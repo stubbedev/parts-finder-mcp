@@ -56,7 +56,7 @@ func pdfPageImages(data []byte, max int) []DocImage {
 		if len(out) >= max {
 			break
 		}
-		d, m := optimizeImage(c.data, c.mime)
+		d, m := optimizeImage(c.data, c.mime, false) // scanned datasheets: grayscale is fine
 		out = append(out, DocImage{Data: d, MIME: m})
 	}
 	return out

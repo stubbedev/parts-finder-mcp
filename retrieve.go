@@ -70,7 +70,7 @@ func fetchPDFBrowserish(ctx context.Context, rawURL string) (title, text string,
 
 // fetchImage downloads an image for visual reading (spec-sheet diagrams,
 // product photos, labels the model can OCR by eye). Returns raw bytes + MIME.
-func fetchImage(ctx context.Context, rawURL string) (data []byte, mime string, err error) {
+func fetchImage(ctx context.Context, rawURL string, keepColor bool) (data []byte, mime string, err error) {
 	resp, err := doRequest(ctx, http.MethodGet, rawURL, map[string]string{
 		"Accept":         "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
 		"Sec-Fetch-Dest": "image",
@@ -98,7 +98,7 @@ func fetchImage(ctx context.Context, rawURL string) (data []byte, mime string, e
 	if !strings.HasPrefix(mime, "image/") {
 		return nil, "", fmt.Errorf("fetch image %s: not an image (%s)", rawURL, mime)
 	}
-	data, mime = optimizeImage(data, mime) // downscale/re-encode before it hits context
+	data, mime = optimizeImage(data, mime, keepColor) // downscale/desaturate before it hits context
 	return data, mime, nil
 }
 

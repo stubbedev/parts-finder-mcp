@@ -74,7 +74,8 @@ type savePartOut struct {
 }
 
 type imageIn struct {
-	URL string `json:"url" jsonschema:"image URL to fetch for visual reading"`
+	URL   string `json:"url" jsonschema:"image URL to fetch for visual reading"`
+	Color bool   `json:"color,omitempty" jsonschema:"keep colour (default: grayscale — colour rarely matters for reading specs and doubles the size). Set true only when colour is the signal, e.g. connector colour-coding"`
 }
 type imageMeta struct {
 	URL   string `json:"url"`
@@ -183,15 +184,17 @@ type shopItem struct {
 	SearchHits   []SearchHit `json:"search_hits,omitempty"`  // buy-page candidates when nothing is on record
 }
 type shopOut struct {
-	Region        Region      `json:"region"`
-	Compatible    bool        `json:"compatible"`
-	Violations    []Violation `json:"violations,omitempty"`
-	Gaps          []string    `json:"gaps,omitempty"`
-	Needs         []Need      `json:"needs,omitempty"` // resource shortages to also shop for (cables, adapters, ...)
-	Items         []shopItem  `json:"items"`
-	TotalBest     float64     `json:"total_best"` // sum of best totals, converted
-	TotalCurrency string      `json:"total_currency,omitempty"`
-	TotalCovers   int         `json:"total_covers"` // how many parts the total includes
+	Region          Region      `json:"region"`
+	Compatible      bool        `json:"compatible"`
+	Partial         bool        `json:"partial,omitempty"`                // not a full bootable build (may be intentional)
+	MissingForBuild []string    `json:"missing_for_full_build,omitempty"` // core categories absent
+	Violations      []Violation `json:"violations,omitempty"`
+	Gaps            []string    `json:"gaps,omitempty"`
+	Needs           []Need      `json:"needs,omitempty"` // resource shortages to also shop for (cables, adapters, ...)
+	Items           []shopItem  `json:"items"`
+	TotalBest       float64     `json:"total_best"` // sum of best totals, converted
+	TotalCurrency   string      `json:"total_currency,omitempty"`
+	TotalCovers     int         `json:"total_covers"` // how many parts the total includes
 }
 
 type deepIn struct {
@@ -343,7 +346,7 @@ func registerTools(s *mcp.Server) {
 		Name:        "fetch_image",
 		Description: "Download an image (product photo, spec-sheet diagram, label, dimension drawing) and return it for VISUAL reading. Use when specs live in a picture, not text — read model numbers, socket markings, dimensions, connector layouts straight off the image. Also the fallback when a listing's only detail is photos.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in imageIn) (*mcp.CallToolResult, imageMeta, error) {
-		data, mime, err := fetchImage(ctx, in.URL)
+		data, mime, err := fetchImage(ctx, in.URL, in.Color)
 		if err != nil {
 			return nil, imageMeta{}, err
 		}
@@ -563,6 +566,7 @@ func registerTools(s *mcp.Server) {
 		spec := composeSpec(parts)
 		out := shopOut{
 			Region: region, Compatible: spec.Compatible,
+			Partial: spec.Partial, MissingForBuild: spec.MissingForBuild,
 			Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
 			TotalCurrency: display,
 		}

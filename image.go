@@ -28,9 +28,13 @@ func init() {
 	image.RegisterFormat("webp", "RIFF????WEBPVP", webp.Decode, webp.DecodeConfig)
 }
 
-// optimizeImage downscales + re-encodes; returns the new bytes and MIME, or the
-// input untouched if anything fails or it's already small.
-func optimizeImage(data []byte, mime string) ([]byte, string) {
+// optimizeImage downscales, optionally desaturates, and re-encodes as JPEG.
+// Grayscale is the default: for reading model numbers, socket markings,
+// dimensions and datasheet text, colour carries no signal and roughly halves
+// the bytes. Pass keepColor=true for the rare case colour matters (connector
+// colour-coding, cable ID). Best-effort: on any failure the input passes
+// through unchanged.
+func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return data, mime // can't decode (svg, exotic) — pass through
@@ -39,25 +43,31 @@ func optimizeImage(data []byte, mime string) ([]byte, string) {
 	w, h := b.Dx(), b.Dy()
 	long := max(w, h)
 
-	// Already small and already a compact raster format: leave it.
-	if long <= maxImageEdge && len(data) <= 400*1024 && (mime == "image/jpeg" || mime == "image/png") {
+	// Already small colour JPEG/PNG and caller wants colour: leave it.
+	if keepColor && long <= maxImageEdge && len(data) <= 400*1024 &&
+		(mime == "image/jpeg" || mime == "image/png") {
 		return data, mime
 	}
 
-	dst := img
+	nw, nh := w, h
 	if long > maxImageEdge {
 		scale := float64(maxImageEdge) / float64(long)
-		nw, nh := int(float64(w)*scale), int(float64(h)*scale)
-		rs := image.NewRGBA(image.Rect(0, 0, nw, nh))
-		draw.CatmullRom.Scale(rs, rs.Bounds(), img, b, draw.Over, nil)
-		dst = rs
+		nw, nh = int(float64(w)*scale), int(float64(h)*scale)
 	}
+
+	var dst draw.Image
+	if keepColor {
+		dst = image.NewRGBA(image.Rect(0, 0, nw, nh))
+	} else {
+		dst = image.NewGray(image.Rect(0, 0, nw, nh)) // grayscale = smaller, no lost signal
+	}
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
 
 	var buf bytes.Buffer
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 82}); err != nil {
 		return data, mime
 	}
-	if buf.Len() >= len(data) && long <= maxImageEdge {
+	if buf.Len() >= len(data) && long <= maxImageEdge && keepColor {
 		return data, mime // re-encode didn't help — keep original
 	}
 	return buf.Bytes(), "image/jpeg"

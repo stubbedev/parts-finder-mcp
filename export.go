@@ -146,6 +146,9 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 			row++
 		}
 		put("Compatible", yesno(spec.Compatible), true)
+		if spec.Partial {
+			put("Partial build", "missing "+strings.Join(spec.MissingForBuild, ", ")+" (add if this should boot on its own)", false)
+		}
 		put("Total TDP (W)", fmt.Sprintf("%d", spec.TotalTDPW), false)
 		f.SetCellValue(sheet, cell(1, row), "TO BUY total ("+display+")")
 		f.SetCellValue(sheet, cell(2, row), total)

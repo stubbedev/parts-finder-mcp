@@ -389,13 +389,15 @@ type Need struct {
 
 // Spec is a composed build: the parts plus derived compat + gaps + needs.
 type Spec struct {
-	Parts      []Part      `json:"parts"`
-	Compatible bool        `json:"compatible"`
-	Violations []Violation `json:"violations"`
-	Gaps       []string    `json:"gaps"`
-	Needs      []Need      `json:"needs,omitempty"` // resource shortages to shop for
-	Owned      []string    `json:"owned,omitempty"` // part ids already owned (not purchased)
-	TotalTDPW  int         `json:"total_tdp_w"`
+	Parts           []Part      `json:"parts"`
+	Compatible      bool        `json:"compatible"`
+	Violations      []Violation `json:"violations"`
+	Gaps            []string    `json:"gaps"`                             // data-quality problems: unverified/stale/unknown attributes
+	MissingForBuild []string    `json:"missing_for_full_build,omitempty"` // core categories absent — informational; a partial/upgrade spec may omit these on purpose
+	Partial         bool        `json:"partial,omitempty"`                // not a complete bootable build (missing core categories)
+	Needs           []Need      `json:"needs,omitempty"`                  // resource shortages to shop for
+	Owned           []string    `json:"owned,omitempty"`                  // part ids already owned (not purchased)
+	TotalTDPW       int         `json:"total_tdp_w"`
 }
 
 // requiredCategories is the minimum for a bootable server build.
@@ -409,9 +411,13 @@ func composeSpec(parts []Part) Spec {
 	byCat := groupByCategory(parts)
 	vs := checkCompat(parts)
 	var gaps []string
+	// Core categories absent = a partial spec (upgrade, parts-list, single
+	// component). That's a normal way to work here, NOT a data problem — keep
+	// it out of gaps so real data issues stay visible.
+	var missing []string
 	for _, cat := range requiredCategories {
 		if len(byCat[cat]) == 0 {
-			gaps = append(gaps, "missing "+cat)
+			missing = append(missing, cat)
 		}
 	}
 	// Flag parts whose category has no wattage — undercuts PSU sizing.
@@ -446,11 +452,13 @@ func composeSpec(parts []Part) Spec {
 	}
 	sort.Slice(needs, func(i, j int) bool { return needs[i].Resource < needs[j].Resource })
 	return Spec{
-		Parts:      parts,
-		Compatible: len(vs) == 0,
-		Violations: vs,
-		Gaps:       gaps,
-		Needs:      needs,
-		TotalTDPW:  totalTDP(byCat),
+		Parts:           parts,
+		Compatible:      len(vs) == 0,
+		Violations:      vs,
+		Gaps:            gaps,
+		MissingForBuild: missing,
+		Partial:         len(missing) > 0,
+		Needs:           needs,
+		TotalTDPW:       totalTDP(byCat),
 	}
 }
