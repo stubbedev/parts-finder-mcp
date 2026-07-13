@@ -16,7 +16,14 @@ import (
 
 var store *Store
 
+// version is stamped at link time (-X main.version=…); "dev" for local builds.
+var version = "dev"
+
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Println("parts-finder " + version)
+		return
+	}
 	dbPath := os.Getenv("PARTS_DB")
 	if dbPath == "" {
 		home, _ := os.UserHomeDir()
@@ -28,7 +35,7 @@ func main() {
 		log.Fatalf("open store %s: %v", dbPath, err)
 	}
 
-	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: "0.1.0"}, nil)
+	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: version}, nil)
 	registerTools(s)
 
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {

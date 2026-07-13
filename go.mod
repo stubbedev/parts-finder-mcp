@@ -1,4 +1,4 @@
-module github.com/abugge/parts-finder-mcp
+module github.com/stubbedev/parts-finder-mcp
 
 go 1.26.4
 
