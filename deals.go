@@ -182,12 +182,7 @@ func probeURL(ctx context.Context, u string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	for _, method := range []string{http.MethodHead, http.MethodGet} {
-		req, err := http.NewRequestWithContext(ctx, method, u, nil)
-		if err != nil {
-			return false
-		}
-		browserHeaders(req)
-		resp, err := httpClient.Do(req)
+		resp, err := doRequest(ctx, method, u, nil)
 		if err != nil {
 			continue // try GET; both failing = network-dead below
 		}

@@ -45,6 +45,9 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	db.Exec(`ALTER TABLE parts ADD COLUMN provides TEXT`)
 	db.Exec(`ALTER TABLE parts ADD COLUMN requires TEXT`)
 	db.Exec(`ALTER TABLE parts ADD COLUMN attrs TEXT`)
+	db.Exec(`ALTER TABLE content_cache ADD COLUMN etag TEXT`)
+	db.Exec(`ALTER TABLE content_cache ADD COLUMN last_modified TEXT`)
+	db.Exec(`ALTER TABLE content_cache ADD COLUMN kind TEXT`)
 	return &Store{db}, nil
 }
 
@@ -263,15 +266,40 @@ func (s *Store) loadSpec(id string) (name string, partIDs []string, err error) {
 	return name, partIDs, nil
 }
 
-func (s *Store) getCached(url string) (title, content string, ok bool) {
-	err := s.db.QueryRow(`SELECT title,content FROM content_cache WHERE url=?`, url).
-		Scan(&title, &content)
-	return title, content, err == nil
+// cacheRec is a persisted fetch with its HTTP validators and age.
+type cacheRec struct {
+	Title, Text        string
+	ETag, LastModified string
+	Kind               string
+	FetchedAt          time.Time
 }
 
-func (s *Store) putCached(url, title, content string) {
-	s.db.Exec(`INSERT INTO content_cache (url,title,content,fetched_at) VALUES (?,?,?,?)
+func (s *Store) getCache(url string) (cacheRec, bool) {
+	var r cacheRec
+	var etag, lastMod, kind, fetched sql.NullString
+	err := s.db.QueryRow(`SELECT title,content,etag,last_modified,kind,fetched_at
+  FROM content_cache WHERE url=?`, url).
+		Scan(&r.Title, &r.Text, &etag, &lastMod, &kind, &fetched)
+	if err != nil {
+		return cacheRec{}, false
+	}
+	r.ETag, r.LastModified, r.Kind = etag.String, lastMod.String, kind.String
+	r.FetchedAt, _ = time.Parse(time.RFC3339, fetched.String)
+	return r, true
+}
+
+func (s *Store) putCache(url, title, content, etag, lastMod, kind string) {
+	s.db.Exec(`INSERT INTO content_cache (url,title,content,etag,last_modified,kind,fetched_at)
+  VALUES (?,?,?,?,?,?,?)
 ON CONFLICT(url) DO UPDATE SET title=excluded.title,content=excluded.content,
+  etag=excluded.etag,last_modified=excluded.last_modified,kind=excluded.kind,
   fetched_at=excluded.fetched_at`,
-		url, title, content, time.Now().Format(time.RFC3339))
+		url, title, content, etag, lastMod, kind, time.Now().Format(time.RFC3339))
+}
+
+// touchCache bumps fetched_at after a 304 — the content is still current, so
+// reset its TTL without re-storing the body.
+func (s *Store) touchCache(url string) {
+	s.db.Exec(`UPDATE content_cache SET fetched_at=? WHERE url=?`,
+		time.Now().Format(time.RFC3339), url)
 }

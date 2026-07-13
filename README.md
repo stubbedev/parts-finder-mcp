@@ -67,7 +67,8 @@ filter.
 | Tool | Does |
 |------|------|
 | `search_parts(query, category?, limit?)` | LIVE keyless region-biased search → result links (web is truth, not training data) |
-| `fetch_content(url, render?)` | fetch + readability → text (cached); PDF-aware; tables kept; `render=true` uses lightpanda |
+| `fetch_content(url, kind?, render?)` | fetch → text (smart-cached by kind); PDF + HTML tables preserved; bot-blocked pages auto-render via lightpanda |
+| `fetch_image(url)` | download an image and return it for visual reading (specs/labels/diagrams off pictures) |
 | `save_part(Part)` | persist a part: scalars + provides/requires + free-form `attrs` |
 | `query_parts(ids? \| category?, where[]?)` | query parts by any attribute: `cuda_compute >= 8.9`, `l3_cache_mb >= 256`; ops eq/ne/gt/gte/lt/lte/contains/exists |
 | `compose_spec(part_ids[])` | build report: compat over known data, loud gaps, needs, total TDP |
@@ -130,6 +131,26 @@ telling you exactly what extras to add.
    re-run `shop_spec`.
 5. Build 2–3 candidate specs → `compare_specs` → pick by compat, TDP, and
    live-checked total.
+
+## Retrieval hardening
+
+The search/fetch core is the cornerstone — every request goes through one
+hardened path:
+
+- **Per-host throttling** — token spacing + concurrency cap + jitter, so we
+  never trip a rate-limit ban (losing a host = losing its deals).
+- **Retry with backoff** — 429/502/503/504 and network errors retry with
+  exponential backoff + jitter, honouring `Retry-After`.
+- **Browser fingerprint rotation** — a realistic UA + client-hint + Sec-Fetch
+  header set, chosen per host and kept stable (flipping mid-session is itself a
+  bot tell). Cookie jar carries sessions across the set-cookie→redirect dance.
+- **https-first**, redirect-following, transparent gzip.
+- **Headless escalation** — TLS-fingerprint walls (eBay/Akamai) auto-escalate
+  to lightpanda; same extraction either way.
+- **Smart caching** — persistent SQLite cache keyed by URL with per-`kind` TTL
+  (spec ~30d / page ~1d / listing ~1h). Stale entries revalidate cheaply via
+  ETag / Last-Modified conditional GETs (304 → keep, reset TTL). On any fetch
+  failure the last-known-good content is served rather than nothing.
 
 ## Freshness guarantees
 

@@ -58,16 +58,27 @@ type searchOut struct {
 
 type fetchIn struct {
 	URL    string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
+	Kind   string `json:"kind,omitempty" jsonschema:"cache freshness bucket: spec (datasheets ~30d), listing (prices ~1h), page (default ~1d)"`
 	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed lightpanda). Bot-blocked sites (403/429) escalate to this automatically"`
 }
 type fetchOut struct {
-	Title  string `json:"title"`
-	Text   string `json:"text"`
-	Cached bool   `json:"cached"`
+	Title    string `json:"title"`
+	Text     string `json:"text"`
+	Cached   bool   `json:"cached"`
+	Rendered bool   `json:"rendered,omitempty"`
 }
 
 type savePartOut struct {
 	ID string `json:"id"`
+}
+
+type imageIn struct {
+	URL string `json:"url" jsonschema:"image URL to fetch for visual reading"`
+}
+type imageMeta struct {
+	URL   string `json:"url"`
+	MIME  string `json:"mime"`
+	Bytes int    `json:"bytes"`
 }
 
 type idsIn struct {
@@ -282,21 +293,26 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "fetch_content",
-		Description: "Fetch a URL and return readable text (cached). Use this to read spec pages, then extract fields and call save_part.",
+		Description: "Fetch a URL and return readable text (HTML tables + PDFs preserved), smartly cached. Bot-blocked sites auto-escalate to a headless browser. `kind` tunes cache freshness: \"spec\" (datasheets, ~30d), \"listing\" (prices, ~1h), or \"page\" (default, ~1d); stale entries are cheaply revalidated. Use this to read spec/listing pages, then save_part / save_listing.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in fetchIn) (*mcp.CallToolResult, fetchOut, error) {
-		if title, text, ok := store.getCached(in.URL); ok {
-			return nil, fetchOut{Title: title, Text: text, Cached: true}, nil
-		}
-		fetch := fetchContent
-		if in.Render {
-			fetch = fetchRendered
-		}
-		title, text, err := fetch(ctx, in.URL)
+		f, cached, err := fetchCached(ctx, in.URL, in.Kind, in.Render)
 		if err != nil {
 			return nil, fetchOut{}, err
 		}
-		store.putCached(in.URL, title, text)
-		return nil, fetchOut{Title: title, Text: text}, nil
+		return nil, fetchOut{Title: f.Title, Text: f.Text, Cached: cached, Rendered: f.Rendered}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "fetch_image",
+		Description: "Download an image (product photo, spec-sheet diagram, label, dimension drawing) and return it for VISUAL reading. Use when specs live in a picture, not text — read model numbers, socket markings, dimensions, connector layouts straight off the image. Also the fallback when a listing's only detail is photos.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in imageIn) (*mcp.CallToolResult, imageMeta, error) {
+		data, mime, err := fetchImage(ctx, in.URL)
+		if err != nil {
+			return nil, imageMeta{}, err
+		}
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{&mcp.ImageContent{Data: data, MIMEType: mime}},
+		}, imageMeta{URL: in.URL, MIME: mime, Bytes: len(data)}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -614,17 +630,15 @@ func registerTools(s *mcp.Server) {
 					continue
 				}
 				seen[h.URL] = true
-				title, text, ok := store.getCached(h.URL)
-				if !ok {
-					if title, text, err = fetchContent(ctx, h.URL); err != nil {
-						continue // unreadable source — move on, search gave us more
-					}
-					store.putCached(h.URL, title, text)
+				f, _, ferr := fetchCached(ctx, h.URL, "spec", false)
+				if ferr != nil {
+					continue // unreadable source — move on, search gave us more
 				}
+				text := f.Text
 				if len(text) > maxDeepSourceChars {
 					text = text[:maxDeepSourceChars] + "\n…(truncated)"
 				}
-				out.Sources = append(out.Sources, deepSource{URL: h.URL, Title: title, Text: text})
+				out.Sources = append(out.Sources, deepSource{URL: h.URL, Title: f.Title, Text: text})
 			}
 			if len(out.Sources) >= maxDeepSources {
 				break

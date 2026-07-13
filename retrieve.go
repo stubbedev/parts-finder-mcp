@@ -24,64 +24,40 @@ import (
 // bot-blocked pages auto-escalate to the zero-config lightpanda renderer
 // (render.go). Extraction quality is identical on both paths (extractHTML).
 
-// Browser-grade UA: many shops flat-out 403 non-browser agents. Marketplaces
-// with TLS fingerprinting (eBay/Akamai) block regardless — those need
-// fetch_content(render=true) via lightpanda.
+// userAgent is the default fingerprint's UA — used where a single UA string is
+// needed (e.g. the lightpanda download).
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-// httpClient defeats the billy-basic bot checks: follows redirects (Go
-// default, ≤10), carries session cookies across the set-cookie-then-redirect
-// dance half the shops do (cookie jar), and speaks gzip + HTTP/2 (transport
-// defaults). TLS-fingerprint walls are the renderer's job.
+// httpClient follows redirects (Go default, ≤10) and carries session cookies
+// across the set-cookie-then-redirect dance half the shops do (cookie jar).
+// Throttling, retries, and fingerprint rotation live in doRequest (net.go).
 var httpClient = newHTTPClient()
 
 func newHTTPClient() *http.Client {
 	jar, _ := cookiejar.New(nil) // only errors on nil PublicSuffixList options
-	return &http.Client{Timeout: 20 * time.Second, Jar: jar}
+	return &http.Client{Timeout: 30 * time.Second, Jar: jar}
 }
 
-// browserHeaders makes a request look like a normal browser navigation —
-// walls commonly reject requests missing Accept/Accept-Language.
-func browserHeaders(req *http.Request) {
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-}
-
+// get fetches a URL through the hardened core, preferring https: it upgrades
+// plain-http URLs and falls back to the original scheme only if TLS won't
+// answer.
 func get(ctx context.Context, u string) (*http.Response, error) {
-	// Prefer https: upgrade plain-http URLs and only fall back to the
-	// original scheme if the TLS endpoint doesn't answer.
 	if strings.HasPrefix(u, "http://") {
-		if resp, err := doGet(ctx, "https://"+strings.TrimPrefix(u, "http://")); err == nil {
+		if resp, err := doRequest(ctx, http.MethodGet, "https://"+strings.TrimPrefix(u, "http://"), nil); err == nil {
 			return resp, nil
 		}
 	}
-	return doGet(ctx, u)
+	return doRequest(ctx, http.MethodGet, u, nil)
 }
 
-func doGet(ctx context.Context, u string) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, err
-	}
-	browserHeaders(req)
-	return httpClient.Do(req)
-}
-
-// fetchPDFBrowserish re-tries a bot-blocked PDF download with the headers a
-// real browser would send (referer from the site root, Accept, language).
-// Covers hotlink-protection 403s; TLS-fingerprint walls still lose.
+// fetchPDFBrowserish re-tries a bot-blocked PDF download with a site-root
+// referer. Covers hotlink-protection 403s; TLS-fingerprint walls still lose.
 func fetchPDFBrowserish(ctx context.Context, rawURL string) (title, text string, err error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return "", "", err
-	}
-	browserHeaders(req)
-	req.Header.Set("Accept", "application/pdf,application/octet-stream,*/*")
+	extra := map[string]string{"Accept": "application/pdf,application/octet-stream,*/*"}
 	if pu, perr := url.Parse(rawURL); perr == nil {
-		req.Header.Set("Referer", pu.Scheme+"://"+pu.Host+"/")
+		extra["Referer"] = pu.Scheme + "://" + pu.Host + "/"
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := doRequest(ctx, http.MethodGet, rawURL, extra)
 	if err != nil {
 		return "", "", err
 	}
@@ -90,6 +66,39 @@ func fetchPDFBrowserish(ctx context.Context, rawURL string) (title, text string,
 		return "", "", fmt.Errorf("pdf retry got %s", resp.Status)
 	}
 	return extractPDF(io.LimitReader(resp.Body, 64<<20))
+}
+
+// fetchImage downloads an image for visual reading (spec-sheet diagrams,
+// product photos, labels the model can OCR by eye). Returns raw bytes + MIME.
+func fetchImage(ctx context.Context, rawURL string) (data []byte, mime string, err error) {
+	resp, err := doRequest(ctx, http.MethodGet, rawURL, map[string]string{
+		"Accept":         "image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8",
+		"Sec-Fetch-Dest": "image",
+		"Sec-Fetch-Mode": "no-cors",
+		"Sec-Fetch-Site": "cross-site",
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", fmt.Errorf("fetch image %s: %s", rawURL, resp.Status)
+	}
+	data, err = io.ReadAll(io.LimitReader(resp.Body, 12<<20)) // 12MB cap
+	if err != nil {
+		return nil, "", err
+	}
+	mime = resp.Header.Get("Content-Type")
+	if i := strings.IndexByte(mime, ';'); i >= 0 {
+		mime = mime[:i]
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		mime = http.DetectContentType(data) // trust bytes over a wrong header
+	}
+	if !strings.HasPrefix(mime, "image/") {
+		return nil, "", fmt.Errorf("fetch image %s: not an image (%s)", rawURL, mime)
+	}
+	return data, mime, nil
 }
 
 // SearchHit is one search result.
@@ -260,10 +269,83 @@ func decodeDDGLink(href string) string {
 
 // fetchContent downloads a URL and extracts readable text. PDFs (spec sheets)
 // go through the PDF text extractor; everything else through readability.
-func fetchContent(ctx context.Context, rawURL string) (title, text string, err error) {
+// Cache TTLs by kind — how long fetched content is trusted before
+// revalidation. Spec sheets barely change; live listings/prices go stale fast.
+// ponytail: three buckets cover the real cases; add a kind if a source needs
+// its own cadence.
+func ttlFor(kind string) time.Duration {
+	switch kind {
+	case "spec":
+		return 30 * 24 * time.Hour
+	case "listing":
+		return time.Hour
+	default: // "page" and unknown
+		return 24 * time.Hour
+	}
+}
+
+// fetchCached is the front door for all content retrieval. Fresh cache hits
+// return instantly; stale-but-revalidatable entries do a cheap conditional GET
+// (304 → keep, bump TTL); misses fetch live. On any fetch failure it serves
+// stale content if we have it — a transient block must never erase
+// last-known-good data. Returns (result, servedFromCache, error).
+func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched, bool, error) {
+	rec, have := store.getCache(rawURL)
+	if have && !render {
+		if time.Since(rec.FetchedAt) < ttlFor(kind) {
+			return rec.fetched(), true, nil // fresh
+		}
+		if rec.ETag != "" || rec.LastModified != "" {
+			f, notMod, err := revalidate(ctx, rawURL, rec.ETag, rec.LastModified)
+			switch {
+			case err == nil && notMod:
+				store.touchCache(rawURL)
+				return rec.fetched(), true, nil
+			case err == nil:
+				store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
+				return f, false, nil
+			default:
+				return rec.fetched(), true, nil // revalidation blocked → serve stale
+			}
+		}
+	}
+	var f Fetched
+	var err error
+	if render {
+		var t, x string
+		t, x, err = fetchRendered(ctx, rawURL)
+		f = Fetched{Title: t, Text: x, Rendered: true}
+	} else {
+		f, err = fetchContent(ctx, rawURL)
+	}
+	if err != nil {
+		if have {
+			return rec.fetched(), true, nil // serve stale on failure
+		}
+		return Fetched{}, false, err
+	}
+	store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
+	return f, false, nil
+}
+
+func (r cacheRec) fetched() Fetched {
+	return Fetched{Title: r.Title, Text: r.Text, ETag: r.ETag, LastModified: r.LastModified}
+}
+
+// Fetched is the result of a content fetch plus HTTP validators for cheap
+// cache revalidation.
+type Fetched struct {
+	Title        string
+	Text         string
+	ETag         string
+	LastModified string
+	Rendered     bool
+}
+
+func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
 	resp, err := get(ctx, rawURL)
 	if err != nil {
-		return "", "", err
+		return Fetched{}, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
@@ -272,37 +354,72 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 		// downloaded) on demand. PDFs can't be rendered by a browser DOM;
 		// instead retry the download with full browser headers + referer
 		// (most PDF 403s are referer/UA checks, not TLS fingerprinting).
-		if strings.HasSuffix(strings.ToLower(rawURL), ".pdf") {
+		if isPDFURL(rawURL) {
 			if t, x, perr := fetchPDFBrowserish(ctx, rawURL); perr == nil {
-				return t, x, nil
+				return Fetched{Title: t, Text: x}, nil
 			}
-			return "", "", fmt.Errorf("fetch %s: %s — PDF host blocks plain HTTP even with browser headers; find a mirror of the datasheet", rawURL, resp.Status)
+			return Fetched{}, fmt.Errorf("fetch %s: %s — PDF host blocks plain HTTP even with browser headers; find a mirror of the datasheet", rawURL, resp.Status)
 		}
 		if t, x, rerr := fetchRendered(ctx, rawURL); rerr == nil {
-			return t, x, nil
+			return Fetched{Title: t, Text: x, Rendered: true}, nil
 		} else {
-			return "", "", fmt.Errorf("fetch %s: %s — site blocks plain HTTP and the render fallback failed (%v); extract what you can from the search snippet", rawURL, resp.Status, rerr)
+			return Fetched{}, fmt.Errorf("fetch %s: %s — site blocks plain HTTP and the render fallback failed (%v); extract what you can from the search snippet", rawURL, resp.Status, rerr)
 		}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return "", "", fmt.Errorf("fetch %s: %s", rawURL, resp.Status)
+		return Fetched{}, fmt.Errorf("fetch %s: %s", rawURL, resp.Status)
 	}
-	// Sniff PDF by content-type, URL suffix, AND payload magic bytes — spec
-	// sheets are often served with a generic/wrong content-type. (kindly does
-	// the same %PDF- check.)
+	return extractResponse(resp, rawURL)
+}
+
+func isPDFURL(u string) bool { return strings.HasSuffix(strings.ToLower(u), ".pdf") }
+
+// extractResponse turns a 200 response into Fetched: PDF sniffing (content-type,
+// URL suffix, AND payload magic bytes — spec sheets are often mislabeled) then
+// HTML extraction, carrying HTTP validators for later revalidation.
+func extractResponse(resp *http.Response, rawURL string) (Fetched, error) {
+	f := Fetched{ETag: resp.Header.Get("ETag"), LastModified: resp.Header.Get("Last-Modified")}
 	br := bufio.NewReader(resp.Body)
 	ct := resp.Header.Get("Content-Type")
 	magic, _ := br.Peek(5)
-	if strings.Contains(ct, "application/pdf") ||
-		strings.HasSuffix(strings.ToLower(rawURL), ".pdf") ||
-		bytes.HasPrefix(magic, []byte("%PDF-")) {
-		return extractPDF(br)
+	if strings.Contains(ct, "application/pdf") || isPDFURL(rawURL) || bytes.HasPrefix(magic, []byte("%PDF-")) {
+		t, x, err := extractPDF(br)
+		f.Title, f.Text = t, x
+		return f, err
 	}
-	buf, err := io.ReadAll(io.LimitReader(br, 4<<20)) // 4MB page cap
+	buf, err := io.ReadAll(io.LimitReader(br, 8<<20)) // 8MB page cap
 	if err != nil {
-		return "", "", err
+		return Fetched{}, err
 	}
-	return extractHTML(buf, rawURL)
+	t, x, err := extractHTML(buf, rawURL)
+	f.Title, f.Text = t, x
+	return f, err
+}
+
+// revalidate does one best-effort conditional GET. Returns notModified=true on
+// a 304 (cache still good), or fresh content on 200. No escalation — a blocked
+// revalidation just means the caller serves stale.
+func revalidate(ctx context.Context, rawURL, etag, lastMod string) (f Fetched, notModified bool, err error) {
+	extra := map[string]string{}
+	if etag != "" {
+		extra["If-None-Match"] = etag
+	}
+	if lastMod != "" {
+		extra["If-Modified-Since"] = lastMod
+	}
+	resp, err := doRequest(ctx, http.MethodGet, rawURL, extra)
+	if err != nil {
+		return Fetched{}, false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotModified {
+		return Fetched{}, true, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return Fetched{}, false, fmt.Errorf("revalidate %s: %s", rawURL, resp.Status)
+	}
+	f, err = extractResponse(resp, rawURL)
+	return f, false, err
 }
 
 // extractHTML is the single HTML→text path — readability for prose plus
