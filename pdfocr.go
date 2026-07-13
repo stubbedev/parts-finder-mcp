@@ -56,7 +56,7 @@ func pdfPageImages(data []byte, max int) []DocImage {
 		if len(out) >= max {
 			break
 		}
-		d, m := optimizeImage(c.data, c.mime, modeText) // scanned datasheets are text — binarize for fewest bytes
+		d, m := optimizeImage(c.data, c.mime, modeText, 0) // scanned datasheets are text — binarize for fewest bytes
 		out = append(out, DocImage{Data: d, MIME: m})
 	}
 	return out

@@ -160,10 +160,14 @@ hardened path:
 - **Resilient** — every goroutine and tool handler recovers from panics, so one
   bad probe/scrape/request can never crash the server. Listing liveness is
   pre-warmed in one parallel sweep before pricing a build.
-- **Vision-tuned images** — fetched/scanned images are downscaled to both
-  Anthropic's long-edge (1568px) and megapixel (~1.15MP) caps and grayscaled by
-  default, so we upload exactly the pixels the model uses — smaller, faster,
-  cheaper, no readable detail lost.
+- **Vision-tuned images** — fetched/scanned images are downscaled before they
+  reach the model, because vision cost is paid in **tokens ∝ pixels**. Photo
+  mode caps ~1568px/1.15MP; **text mode binarizes to 1-bit and caps ~1000px**
+  (crisp glyph edges survive it) for the fewest tokens reading specs; a per-call
+  `max_edge` shrinks further (e.g. 640 for a sparse label). Caps are
+  general-purpose defaults, all env-overridable per harness/model
+  (`PARTS_IMG_MAX_EDGE`, `PARTS_IMG_TEXT_EDGE`, `PARTS_IMG_MAX_PIXELS`,
+  `PARTS_IMG_TEXT_PIXELS`) since different vision models tile differently.
 - **Smart caching** — persistent SQLite cache keyed by URL with per-`kind` TTL
   (spec ~30d / page ~1d / listing ~1h). Stale entries revalidate cheaply via
   ETag / Last-Modified conditional GETs (304 → keep, reset TTL). On any fetch

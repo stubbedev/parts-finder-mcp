@@ -8,6 +8,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"math"
+	"os"
+	"strconv"
 
 	_ "golang.org/x/image/bmp" // register BMP decoder
 	"golang.org/x/image/draw"
@@ -27,24 +29,57 @@ import (
 // resample with a good filter instead of the server's. A 4:3 photo at 1568px
 // long edge is 1.84MP, well over the area cap, so the megapixel bound is what
 // actually shrinks most real images further without touching readable detail.
-const (
-	maxImageEdge   = 1568
-	maxImagePixels = 1_150_000
+// Image size caps. Vision cost is paid in TOKENS, which scale with PIXELS (not
+// bytes), so we downscale before sending. The defaults are conservative,
+// general-purpose values — NOT tied to one model. Different harnesses/models
+// tile differently (e.g. some at 512px, some ~1.5k), so every cap is
+// env-overridable and there's a per-call max_edge knob. Text caps smaller than
+// photo: legible 1-bit text survives aggressive downscale where photo detail
+// wouldn't, and it roughly halves the tokens.
+var (
+	maxImageEdge   = envInt("PARTS_IMG_MAX_EDGE", 1568)
+	maxImagePixels = float64(envInt("PARTS_IMG_MAX_PIXELS", 1_150_000))
+	maxTextEdge    = envInt("PARTS_IMG_TEXT_EDGE", 1000)
+	maxTextPixels  = float64(envInt("PARTS_IMG_TEXT_PIXELS", 750_000))
 )
 
-// fitScale returns the largest scale ≤1 that keeps the image within both the
-// long-edge and megapixel caps.
-func fitScale(w, h int) float64 {
-	s := 1.0
-	if long := max(w, h); long > maxImageEdge {
-		s = float64(maxImageEdge) / float64(long)
+func envInt(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
 	}
-	if px := float64(w) * float64(h); px > maxImagePixels {
-		if ps := math.Sqrt(maxImagePixels / px); ps < s {
+	return def
+}
+
+// fitScale returns the largest scale ≤1 that keeps the image within both the
+// long-edge and pixel caps.
+func fitScale(w, h, maxEdge int, maxPixels float64) float64 {
+	s := 1.0
+	if long := max(w, h); long > maxEdge {
+		s = float64(maxEdge) / float64(long)
+	}
+	if px := float64(w) * float64(h); px > maxPixels {
+		if ps := math.Sqrt(maxPixels / px); ps < s {
 			s = ps
 		}
 	}
 	return s
+}
+
+// capsFor picks the pixel caps for a mode, honouring an explicit long-edge
+// override (0 = mode default). A smaller override also tightens the area cap so
+// the model can shrink a sparse label hard, or loosen it for a dense table.
+func capsFor(mode string, override int) (edge int, pixels float64) {
+	edge, pixels = maxImageEdge, maxImagePixels
+	if mode == modeText {
+		edge, pixels = maxTextEdge, maxTextPixels
+	}
+	if override > 0 && override < edge {
+		edge = override
+		pixels = float64(edge) * float64(edge) // allow up to a square at that edge
+	}
+	return edge, pixels
 }
 
 func init() {
@@ -66,16 +101,18 @@ const (
 	modeColor = "color"
 )
 
-// optimizeImage downscales to the vision caps and re-encodes as few bytes as
-// the mode allows. Best-effort: on any failure the input passes through.
-func optimizeImage(data []byte, mime, mode string) ([]byte, string) {
+// optimizeImage downscales to the mode's pixel caps (maxEdge>0 overrides the
+// long-edge cap) and re-encodes as few bytes as the mode allows. Best-effort:
+// on any failure the input passes through.
+func optimizeImage(data []byte, mime, mode string, maxEdge int) ([]byte, string) {
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return data, mime // can't decode (svg, exotic) — pass through
 	}
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
-	scale := fitScale(w, h)
+	edge, pixels := capsFor(mode, maxEdge)
+	scale := fitScale(w, h, edge, pixels)
 	nw, nh := max(1, int(float64(w)*scale)), max(1, int(float64(h)*scale))
 
 	var dst draw.Image

@@ -92,9 +92,10 @@ type savePartOut struct {
 }
 
 type imageIn struct {
-	URL   string `json:"url" jsonschema:"image URL to fetch for visual reading"`
-	Text  bool   `json:"text,omitempty" jsonschema:"the image is mostly text/a document (spec sheet, label, screenshot, scan): binarize to 1-bit black-and-white for the FEWEST bytes while staying perfectly legible. Use this whenever you're reading text off the image"`
-	Color bool   `json:"color,omitempty" jsonschema:"keep colour (default is grayscale). Use only when colour is the signal, e.g. connector colour-coding. Ignored if text=true"`
+	URL     string `json:"url" jsonschema:"image URL to fetch for visual reading"`
+	Text    bool   `json:"text,omitempty" jsonschema:"the image is mostly text/a document (spec sheet, label, screenshot, scan): binarize to 1-bit black-and-white for the FEWEST bytes while staying legible. Use whenever you're reading text off the image"`
+	Color   bool   `json:"color,omitempty" jsonschema:"keep colour (default is grayscale). Use only when colour is the signal, e.g. connector colour-coding. Ignored if text=true"`
+	MaxEdge int    `json:"max_edge,omitempty" jsonschema:"cap the long edge to this many pixels — fewer pixels = fewer vision tokens. Shrink hard for a sparse label (e.g. 640); raise for a dense table if small text is unreadable. Default: 1000 for text, 1568 otherwise"`
 }
 type imageMeta struct {
 	URL   string `json:"url"`
@@ -373,7 +374,7 @@ func registerTools(s *mcp.Server) {
 		case in.Color:
 			mode = modeColor
 		}
-		data, mime, err := fetchImage(ctx, in.URL, mode)
+		data, mime, err := fetchImage(ctx, in.URL, mode, in.MaxEdge)
 		if err != nil {
 			return nil, imageMeta{}, err
 		}
