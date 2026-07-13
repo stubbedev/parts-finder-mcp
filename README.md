@@ -68,7 +68,8 @@ filter.
 |------|------|
 | `search_parts(query, category?, limit?)` | LIVE keyless region-biased search → result links (web is truth, not training data) |
 | `fetch_content(url, kind?, render?)` | fetch → text (smart-cached by kind); PDF + HTML tables preserved; bot-blocked pages auto-render via lightpanda |
-| `fetch_image(url)` | download an image and return it for visual reading (specs/labels/diagrams off pictures) |
+| `fetch_image(url)` | download + downscale an image (jpeg/png/gif/webp/bmp/tiff) → vision block for reading specs/labels/diagrams off pictures |
+| `export_spec(spec_ids[], path?)` | write a polished .xlsx: per-spec sheet (parts, live prices, buy links, owned-vs-buy totals) + Compare sheet |
 | `save_part(Part)` | persist a part: scalars + provides/requires + free-form `attrs` |
 | `query_parts(ids? \| category?, where[]?)` | query parts by any attribute: `cuda_compute >= 8.9`, `l3_cache_mb >= 256`; ops eq/ne/gt/gte/lt/lte/contains/exists |
 | `compose_spec(part_ids[])` | build report: compat over known data, loud gaps, needs, total TDP |
@@ -110,6 +111,15 @@ backplanes — any category — without new code per pair.
 
 `fetch_content` preserves `<table>` data as markdown (spec sheets are tables),
 so the client can extract these tokens reliably.
+
+Already own some parts? List them in a spec's `owned_ids` — they still count
+for compatibility and TDP but are excluded from the purchase total and never
+shopped, so a build where you only need 1-2 new parts prices correctly.
+
+Reading images & scanned PDFs: `fetch_image` downscales any common format
+(jpeg/png/gif/webp/bmp/tiff) to a vision-optimal size. `fetch_content` on a
+scanned/image-only PDF (no text layer) automatically returns its page images as
+vision blocks so specs can be read straight off the scan.
 
 Quantities: repeat a part id in a spec (`["mb","cpu","cpu","psu"]` = dual CPU).
 Each instance consumes resources and counts toward TDP, so cable/slot shortages

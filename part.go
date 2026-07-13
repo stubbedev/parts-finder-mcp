@@ -394,6 +394,7 @@ type Spec struct {
 	Violations []Violation `json:"violations"`
 	Gaps       []string    `json:"gaps"`
 	Needs      []Need      `json:"needs,omitempty"` // resource shortages to shop for
+	Owned      []string    `json:"owned,omitempty"` // part ids already owned (not purchased)
 	TotalTDPW  int         `json:"total_tdp_w"`
 }
 

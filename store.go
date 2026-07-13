@@ -48,6 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	db.Exec(`ALTER TABLE content_cache ADD COLUMN etag TEXT`)
 	db.Exec(`ALTER TABLE content_cache ADD COLUMN last_modified TEXT`)
 	db.Exec(`ALTER TABLE content_cache ADD COLUMN kind TEXT`)
+	db.Exec(`ALTER TABLE specs ADD COLUMN owned_ids TEXT`)
 	return &Store{db}, nil
 }
 
@@ -222,23 +223,26 @@ func (s *Store) knownVendors(country string) (map[string]bool, error) {
 	return out, nil
 }
 
-func (s *Store) saveSpec(id, name string, partIDs []string) error {
+func (s *Store) saveSpec(id, name string, partIDs, ownedIDs []string) error {
 	ids, _ := json.Marshal(partIDs)
-	_, err := s.db.Exec(`INSERT INTO specs (id,name,part_ids,created_at) VALUES (?,?,?,?)
-ON CONFLICT(id) DO UPDATE SET name=excluded.name,part_ids=excluded.part_ids`,
-		id, name, string(ids), time.Now().Format(time.RFC3339))
+	owned, _ := json.Marshal(ownedIDs)
+	_, err := s.db.Exec(`INSERT INTO specs (id,name,part_ids,owned_ids,created_at) VALUES (?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET name=excluded.name,part_ids=excluded.part_ids,
+  owned_ids=excluded.owned_ids`,
+		id, name, string(ids), string(owned), time.Now().Format(time.RFC3339))
 	return err
 }
 
 // SpecInfo is a saved spec's identity for listing.
 type SpecInfo struct {
-	ID      string   `json:"id"`
-	Name    string   `json:"name,omitempty"`
-	PartIDs []string `json:"part_ids"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name,omitempty"`
+	PartIDs  []string `json:"part_ids"`
+	OwnedIDs []string `json:"owned_ids,omitempty"`
 }
 
 func (s *Store) listSpecs() ([]SpecInfo, error) {
-	rows, err := s.db.Query(`SELECT id,name,part_ids FROM specs ORDER BY created_at DESC`)
+	rows, err := s.db.Query(`SELECT id,name,part_ids,owned_ids FROM specs ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -247,23 +251,27 @@ func (s *Store) listSpecs() ([]SpecInfo, error) {
 	for rows.Next() {
 		var si SpecInfo
 		var ids string
-		if err := rows.Scan(&si.ID, &si.Name, &ids); err != nil {
+		var owned sql.NullString
+		if err := rows.Scan(&si.ID, &si.Name, &ids, &owned); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(ids), &si.PartIDs)
+		json.Unmarshal([]byte(owned.String), &si.OwnedIDs)
 		out = append(out, si)
 	}
 	return out, nil
 }
 
-func (s *Store) loadSpec(id string) (name string, partIDs []string, err error) {
+func (s *Store) loadSpec(id string) (name string, partIDs, ownedIDs []string, err error) {
 	var ids string
-	err = s.db.QueryRow(`SELECT name,part_ids FROM specs WHERE id=?`, id).Scan(&name, &ids)
+	var owned sql.NullString
+	err = s.db.QueryRow(`SELECT name,part_ids,owned_ids FROM specs WHERE id=?`, id).Scan(&name, &ids, &owned)
 	if err != nil {
-		return "", nil, err
+		return "", nil, nil, err
 	}
+	json.Unmarshal([]byte(owned.String), &ownedIDs)
 	json.Unmarshal([]byte(ids), &partIDs)
-	return name, partIDs, nil
+	return name, partIDs, ownedIDs, nil
 }
 
 // cacheRec is a persisted fetch with its HTTP validators and age.

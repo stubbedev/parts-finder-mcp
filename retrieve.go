@@ -98,6 +98,7 @@ func fetchImage(ctx context.Context, rawURL string) (data []byte, mime string, e
 	if !strings.HasPrefix(mime, "image/") {
 		return nil, "", fmt.Errorf("fetch image %s: not an image (%s)", rawURL, mime)
 	}
+	data, mime = optimizeImage(data, mime) // downscale/re-encode before it hits context
 	return data, mime, nil
 }
 
@@ -324,7 +325,11 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 		}
 		return Fetched{}, false, err
 	}
-	store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
+	// Don't cache scanned-PDF image results — the cache only holds text, and a
+	// hit would return empty text with no images. Re-extract each time (rare).
+	if len(f.Images) == 0 {
+		store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
+	}
 	return f, false, nil
 }
 
@@ -340,6 +345,7 @@ type Fetched struct {
 	ETag         string
 	LastModified string
 	Rendered     bool
+	Images       []DocImage // scanned-PDF page images for visual OCR (not cached)
 }
 
 func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
@@ -383,9 +389,20 @@ func extractResponse(resp *http.Response, rawURL string) (Fetched, error) {
 	ct := resp.Header.Get("Content-Type")
 	magic, _ := br.Peek(5)
 	if strings.Contains(ct, "application/pdf") || isPDFURL(rawURL) || bytes.HasPrefix(magic, []byte("%PDF-")) {
-		t, x, err := extractPDF(br)
+		raw, err := io.ReadAll(io.LimitReader(br, 64<<20)) // 64MB PDF cap
+		if err != nil {
+			return Fetched{}, err
+		}
+		t, x, _ := extractPDF(bytes.NewReader(raw))
 		f.Title, f.Text = t, x
-		return f, err
+		// Scanned/image-only PDF (no usable text layer): fall back to page
+		// images so vision can OCR the datasheet.
+		if len(strings.Fields(x)) < scannedTextThreshold/6 || len(strings.TrimSpace(x)) < scannedTextThreshold {
+			if imgs := pdfPageImages(raw, 5); len(imgs) > 0 {
+				f.Images = imgs
+			}
+		}
+		return f, nil
 	}
 	buf, err := io.ReadAll(io.LimitReader(br, 8<<20)) // 8MB page cap
 	if err != nil {

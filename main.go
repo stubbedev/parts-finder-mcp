@@ -66,6 +66,7 @@ type fetchOut struct {
 	Text     string `json:"text"`
 	Cached   bool   `json:"cached"`
 	Rendered bool   `json:"rendered,omitempty"`
+	Images   int    `json:"images,omitempty"` // scanned-PDF page images returned as vision blocks
 }
 
 type savePartOut struct {
@@ -111,7 +112,8 @@ type specOption struct {
 	TotalBest    float64     `json:"total_best"` // sum of best usable listings, converted
 	TotalCovers  int         `json:"total_covers"`
 	PartCount    int         `json:"part_count"`
-	BuyLinks     []string    `json:"buy_links,omitempty"` // best usable URL per covered part
+	OwnedCount   int         `json:"owned_count,omitempty"` // parts already owned, excluded from the total
+	BuyLinks     []string    `json:"buy_links,omitempty"`   // best usable URL per covered part
 	UncoveredIDs []string    `json:"uncovered_ids,omitempty"`
 }
 type compareOut struct {
@@ -121,9 +123,10 @@ type compareOut struct {
 }
 
 type saveSpecIn struct {
-	ID      string   `json:"id" jsonschema:"spec id (slug); reused id overwrites"`
-	Name    string   `json:"name,omitempty"`
-	PartIDs []string `json:"part_ids"`
+	ID       string   `json:"id" jsonschema:"spec id (slug); reused id overwrites"`
+	Name     string   `json:"name,omitempty"`
+	PartIDs  []string `json:"part_ids"`
+	OwnedIDs []string `json:"owned_ids,omitempty" jsonschema:"part ids in this build you already own — excluded from the purchase total, never shopped"`
 }
 type loadSpecIn struct {
 	ID string `json:"id,omitempty" jsonschema:"spec id; omit to list all saved specs"`
@@ -158,12 +161,23 @@ type substituteOut struct {
 type shopIn struct {
 	SpecID          string   `json:"spec_id,omitempty" jsonschema:"saved spec to shop for (or pass part_ids)"`
 	PartIDs         []string `json:"part_ids,omitempty" jsonschema:"parts to shop for when no spec_id"`
+	OwnedIDs        []string `json:"owned_ids,omitempty" jsonschema:"part ids you already own — excluded from the total (ignored when spec_id is used; the spec carries its own owned set)"`
 	Country         string   `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
 	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for the guiding totals; defaults to region currency"`
 	NoSearch        bool     `json:"no_search,omitempty" jsonschema:"skip web searches for parts that lack live listings"`
 }
+
+func toSet(ids []string) map[string]bool {
+	m := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	return m
+}
+
 type shopItem struct {
 	Part         Part        `json:"part"`
+	Owned        bool        `json:"owned,omitempty"`        // already have it — not part of the purchase
 	Best         *Listing    `json:"best,omitempty"`         // cheapest live, shippable listing — the link to click
 	Alternatives []Listing   `json:"alternatives,omitempty"` // other live options, sorted
 	SearchHits   []SearchHit `json:"search_hits,omitempty"`  // buy-page candidates when nothing is on record
@@ -222,6 +236,17 @@ func emptyFields(p Part) []string {
 	add("provides", len(p.Provides) == 0)
 	add("requires", len(p.Requires) == 0)
 	return f
+}
+
+type exportIn struct {
+	SpecIDs         []string `json:"spec_ids" jsonschema:"saved spec ids to export (one sheet each; a Compare sheet is added for 2+)"`
+	Path            string   `json:"path,omitempty" jsonschema:"output .xlsx path; defaults to ./parts-finder-<spec>.xlsx"`
+	Country         string   `json:"country,omitempty"`
+	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for the price columns; defaults to region currency"`
+}
+type exportOut struct {
+	Path  string `json:"path"`
+	Specs int    `json:"specs"`
 }
 
 type convertIn struct {
@@ -299,7 +324,19 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, fetchOut{}, err
 		}
-		return nil, fetchOut{Title: f.Title, Text: f.Text, Cached: cached, Rendered: f.Rendered}, nil
+		out := fetchOut{Title: f.Title, Text: f.Text, Cached: cached, Rendered: f.Rendered, Images: len(f.Images)}
+		// Scanned PDF: no text layer, so return the page images as vision
+		// blocks for the model to OCR directly.
+		if len(f.Images) > 0 {
+			res := &mcp.CallToolResult{Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning %d page image(s); read the specs visually.", len(f.Images))},
+			}}
+			for _, img := range f.Images {
+				res.Content = append(res.Content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MIME})
+			}
+			return res, out, nil
+		}
+		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -383,12 +420,12 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_spec",
-		Description: "Persist a build (list of part ids) under an id for later recall.",
+		Description: "Persist a build (list of part ids) under an id for later recall. Repeat an id for quantity. List parts you ALREADY OWN in owned_ids — they still count for compatibility/TDP but are excluded from the purchase total and never shopped, so a build where you only need 1-2 new parts prices correctly.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in saveSpecIn) (*mcp.CallToolResult, savePartOut, error) {
 		if in.ID == "" {
 			return nil, savePartOut{}, fmt.Errorf("id is required")
 		}
-		if err := store.saveSpec(in.ID, in.Name, in.PartIDs); err != nil {
+		if err := store.saveSpec(in.ID, in.Name, in.PartIDs, in.OwnedIDs); err != nil {
 			return nil, savePartOut{}, err
 		}
 		return nil, savePartOut{ID: in.ID}, nil
@@ -502,12 +539,13 @@ func registerTools(s *mcp.Server) {
 		Description: "One-stop purchase plan for a build: per part, the cheapest usable (live + ships-to-region) listing as the buy link, ALL other recorded listings as flagged alternatives (nothing filtered out), a converted build total, resource shortages to also shop for (needs: cables, adapters, bays), and buy-page search hits for parts with no usable listing. Repeat a part id in the spec to buy multiples. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in shopIn) (*mcp.CallToolResult, shopOut, error) {
 		partIDs := in.PartIDs
+		ownedIDs := in.OwnedIDs
 		if in.SpecID != "" {
-			_, ids, err := store.loadSpec(in.SpecID)
+			_, ids, owned, err := store.loadSpec(in.SpecID)
 			if err != nil {
 				return nil, shopOut{}, err
 			}
-			partIDs = ids
+			partIDs, ownedIDs = ids, owned
 		}
 		if len(partIDs) == 0 {
 			return nil, shopOut{}, fmt.Errorf("pass spec_id or part_ids")
@@ -516,6 +554,7 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, shopOut{}, err
 		}
+		owned := toSet(ownedIDs)
 		region := regionFor(ctx, in.Country)
 		display := in.DisplayCurrency
 		if display == "" {
@@ -529,6 +568,11 @@ func registerTools(s *mcp.Server) {
 		}
 		for _, p := range parts {
 			item := shopItem{Part: p}
+			if owned[p.ID] {
+				item.Owned = true // already have it: counts for compat/TDP, not for buying
+				out.Items = append(out.Items, item)
+				continue
+			}
 			ls, err := pricePart(ctx, p.ID, region, display)
 			if err != nil {
 				return nil, shopOut{}, err
@@ -565,7 +609,7 @@ func registerTools(s *mcp.Server) {
 		}
 		out := compareOut{Region: region, TotalCurrency: display}
 		for _, sid := range in.SpecIDs {
-			name, partIDs, err := store.loadSpec(sid)
+			name, partIDs, ownedIDs, err := store.loadSpec(sid)
 			if err != nil {
 				return nil, compareOut{}, fmt.Errorf("spec %s: %w", sid, err)
 			}
@@ -573,13 +617,17 @@ func registerTools(s *mcp.Server) {
 			if err != nil {
 				return nil, compareOut{}, err
 			}
+			owned := toSet(ownedIDs)
 			spec := composeSpec(parts)
 			opt := specOption{
 				ID: sid, Name: name, Compatible: spec.Compatible,
 				Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
-				TotalTDPW: spec.TotalTDPW, PartCount: len(parts),
+				TotalTDPW: spec.TotalTDPW, PartCount: len(parts), OwnedCount: len(owned),
 			}
 			for _, p := range parts {
+				if owned[p.ID] {
+					continue // already owned — not a purchase
+				}
 				ls, err := pricePart(ctx, p.ID, region, display)
 				if err != nil {
 					return nil, compareOut{}, err
@@ -648,6 +696,30 @@ func registerTools(s *mcp.Server) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "export_spec",
+		Description: "Export one or more saved specs to an .xlsx workbook: a sheet per spec (parts, key specs, live best price + buy link, totals, gaps, needs) plus a Compare sheet for multiple specs. Returns the file path to open.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in exportIn) (*mcp.CallToolResult, exportOut, error) {
+		if len(in.SpecIDs) == 0 {
+			return nil, exportOut{}, fmt.Errorf("pass spec_ids")
+		}
+		region := regionFor(ctx, in.Country)
+		display := in.DisplayCurrency
+		if display == "" {
+			display = region.Currency
+		}
+		path := in.Path
+		if path == "" {
+			cwd, _ := os.Getwd()
+			path = filepath.Join(cwd, "parts-finder-"+slug(in.SpecIDs[0])+".xlsx")
+		}
+		out, err := exportSpecsXLSX(ctx, in.SpecIDs, path, region, display)
+		if err != nil {
+			return nil, exportOut{}, err
+		}
+		return nil, exportOut{Path: out, Specs: len(in.SpecIDs)}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "convert_currency",
 		Description: "Convert an amount between currencies using indicative ECB reference rates (frankfurter.app). For guiding figures, not accounting.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in convertIn) (*mcp.CallToolResult, convertOut, error) {
@@ -669,7 +741,7 @@ func registerTools(s *mcp.Server) {
 			}
 			return nil, loadSpecOut{Specs: specs}, nil
 		}
-		_, partIDs, err := store.loadSpec(in.ID)
+		_, partIDs, ownedIDs, err := store.loadSpec(in.ID)
 		if err != nil {
 			return nil, loadSpecOut{}, err
 		}
@@ -678,6 +750,7 @@ func registerTools(s *mcp.Server) {
 			return nil, loadSpecOut{}, err
 		}
 		spec := composeSpec(parts)
+		spec.Owned = ownedIDs
 		return nil, loadSpecOut{Spec: &spec}, nil
 	})
 }
