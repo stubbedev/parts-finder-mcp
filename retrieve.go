@@ -23,7 +23,10 @@ import (
 // endpoint covers static vendor/reseller pages. Add lightpanda when a target
 // needs JS rendering.
 
-const userAgent = "Mozilla/5.0 (X11; Linux x86_64) parts-finder-mcp/0.1"
+// Browser-grade UA: many shops flat-out 403 non-browser agents. Marketplaces
+// with TLS fingerprinting (eBay/Akamai) block regardless — those need
+// fetch_content(render=true) via lightpanda.
+const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
@@ -210,6 +213,9 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 		return "", "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
+		return "", "", fmt.Errorf("fetch %s: %s — site blocks plain HTTP (bot detection); retry with render=true (needs LIGHTPANDA_URL) or extract what you can from the search snippet", rawURL, resp.Status)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("fetch %s: %s", rawURL, resp.Status)
 	}

@@ -265,7 +265,7 @@ func regionFor(ctx context.Context, country string) Region {
 func registerTools(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_parts",
-		Description: "LIVE region-biased web search for hardware parts/spec pages. Returns result links to fetch. The live web is the source of truth for what exists: NEVER claim a model/SKU doesn't exist from prior knowledge — hardware releases outpace training data, so search first and trust the results.",
+		Description: "LIVE region-biased web search for hardware parts/spec pages. Returns result links to fetch. Scope to a marketplace with the site: operator in the query (e.g. 'site:ebay.de EPYC 9334', 'site:ebay.com ...') — this surfaces direct item links + price snippets even for sites whose pages block direct fetching. The live web is the source of truth for what exists: NEVER claim a model/SKU doesn't exist from prior knowledge — hardware releases outpace training data, so search first and trust the results.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, searchOut, error) {
 		q := in.Query
 		if in.Category != "" {
