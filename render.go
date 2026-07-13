@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,7 +16,6 @@ import (
 	"time"
 
 	"github.com/chromedp/chromedp"
-	readability "github.com/go-shiori/go-readability"
 )
 
 // Zero-config headless rendering. Resolution order for a CDP endpoint:
@@ -215,10 +213,7 @@ func fetchRendered(ctx context.Context, rawURL string) (title, text string, err 
 	); err != nil {
 		return "", "", fmt.Errorf("render %s: %w", rawURL, err)
 	}
-	pageURL, _ := url.Parse(rawURL)
-	art, err := readability.FromReader(strings.NewReader(html), pageURL)
-	if err != nil {
-		return "", "", err
-	}
-	return art.Title, art.TextContent, nil
+	// Same extraction as the plain fetcher (readability + table preservation):
+	// rendering is an implementation detail, never a downgrade.
+	return extractHTML([]byte(html), rawURL)
 }

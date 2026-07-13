@@ -13,7 +13,7 @@
 
         parts-finder = pkgs.buildGoModule {
           pname = "parts-finder";
-          version = "0.1.0";
+          version = "0.1.1";
           src = ./.;
           # buildGoModule fetches Go deps through the module proxy and
           # hashes the resulting vendor tree; `vendorHash` pins that
@@ -27,7 +27,7 @@
           ldflags = [
             "-s"
             "-w"
-            "-X main.version=0.1.0"
+            "-X main.version=0.1.1"
           ];
         };
       in

@@ -237,12 +237,18 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 		bytes.HasPrefix(magic, []byte("%PDF-")) {
 		return extractPDF(br)
 	}
-	// Buffer the HTML: readability flattens <table>s, but hardware specs ARE
-	// tables — extract them separately and append as markdown.
 	buf, err := io.ReadAll(io.LimitReader(br, 4<<20)) // 4MB page cap
 	if err != nil {
 		return "", "", err
 	}
+	return extractHTML(buf, rawURL)
+}
+
+// extractHTML is the single HTML→text path — readability for prose plus
+// <table> preservation as markdown (hardware specs ARE tables). Used by both
+// the plain fetcher and the headless renderer so a bot-blocked site never
+// yields worse extraction than an unblocked one.
+func extractHTML(buf []byte, rawURL string) (title, text string, err error) {
 	pageURL, _ := url.Parse(rawURL)
 	art, err := readability.FromReader(bytes.NewReader(buf), pageURL)
 	if err != nil {
