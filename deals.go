@@ -186,7 +186,7 @@ func probeURL(ctx context.Context, u string) bool {
 		if err != nil {
 			return false
 		}
-		req.Header.Set("User-Agent", userAgent)
+		browserHeaders(req)
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			continue // try GET; both failing = network-dead below

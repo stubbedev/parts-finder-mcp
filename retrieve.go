@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
 	"strings"
@@ -28,7 +29,24 @@ import (
 // fetch_content(render=true) via lightpanda.
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
-var httpClient = &http.Client{Timeout: 20 * time.Second}
+// httpClient defeats the billy-basic bot checks: follows redirects (Go
+// default, ≤10), carries session cookies across the set-cookie-then-redirect
+// dance half the shops do (cookie jar), and speaks gzip + HTTP/2 (transport
+// defaults). TLS-fingerprint walls are the renderer's job.
+var httpClient = newHTTPClient()
+
+func newHTTPClient() *http.Client {
+	jar, _ := cookiejar.New(nil) // only errors on nil PublicSuffixList options
+	return &http.Client{Timeout: 20 * time.Second, Jar: jar}
+}
+
+// browserHeaders makes a request look like a normal browser navigation —
+// walls commonly reject requests missing Accept/Accept-Language.
+func browserHeaders(req *http.Request) {
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+}
 
 func get(ctx context.Context, u string) (*http.Response, error) {
 	// Prefer https: upgrade plain-http URLs and only fall back to the
@@ -46,7 +64,7 @@ func doGet(ctx context.Context, u string) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	browserHeaders(req)
 	return httpClient.Do(req)
 }
 
@@ -58,9 +76,8 @@ func fetchPDFBrowserish(ctx context.Context, rawURL string) (title, text string,
 	if err != nil {
 		return "", "", err
 	}
-	req.Header.Set("User-Agent", userAgent)
+	browserHeaders(req)
 	req.Header.Set("Accept", "application/pdf,application/octet-stream,*/*")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 	if pu, perr := url.Parse(rawURL); perr == nil {
 		req.Header.Set("Referer", pu.Scheme+"://"+pu.Host+"/")
 	}
