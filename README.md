@@ -26,6 +26,45 @@ just build        # ./bin/parts-finder
 go build -o parts-finder .
 ```
 
+### Docker (e.g. Docker Desktop on macOS)
+
+A multi-arch image (amd64 + arm64, so Apple Silicon runs it natively) is
+published on every release:
+
+```sh
+docker pull ghcr.io/stubbedev/parts-finder-mcp:latest
+```
+
+Register it with Claude Code — the server speaks stdio, so `-i` is required
+and no ports are exposed. The named volume keeps your parts/specs/listings DB
+(and the auto-downloaded lightpanda renderer) across sessions:
+
+```sh
+claude mcp add parts-finder -- docker run -i --rm \
+  -v parts-finder-data:/data \
+  -v parts-finder-cache:/root/.cache \
+  ghcr.io/stubbedev/parts-finder-mcp:latest
+```
+
+`export_spec` caveat: the container writes .xlsx files inside its own
+filesystem. Mount a host folder and export there:
+
+```sh
+claude mcp add parts-finder -- docker run -i --rm \
+  -v parts-finder-data:/data \
+  -v parts-finder-cache:/root/.cache \
+  -v "$HOME/Documents/parts-finder:/exports" \
+  ghcr.io/stubbedev/parts-finder-mcp:latest
+# then ask for exports to /exports/<name>.xlsx — they land in
+# ~/Documents/parts-finder on the Mac.
+```
+
+Or build the image yourself: `docker build -t parts-finder .` and use
+`parts-finder` in place of the ghcr.io tag above.
+
+Native install is also fine on macOS — `brew install
+stubbedev/parts-finder/parts-finder` skips Docker entirely.
+
 ## Register (Claude Code)
 
 ```sh
