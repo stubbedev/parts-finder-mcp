@@ -931,7 +931,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "deep_specs",
-		Description: "Deep-drill a part's specifications: multi-angle web search (spec page, datasheet PDF, manual; motherboards also get a CPU-support/QVL angle — the vendor's own compatibility list is the authoritative source), fetch the top sources (tables preserved), and report which fields are still empty. empty_fields is generated from the ACTIVE compat rules, so it always asks for exactly what the engine can check. Use the returned source texts to fill EVERY listed attribute + provides/requires, then save_part. If a source states a constraint the rules can't express, save_rule it. Re-run with extra queries if fields stay empty.",
+		Description: "Deep-drill a part's specifications: Open Icecat's brand-authorized datasheet first — zero config, public open-content access (normalized spec table + vendor PDF links; save the part's gtin/ean or mpn attr for exact lookups — listings print EANs, spec pages print MPNs), then multi-angle web search (spec page, datasheet PDF, manual; motherboards also get a CPU-support/QVL angle — the vendor's own compatibility list is the authoritative source), fetching the top sources with tables preserved, and reporting which fields are still empty. empty_fields is generated from the ACTIVE compat rules, so it always asks for exactly what the engine can check. Use the returned source texts to fill EVERY listed attribute + provides/requires, then save_part; fetch_content any listed vendor PDFs for full detail. If a source states a constraint the rules can't express, save_rule it. Re-run with extra queries if fields stay empty.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in deepIn) (*mcp.CallToolResult, deepOut, error) {
 		parts, err := store.getParts([]string{in.PartID})
 		if err != nil {
@@ -954,9 +954,17 @@ func registerTools(s *mcp.Server) {
 			if p.Category == "motherboard" {
 				queries = append([]string{name + " cpu support list qvl"}, queries...)
 			}
+			// Icecat datasheets by search too — backup for parts the direct
+			// API lookup misses (non-sponsor brands, odd product codes).
+			queries = append(queries, name+" site:icecat.biz")
 		}
 		region := detectRegion(ctx)
 		out := deepOut{Part: p, EmptyFields: emptyFields(p)}
+		// Open Icecat first when configured: brand-authorized normalized specs
+		// + vendor PDF links, independent of whatever the web search finds.
+		if src, ok := icecatSource(ctx, p); ok {
+			out.Sources = append(out.Sources, src)
+		}
 		seen := map[string]bool{p.SourceURL: true, "": true}
 		for _, q := range queries {
 			hits, _ := searchRegion(ctx, q, 5, region)

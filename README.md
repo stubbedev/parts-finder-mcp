@@ -38,6 +38,12 @@ Optional env:
 - `SEARXNG_URL` — base URL of a SearXNG instance; when set it becomes the
   FIRST search engine in the chain (your own instance, no rate-limit
   exposure).
+- `ICECAT_USER` — Icecat account username for wider catalog access.
+  **Not required**: without it, Open Icecat's public open-content user is
+  used — zero config, zero registration. `deep_specs` pulls the
+  brand-authorized structured datasheet (normalized spec table + vendor PDF
+  links) before falling back to web search; save a part's `gtin`/`ean` or
+  `mpn` attr for exact lookups.
 - `LIGHTPANDA_URL` — CDP endpoint of an externally managed
   [lightpanda](https://github.com/lightpanda-io/browser)/Chrome. **Optional**:
   without it, parts-finder finds `lightpanda` on PATH, or downloads it to
