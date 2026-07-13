@@ -19,9 +19,9 @@ import (
 	"github.com/ledongthuc/pdf"
 )
 
-// ponytail: real browser (lightpanda) deferred to M3; plain HTTP + DDG HTML
-// endpoint covers static vendor/reseller pages. Add lightpanda when a target
-// needs JS rendering.
+// Plain HTTP + DDG HTML endpoint covers static vendor/reseller pages;
+// bot-blocked pages auto-escalate to the zero-config lightpanda renderer
+// (render.go). Extraction quality is identical on both paths (extractHTML).
 
 // Browser-grade UA: many shops flat-out 403 non-browser agents. Marketplaces
 // with TLS fingerprinting (eBay/Akamai) block regardless — those need
@@ -31,12 +31,48 @@ const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, li
 var httpClient = &http.Client{Timeout: 20 * time.Second}
 
 func get(ctx context.Context, u string) (*http.Response, error) {
+	// Prefer https: upgrade plain-http URLs and only fall back to the
+	// original scheme if the TLS endpoint doesn't answer.
+	if strings.HasPrefix(u, "http://") {
+		if resp, err := doGet(ctx, "https://"+strings.TrimPrefix(u, "http://")); err == nil {
+			return resp, nil
+		}
+	}
+	return doGet(ctx, u)
+}
+
+func doGet(ctx context.Context, u string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", userAgent)
 	return httpClient.Do(req)
+}
+
+// fetchPDFBrowserish re-tries a bot-blocked PDF download with the headers a
+// real browser would send (referer from the site root, Accept, language).
+// Covers hotlink-protection 403s; TLS-fingerprint walls still lose.
+func fetchPDFBrowserish(ctx context.Context, rawURL string) (title, text string, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/pdf,application/octet-stream,*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	if pu, perr := url.Parse(rawURL); perr == nil {
+		req.Header.Set("Referer", pu.Scheme+"://"+pu.Host+"/")
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", "", fmt.Errorf("pdf retry got %s", resp.Status)
+	}
+	return extractPDF(io.LimitReader(resp.Body, 64<<20))
 }
 
 // SearchHit is one search result.
@@ -216,7 +252,15 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 		// Bot-blocked (eBay/Akamai and friends). Auto-escalate through the
 		// headless renderer — zero config, lightpanda is spawned (and even
-		// downloaded) on demand.
+		// downloaded) on demand. PDFs can't be rendered by a browser DOM;
+		// instead retry the download with full browser headers + referer
+		// (most PDF 403s are referer/UA checks, not TLS fingerprinting).
+		if strings.HasSuffix(strings.ToLower(rawURL), ".pdf") {
+			if t, x, perr := fetchPDFBrowserish(ctx, rawURL); perr == nil {
+				return t, x, nil
+			}
+			return "", "", fmt.Errorf("fetch %s: %s — PDF host blocks plain HTTP even with browser headers; find a mirror of the datasheet", rawURL, resp.Status)
+		}
 		if t, x, rerr := fetchRendered(ctx, rawURL); rerr == nil {
 			return t, x, nil
 		} else {

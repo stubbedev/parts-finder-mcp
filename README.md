@@ -45,7 +45,7 @@ Optional env:
   renderer — zero configuration needed.
 - `REGION_COUNTRY` / `REGION_CURRENCY` — override the IP-detected region
   (e.g. `DK` / `DKK`). By default the region is auto-detected from your IP
-  (ip-api.com) and cached for the process.
+  (ifconfig.co over https) and cached for the process.
 
 ## Region & currency
 

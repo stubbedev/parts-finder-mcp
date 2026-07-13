@@ -174,10 +174,13 @@ func urlAlive(ctx context.Context, u string) bool {
 	return alive
 }
 
+// probeURL decides listing liveness. Principle: a deal is only dead on
+// PROOF — 404/410 from a GET, or total network failure. Bot walls answer
+// probes with 403/429/500 (eBay does all three depending on method); treating
+// those as dead would hide every marketplace deal.
 func probeURL(ctx context.Context, u string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	// Try HEAD first; some servers reject it, so fall back to GET.
 	for _, method := range []string{http.MethodHead, http.MethodGet} {
 		req, err := http.NewRequestWithContext(ctx, method, u, nil)
 		if err != nil {
@@ -186,15 +189,23 @@ func probeURL(ctx context.Context, u string) bool {
 		req.Header.Set("User-Agent", userAgent)
 		resp, err := httpClient.Do(req)
 		if err != nil {
-			continue
+			continue // try GET; both failing = network-dead below
 		}
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusMethodNotAllowed && method == http.MethodHead {
-			continue
+		ok := resp.StatusCode >= 200 && resp.StatusCode < 400
+		if method == http.MethodHead && !ok {
+			continue // HEAD is unreliable (bot walls 500/403 it) — GET decides
 		}
-		return resp.StatusCode >= 200 && resp.StatusCode < 400
+		switch {
+		case ok:
+			return true
+		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
+			return false // definitive: listing is gone
+		default:
+			return true // 403/429/5xx/challenges — ambiguous, never kill a deal on ambiguity
+		}
 	}
-	return false
+	return false // network-level failure on both methods
 }
 
 // substituteMatch reports whether candidate can drop into the same build slot as

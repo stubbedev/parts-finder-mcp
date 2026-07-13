@@ -421,9 +421,9 @@ func registerTools(s *mcp.Server) {
 		sortListings(listings)
 		out := dealsOut{Region: region, Listings: listings}
 		if in.Search {
-			p := parts[0]
-			q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
-			out.Hits, _ = searchRegion(ctx, q, 10, region) // best-effort
+			if name := strings.TrimSpace(parts[0].Vendor + " " + parts[0].Model); name != "" {
+				out.Hits, _ = searchRegion(ctx, name+" buy price", 10, region) // best-effort
+			}
 		}
 		return nil, out, nil
 	})
@@ -526,9 +526,8 @@ func registerTools(s *mcp.Server) {
 				}
 			} else {
 				item.Alternatives = ls // only flagged listings on record — show them all
-				if !in.NoSearch {
-					q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
-					item.SearchHits, _ = searchRegion(ctx, q, 5, region) // best-effort
+				if name := strings.TrimSpace(p.Vendor + " " + p.Model); !in.NoSearch && name != "" {
+					item.SearchHits, _ = searchRegion(ctx, name+" buy price", 5, region) // best-effort
 				}
 			}
 			out.Items = append(out.Items, item)

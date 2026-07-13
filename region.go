@@ -48,28 +48,52 @@ func detectRegion(ctx context.Context) Region {
 	return regionVal
 }
 
-// lookupIP asks a keyless geo-IP service for the caller's country + currency.
-// ponytail: single provider (ip-api.com, no key, 45 req/min). Add a fallback
-// provider only if it proves flaky.
+// lookupIP asks a keyless https geo-IP service for the caller's country;
+// currency is derived from the ISO table below. ponytail: single provider
+// (ifconfig.co, https, no key); detection is cached for the process so one
+// call per run. Add a fallback provider only if it proves flaky.
 func lookupIP(ctx context.Context) Region {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"http://ip-api.com/json/?fields=countryCode,currency", nil)
+		"https://ifconfig.co/json", nil)
 	if err != nil {
 		return Region{}
 	}
+	req.Header.Set("User-Agent", userAgent)
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return Region{}
 	}
 	defer resp.Body.Close()
 	var v struct {
-		CountryCode string `json:"countryCode"`
-		Currency    string `json:"currency"`
+		CountryISO string `json:"country_iso"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&v) != nil {
 		return Region{}
 	}
-	return Region{Country: strings.ToUpper(v.CountryCode), Currency: strings.ToUpper(v.Currency)}
+	cc := strings.ToUpper(v.CountryISO)
+	return Region{Country: cc, Currency: currencyOf(cc)}
+}
+
+// currencyOf maps ISO country -> ISO currency. Standards data, not vendor
+// preference: non-euro currencies listed explicitly, EU members default to
+// EUR, everything else to USD (safe display fallback — override with
+// REGION_CURRENCY).
+var countryCurrency = map[string]string{
+	"DK": "DKK", "SE": "SEK", "NO": "NOK", "IS": "ISK", "CH": "CHF",
+	"GB": "GBP", "PL": "PLN", "CZ": "CZK", "HU": "HUF", "RO": "RON",
+	"BG": "BGN", "US": "USD", "CA": "CAD", "AU": "AUD", "NZ": "NZD",
+	"JP": "JPY", "CN": "CNY", "KR": "KRW", "IN": "INR", "BR": "BRL",
+	"MX": "MXN", "SG": "SGD", "HK": "HKD", "TW": "TWD", "TR": "TRY",
+}
+
+func currencyOf(country string) string {
+	if c, ok := countryCurrency[country]; ok {
+		return c
+	}
+	if euCountries[country] {
+		return "EUR"
+	}
+	return "USD"
 }
 
 // ddgRegion maps a country to DuckDuckGo's kl locale param. Unknown -> "".
