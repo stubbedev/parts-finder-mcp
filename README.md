@@ -1,7 +1,6 @@
 # parts-finder-mcp
 
-Local Go MCP server for speccing servers from compatible hardware. See
-[DESIGN.md](DESIGN.md) for the full design.
+Local Go MCP server for speccing servers from compatible hardware.
 
 ## Install
 
