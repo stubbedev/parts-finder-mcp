@@ -3,18 +3,107 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/xuri/excelize/v2"
 )
+
+// exportLocations are the logical save spots offered via elicitation.
+var exportLocations = []string{"Documents", "Home", "Current folder", "Custom folder"}
+
+// resolveExportDir maps a location choice to an absolute directory, working on
+// both Linux and macOS. Unknown/empty → current directory.
+func resolveExportDir(choice, custom string) string {
+	home, _ := os.UserHomeDir()
+	switch choice {
+	case "Home":
+		return home
+	case "Documents":
+		if d := os.Getenv("XDG_DOCUMENTS_DIR"); d != "" { // Linux XDG override
+			return expandHome(d, home)
+		}
+		return filepath.Join(home, "Documents") // macOS + Linux default
+	case "Custom folder":
+		if custom != "" {
+			return expandHome(custom, home)
+		}
+	}
+	cwd, _ := os.Getwd()
+	return cwd
+}
+
+func expandHome(p, home string) string {
+	if p == "~" {
+		return home
+	}
+	if strings.HasPrefix(p, "~/") {
+		return filepath.Join(home, p[2:])
+	}
+	return p
+}
+
+// elicitExportPath asks the user where to save via MCP form elicitation.
+// Returns "" (with nil error) when the client can't elicit or the user
+// declines — the caller then falls back to a sensible default.
+func elicitExportPath(ctx context.Context, sess *mcp.ServerSession, defaultName string) string {
+	if sess == nil {
+		return ""
+	}
+	schema := map[string]any{
+		"type": "object",
+		"properties": map[string]any{
+			"location": map[string]any{
+				"type": "string", "enum": exportLocations,
+				"description": "Where to save the spreadsheet",
+			},
+			"custom_folder": map[string]any{
+				"type": "string", "description": "Absolute folder path (only if you picked 'Custom folder')",
+			},
+			"filename": map[string]any{
+				"type": "string", "description": "File name", "default": defaultName,
+			},
+		},
+		"required": []string{"location"},
+	}
+	res, err := sess.Elicit(ctx, &mcp.ElicitParams{
+		Mode:            "form",
+		Message:         "Where should I save the Excel export?",
+		RequestedSchema: schema,
+	})
+	if err != nil || res == nil || res.Action != "accept" {
+		return "" // unsupported or declined → caller defaults
+	}
+	str := func(k string) string { s, _ := res.Content[k].(string); return strings.TrimSpace(s) }
+	dir := resolveExportDir(str("location"), str("custom_folder"))
+	name := str("filename")
+	if name == "" {
+		name = defaultName
+	}
+	if !strings.HasSuffix(strings.ToLower(name), ".xlsx") {
+		name += ".xlsx"
+	}
+	return filepath.Join(dir, filepath.Base(name)) // Base: keep the filename in the chosen dir
+}
 
 // exportSpecsXLSX writes one polished workbook: a sheet per spec (title,
 // frozen header, bordered/zebra table of parts + live best price + key specs +
 // buy links, then a summary block separating what you must BUY from what you
 // already OWN) and, for 2+ specs, a Compare sheet — the decision view.
-func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region Region, display string) (string, error) {
-	f := excelize.NewFile()
+func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region Region, display string, appendMode bool) (string, error) {
+	var f *excelize.File
+	fresh := true
+	if appendMode {
+		if existing, err := excelize.OpenFile(path); err == nil {
+			f, fresh = existing, false // edit the existing workbook in place
+		}
+	}
+	if f == nil {
+		f = excelize.NewFile()
+	}
 	defer f.Close()
 
 	st := newStyles(f, display)
@@ -30,9 +119,15 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 			return "", err
 		}
 		owned := toSet(ownedIDs)
+		prewarmLiveness(ctx, partIDs)
 		spec := composeSpec(parts)
 
-		sheet := sheetName(sid, f)
+		// Deterministic sheet name so re-exporting a spec REPLACES its sheet
+		// (update-in-place) rather than piling up "~2" duplicates.
+		sheet := safeSheetName(sid)
+		if idx, err := f.GetSheetIndex(sheet); err == nil && idx != -1 {
+			f.DeleteSheet(sheet)
+		}
 		f.NewSheet(sheet)
 
 		// Title.
@@ -181,13 +276,19 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 	}
 
 	if len(summaries) > 1 {
+		if idx, err := f.GetSheetIndex("Compare"); err == nil && idx != -1 {
+			f.DeleteSheet("Compare") // refresh on re-export
+		}
 		writeCompareSheet(f, st, summaries, display)
 	}
 
-	// Drop the default sheet now that real sheets exist (delete-only-sheet is a
-	// no-op, so this must happen after the first NewSheet).
-	if idx, err := f.GetSheetIndex("Sheet1"); err == nil && idx != -1 {
-		f.DeleteSheet("Sheet1")
+	// Drop the default sheet now that real sheets exist (only present on a
+	// freshly-created workbook; delete-only-sheet is a no-op so this runs after
+	// the first NewSheet).
+	if fresh {
+		if idx, err := f.GetSheetIndex("Sheet1"); err == nil && idx != -1 {
+			f.DeleteSheet("Sheet1")
+		}
 	}
 
 	if err := f.SaveAs(path); err != nil {
@@ -291,22 +392,18 @@ func keySpecs(p Part) string {
 	return b.String()
 }
 
-// sheetName makes a spec id safe + unique as an Excel sheet name (≤31 chars,
-// no []:*?/\).
-func sheetName(sid string, f *excelize.File) string {
+// safeSheetName makes a spec id a valid, deterministic Excel sheet name
+// (≤31 chars, no []:*?/\). Deterministic so a re-export replaces the same
+// sheet. ponytail: two spec ids sharing a 28-char sanitized prefix would
+// collide — fine for realistic ids.
+func safeSheetName(sid string) string {
 	repl := strings.NewReplacer("[", "(", "]", ")", ":", "-", "*", "-", "?", "-", "/", "-", "\\", "-")
 	n := repl.Replace(sid)
 	if len(n) > 28 {
 		n = n[:28]
 	}
-	base, i := n, 2
-	for {
-		idx, err := f.GetSheetIndex(n)
-		if err != nil || idx == -1 {
-			break
-		}
-		n = fmt.Sprintf("%s~%d", base, i)
-		i++
+	if n == "" {
+		n = "spec"
 	}
 	return n
 }

@@ -6,6 +6,7 @@ import (
 	_ "image/gif" // register GIF decoder
 	"image/jpeg"
 	_ "image/png" // register PNG decoder
+	"math"
 
 	_ "golang.org/x/image/bmp" // register BMP decoder
 	"golang.org/x/image/draw"
@@ -19,9 +20,31 @@ import (
 // upload time for no extra readable detail. Best-effort: on any decode/encode
 // problem the original bytes pass through unchanged.
 //
-// 1568px is Anthropic's documented long-edge sweet spot — larger images are
-// downscaled server-side anyway, so sending bigger only wastes bandwidth.
-const maxImageEdge = 1568
+// Anthropic vision downscales anything over ~1568px on the long edge OR over
+// ~1.15 megapixels, whichever bites first. Matching BOTH here means we ship the
+// exact pixels the model will use — no wasted upload, no wasted tokens — and we
+// resample with a good filter instead of the server's. A 4:3 photo at 1568px
+// long edge is 1.84MP, well over the area cap, so the megapixel bound is what
+// actually shrinks most real images further without touching readable detail.
+const (
+	maxImageEdge   = 1568
+	maxImagePixels = 1_150_000
+)
+
+// fitScale returns the largest scale ≤1 that keeps the image within both the
+// long-edge and megapixel caps.
+func fitScale(w, h int) float64 {
+	s := 1.0
+	if long := max(w, h); long > maxImageEdge {
+		s = float64(maxImageEdge) / float64(long)
+	}
+	if px := float64(w) * float64(h); px > maxImagePixels {
+		if ps := math.Sqrt(maxImagePixels / px); ps < s {
+			s = ps
+		}
+	}
+	return s
+}
 
 func init() {
 	// Let image.Decode sniff webp too (stdlib registers jpeg/png/gif on import).
@@ -41,18 +64,21 @@ func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
 	}
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
-	long := max(w, h)
+	scale := fitScale(w, h)
 
-	// Already small colour JPEG/PNG and caller wants colour: leave it.
-	if keepColor && long <= maxImageEdge && len(data) <= 400*1024 &&
+	// Already within caps, already a compact colour raster, and caller wants
+	// colour: nothing to gain — leave it.
+	if keepColor && scale == 1 && len(data) <= 400*1024 &&
 		(mime == "image/jpeg" || mime == "image/png") {
 		return data, mime
 	}
 
-	nw, nh := w, h
-	if long > maxImageEdge {
-		scale := float64(maxImageEdge) / float64(long)
-		nw, nh = int(float64(w)*scale), int(float64(h)*scale)
+	nw, nh := int(float64(w)*scale), int(float64(h)*scale)
+	if nw < 1 {
+		nw = 1
+	}
+	if nh < 1 {
+		nh = 1
 	}
 
 	var dst draw.Image
@@ -67,7 +93,7 @@ func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
 	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 82}); err != nil {
 		return data, mime
 	}
-	if buf.Len() >= len(data) && long <= maxImageEdge && keepColor {
+	if buf.Len() >= len(data) && scale == 1 && keepColor {
 		return data, mime // re-encode didn't help — keep original
 	}
 	return buf.Bytes(), "image/jpeg"

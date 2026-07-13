@@ -69,7 +69,7 @@ filter.
 | `search_parts(query, category?, limit?)` | LIVE keyless region-biased search → result links (web is truth, not training data) |
 | `fetch_content(url, kind?, render?)` | fetch → text (smart-cached by kind); PDF + HTML tables preserved; bot-blocked pages auto-render via lightpanda |
 | `fetch_image(url)` | download + downscale an image (jpeg/png/gif/webp/bmp/tiff) → vision block for reading specs/labels/diagrams off pictures |
-| `export_spec(spec_ids[], path?)` | write a polished .xlsx: per-spec sheet (parts, live prices, buy links, owned-vs-buy totals) + Compare sheet |
+| `export_spec(spec_ids[], path?, append?)` | polished .xlsx: per-spec sheet (parts, live prices, buy links, owned-vs-buy totals) + Compare sheet; `append` edits an existing workbook in place; prompts for a save location when `path` is omitted |
 | `save_part(Part)` | persist a part: scalars + provides/requires + free-form `attrs` |
 | `query_parts(ids? \| category?, where[]?)` | query parts by any attribute: `cuda_compute >= 8.9`, `l3_cache_mb >= 256`; ops eq/ne/gt/gte/lt/lte/contains/exists |
 | `compose_spec(part_ids[])` | build report: compat over known data, loud gaps, needs, total TDP |
@@ -157,6 +157,13 @@ hardened path:
 - **https-first**, redirect-following, transparent gzip.
 - **Headless escalation** — TLS-fingerprint walls (eBay/Akamai) auto-escalate
   to lightpanda; same extraction either way.
+- **Resilient** — every goroutine and tool handler recovers from panics, so one
+  bad probe/scrape/request can never crash the server. Listing liveness is
+  pre-warmed in one parallel sweep before pricing a build.
+- **Vision-tuned images** — fetched/scanned images are downscaled to both
+  Anthropic's long-edge (1568px) and megapixel (~1.15MP) caps and grayscaled by
+  default, so we upload exactly the pixels the model uses — smaller, faster,
+  cheaper, no readable detail lost.
 - **Smart caching** — persistent SQLite cache keyed by URL with per-`kind` TTL
   (spec ~30d / page ~1d / listing ~1h). Stale entries revalidate cheaply via
   ETag / Last-Modified conditional GETs (304 → keep, reset TTL). On any fetch

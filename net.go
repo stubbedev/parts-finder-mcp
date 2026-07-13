@@ -2,14 +2,26 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// recoverLog turns a panicking goroutine into a logged non-event. A panic in
+// ANY goroutine that isn't recovered takes down the whole MCP process — every
+// goroutine we spawn defers this so one bad probe/scrape can't crash the
+// server. Logs to stderr (stdout carries the MCP protocol).
+func recoverLog(where string) {
+	if r := recover(); r != nil {
+		fmt.Fprintf(os.Stderr, "parts-finder: recovered panic in %s: %v\n", where, r)
+	}
+}
 
 // This is the retrieval cornerstone: every outbound request goes through
 // doRequest, which (1) rotates a realistic browser fingerprint stable per host

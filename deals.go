@@ -124,6 +124,27 @@ func annotateDisplay(ctx context.Context, ls []Listing, display string) {
 	}
 }
 
+// prewarmLiveness probes every listing URL across a set of parts in one
+// concurrent batch, populating the alive cache. Pricing each part afterwards
+// then hits the cache instead of serially probing — turning N sequential
+// per-part probe rounds into one parallel sweep. Best-effort.
+func prewarmLiveness(ctx context.Context, partIDs []string) {
+	var all []Listing
+	seen := map[string]bool{}
+	for _, id := range partIDs {
+		if seen[id] {
+			continue // repeated (quantity) ids share listings
+		}
+		seen[id] = true
+		ls, err := store.listingsFor(id)
+		if err != nil {
+			continue
+		}
+		all = append(all, ls...)
+	}
+	liveCheckAll(ctx, all)
+}
+
 // liveCheckAll probes each listing URL concurrently and sets Dead when the URL
 // is unreachable or 4xx/5xx. ponytail: status/redirect check only — a live URL
 // whose price changed still reads as alive; deep price re-verification is the
@@ -139,7 +160,8 @@ func liveCheckAll(ctx context.Context, ls []Listing) {
 		sem <- struct{}{}
 		go func(i int) {
 			defer wg.Done()
-			defer func() { <-sem }()
+			defer func() { <-sem }() // release slot even if the probe panics
+			defer recoverLog("liveCheck")
 			ls[i].Dead = !urlAlive(ctx, ls[i].URL)
 		}(i)
 	}

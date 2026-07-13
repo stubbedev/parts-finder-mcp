@@ -129,7 +129,11 @@ func spawnLightpanda(ctx context.Context, bin string) (base string, cmd *exec.Cm
 	// Reap on exit (no zombie) and expose "process died" to the poll loop —
 	// cmd.ProcessState is only set by Wait.
 	died := make(chan struct{})
-	go func() { cmd.Wait(); close(died) }()
+	go func() {
+		defer recoverLog("lightpanda-reaper")
+		cmd.Wait()
+		close(died)
+	}()
 	base = fmt.Sprintf("http://127.0.0.1:%d", port)
 	// Readiness: poll the real CDP endpoint, abort early if the process died.
 	deadline := time.Now().Add(15 * time.Second)

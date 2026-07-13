@@ -36,12 +36,30 @@ func main() {
 	}
 
 	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: version}, nil)
+	// A panic in any tool handler would otherwise crash the whole server — the
+	// SDK doesn't recover them. Turn a handler panic into a normal error so one
+	// bad request never takes the process down.
+	s.AddReceivingMiddleware(recoverMiddleware)
 	registerTools(s)
 
 	defer stopRenderer() // kill any lightpanda we spawned
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		stopRenderer()
 		log.Fatal(err)
+	}
+}
+
+// recoverMiddleware catches a panic in any request handler and returns it as an
+// error instead of letting it crash the server process.
+func recoverMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (result mcp.Result, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(os.Stderr, "parts-finder: recovered panic in %s: %v\n", method, r)
+				err = fmt.Errorf("internal error in %s: %v", method, r)
+			}
+		}()
+		return next(ctx, method, req)
 	}
 }
 
@@ -244,6 +262,7 @@ func emptyFields(p Part) []string {
 type exportIn struct {
 	SpecIDs         []string `json:"spec_ids" jsonschema:"saved spec ids to export (one sheet each; a Compare sheet is added for 2+)"`
 	Path            string   `json:"path,omitempty" jsonschema:"output .xlsx path; defaults to ./parts-finder-<spec>.xlsx"`
+	Append          bool     `json:"append,omitempty" jsonschema:"edit an existing workbook at path instead of overwriting it: each spec's sheet is added or replaced in place, other sheets untouched"`
 	Country         string   `json:"country,omitempty"`
 	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for the price columns; defaults to region currency"`
 }
@@ -563,6 +582,7 @@ func registerTools(s *mcp.Server) {
 		if display == "" {
 			display = region.Currency
 		}
+		prewarmLiveness(ctx, partIDs) // one parallel probe sweep; per-part pricing then hits cache
 		spec := composeSpec(parts)
 		out := shopOut{
 			Region: region, Compatible: spec.Compatible,
@@ -622,6 +642,7 @@ func registerTools(s *mcp.Server) {
 				return nil, compareOut{}, err
 			}
 			owned := toSet(ownedIDs)
+			prewarmLiveness(ctx, partIDs)
 			spec := composeSpec(parts)
 			opt := specOption{
 				ID: sid, Name: name, Compatible: spec.Compatible,
@@ -701,8 +722,8 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "export_spec",
-		Description: "Export one or more saved specs to an .xlsx workbook: a sheet per spec (parts, key specs, live best price + buy link, totals, gaps, needs) plus a Compare sheet for multiple specs. Returns the file path to open.",
-	}, func(ctx context.Context, _ *mcp.CallToolRequest, in exportIn) (*mcp.CallToolResult, exportOut, error) {
+		Description: "Export one or more saved specs to an .xlsx workbook: a sheet per spec (parts, key specs, live best price + buy link, owned-vs-buy totals, gaps, needs) plus a Compare sheet for multiple specs. Returns the file path to open. Pass append=true to update an existing workbook in place — a spec's sheet is added or replaced, leaving your other sheets/edits intact.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in exportIn) (*mcp.CallToolResult, exportOut, error) {
 		if len(in.SpecIDs) == 0 {
 			return nil, exportOut{}, fmt.Errorf("pass spec_ids")
 		}
@@ -711,12 +732,21 @@ func registerTools(s *mcp.Server) {
 		if display == "" {
 			display = region.Currency
 		}
+		defaultName := "parts-finder-" + slug(in.SpecIDs[0]) + ".xlsx"
 		path := in.Path
 		if path == "" {
-			cwd, _ := os.Getwd()
-			path = filepath.Join(cwd, "parts-finder-"+slug(in.SpecIDs[0])+".xlsx")
+			// Ask the user where to save (Home/Documents/current/custom); falls
+			// back to the current folder if the client can't elicit.
+			path = elicitExportPath(ctx, req.Session, defaultName)
 		}
-		out, err := exportSpecsXLSX(ctx, in.SpecIDs, path, region, display)
+		if path == "" {
+			cwd, _ := os.Getwd()
+			path = filepath.Join(cwd, defaultName)
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return nil, exportOut{}, fmt.Errorf("create output dir: %w", err)
+		}
+		out, err := exportSpecsXLSX(ctx, in.SpecIDs, path, region, display, in.Append)
 		if err != nil {
 			return nil, exportOut{}, err
 		}
