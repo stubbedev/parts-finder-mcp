@@ -110,7 +110,11 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 	var summaries []cmpRow
 
 	for _, sid := range specIDs {
-		name, partIDs, ownedIDs, err := store.loadSpec(sid)
+		name, rawIDs, rawOwned, err := store.loadSpec(sid)
+		if err != nil {
+			return "", fmt.Errorf("spec %s: %w", sid, err)
+		}
+		partIDs, ownedIDs, err := store.expandSpecIDs(rawIDs, rawOwned)
 		if err != nil {
 			return "", fmt.Errorf("spec %s: %w", sid, err)
 		}
@@ -118,7 +122,7 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 		if err != nil {
 			return "", err
 		}
-		owned := toSet(ownedIDs)
+		ownedLeft := toCount(ownedIDs) // repeats = units owned; consumed per row
 		prewarmLiveness(ctx, partIDs)
 		spec := composeSpec(parts)
 
@@ -157,9 +161,10 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 			if (row-hrow)%2 == 0 {
 				base = st.cellAlt
 			}
-			isOwned := owned[p.ID]
+			isOwned := ownedLeft[p.ID] > 0 // rows are per unit; own 3 of 8 = first 3 rows owned
 			status := "buy"
 			if isOwned {
+				ownedLeft[p.ID]--
 				status = "OWNED"
 				ownedN++
 			}

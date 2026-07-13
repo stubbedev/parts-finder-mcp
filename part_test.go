@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // Self-test: known-good build has no violations; known-bad build fires the
 // expected rules. Guards the compat engine against silent breakage.
@@ -103,6 +106,124 @@ func TestQuantityAndNeeds(t *testing.T) {
 	}
 }
 
+// Data-driven combo rules: module type, cpu mem gen, capacity caps, cooler
+// socket lists, superset port tokens. Unknowns never violate.
+func TestExtendedCombos(t *testing.T) {
+	mb := Part{ID: "mb", Category: "motherboard", Socket: "SP5", MemType: "DDR5",
+		Attrs: map[string]any{"mem_module": "RDIMM", "mem_max_gb": 512, "dimm_max_gb": 64}}
+	fire := func(parts []Part, rule string) bool {
+		for _, v := range checkCompat(parts) {
+			if v.Rule == rule {
+				return true
+			}
+		}
+		return false
+	}
+	// RDIMM board + UDIMM stick = no boot.
+	udimm := Part{ID: "u1", Category: "ram", MemType: "DDR5", Attrs: map[string]any{"mem_module": "UDIMM"}}
+	if !fire([]Part{mb, udimm}, "ram_module_type") {
+		t.Errorf("UDIMM on RDIMM board must violate")
+	}
+	// Matching module type, normalized case: fine.
+	rdimm := Part{ID: "r1", Category: "ram", MemType: "DDR5",
+		Attrs: map[string]any{"mem_module": "rdimm", "capacity_gb": 64}}
+	if fire([]Part{mb, rdimm}, "ram_module_type") {
+		t.Errorf("rdimm == RDIMM after normalization")
+	}
+	// Unknown module type on the stick: gap territory, no violation.
+	plain := Part{ID: "p1", Category: "ram", MemType: "DDR5"}
+	if fire([]Part{mb, plain}, "ram_module_type") {
+		t.Errorf("unknown module type must not violate")
+	}
+	// CPU with a DDR4 controller on a DDR5 board.
+	cpu4 := Part{ID: "c4", Category: "cpu", Socket: "SP5", MemType: "DDR4"}
+	if !fire([]Part{mb, cpu4}, "cpu_mem_type") {
+		t.Errorf("DDR4 cpu on DDR5 board must violate")
+	}
+	// 9x64GB = 576GB > 512GB board max (sum); a 128GB stick > 64GB/DIMM (each).
+	nine := []Part{mb}
+	for i := 0; i < 9; i++ {
+		nine = append(nine, rdimm)
+	}
+	if !fire(nine, "mem_capacity") {
+		t.Errorf("576GB total on 512GB board must violate")
+	}
+	big := Part{ID: "big", Category: "ram", MemType: "DDR5",
+		Attrs: map[string]any{"mem_module": "RDIMM", "capacity_gb": 128}}
+	if !fire([]Part{mb, big}, "dimm_capacity") {
+		t.Errorf("128GB stick vs 64GB/DIMM cap must violate")
+	}
+	// Cooler socket list: "SP5, SP6" fits SP5 board; "AM45" must not match "AM4".
+	cooler := Part{ID: "cool", Category: "cooler", Attrs: map[string]any{"sockets": "SP5, SP6"}}
+	if fire([]Part{mb, cooler}, "cooler_socket") {
+		t.Errorf("SP5 in [SP5, SP6] should fit")
+	}
+	wrong := Part{ID: "wrongcool", Category: "cooler", Attrs: map[string]any{"sockets": "LGA4677"}}
+	if !fire([]Part{mb, wrong}, "cooler_socket") {
+		t.Errorf("LGA4677-only cooler on SP5 board must violate")
+	}
+	if tokensContain("AM45", "AM4") {
+		t.Errorf("token match must be exact, not substring")
+	}
+	// SAS ports satisfy SATA drives; never the reverse.
+	hba := Part{ID: "hba", Category: "hba", Provides: map[string]int{"port:sas": 8}}
+	sata := Part{ID: "ssd", Category: "storage", Requires: map[string]int{"port:sata": 1}}
+	if vs := resourceViolations([]Part{hba, sata}); len(vs) != 0 {
+		t.Errorf("sata drive on sas port should fit, got %+v", vs)
+	}
+	sataCtl := Part{ID: "ctl", Category: "hba", Provides: map[string]int{"port:sata": 8}}
+	sasDrive := Part{ID: "sas1", Category: "storage", Requires: map[string]int{"port:sas": 1}}
+	if vs := resourceViolations([]Part{sataCtl, sasDrive}); len(vs) != 1 {
+		t.Errorf("sas drive on sata-only controller must violate, got %+v", vs)
+	}
+	// RAM faster than board max: gap (downclock), never a violation.
+	fastRAM := Part{ID: "fast", Category: "ram", MemType: "DDR5", MemSpeed: 6400}
+	slowMB := Part{ID: "smb", Category: "motherboard", MemType: "DDR5", MemSpeed: 4800}
+	if fire([]Part{slowMB, fastRAM}, "mem_speed") {
+		t.Errorf("faster RAM must not violate")
+	}
+	spec := composeSpec([]Part{slowMB, fastRAM})
+	found := false
+	for _, g := range spec.Gaps {
+		if strings.Contains(g, "downclock") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("downclock should surface as gap, gaps: %v", spec.Gaps)
+	}
+}
+
+// Dual-PSU: capacity is the SUM of PSU outputs; losing N+1 (largest PSU alone
+// can't carry the load) is a gap, not a violation.
+func TestMultiPSU(t *testing.T) {
+	cpu := Part{ID: "cpu", Category: "cpu", TDPW: 600}
+	psu := Part{ID: "psu", Category: "psu", Watts: 500}
+	// Two 500W PSUs cover 600*1.3=780W combined — no violation.
+	if vs := checkCompat([]Part{cpu, psu, psu}); len(vs) != 0 {
+		t.Fatalf("dual 500W covers 780W need, got: %+v", vs)
+	}
+	// One 500W does not.
+	got := map[string]bool{}
+	for _, v := range checkCompat([]Part{cpu, psu}) {
+		got[v.Rule] = true
+	}
+	if !got["psu_headroom"] {
+		t.Errorf("single 500W vs 780W need must violate")
+	}
+	// Combined-OK but single-PSU-short => redundancy gap.
+	spec := composeSpec([]Part{cpu, psu, psu})
+	found := false
+	for _, g := range spec.Gaps {
+		if strings.Contains(g, "N+1") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("dual PSU without single-PSU headroom should gap on N+1, gaps: %v", spec.Gaps)
+	}
+}
+
 // Attribute queries: numeric + string ops over scalar fields AND free attrs.
 func TestMatchWhere(t *testing.T) {
 	gpu := Part{ID: "gpu", Category: "gpu", TDPW: 140,
@@ -124,6 +245,12 @@ func TestMatchWhere(t *testing.T) {
 		{cpu, Where{"l3_cache_mb", "exists", nil}, true},
 		{gpu, Where{"l3_cache_mb", "exists", nil}, false},
 		{cpu, Where{"cores", "eq", "32"}, true}, // string "32" vs number coerces numeric
+		// Zero-valued attrs are unknown regardless of concrete type — JSON
+		// attrs decode float64(0), which `v == 0` (int) used to miss.
+		{Part{ID: "z", Category: "gpu", Attrs: map[string]any{"vram_gb": 0.0}},
+			Where{"vram_gb", "exists", nil}, false},
+		{Part{ID: "z", Category: "gpu", Attrs: map[string]any{"vram_gb": 0.0}},
+			Where{"vram_gb", "lte", 8}, false},
 	}
 	for _, c := range cases {
 		if got := matchWhere(c.p, c.w); got != c.want {

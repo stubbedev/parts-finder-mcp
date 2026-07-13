@@ -36,6 +36,11 @@ CREATE TABLE IF NOT EXISTS listings (
   id TEXT PRIMARY KEY, part_id TEXT, vendor TEXT, price REAL, shipping REAL,
   currency TEXT, condition TEXT, url TEXT, ships_to TEXT, seen_at TEXT
 );
+CREATE TABLE IF NOT EXISTS listing_history (
+  listing_id TEXT, part_id TEXT, vendor TEXT, price REAL, shipping REAL,
+  currency TEXT, seen_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_history_part ON listing_history(part_id);
 CREATE INDEX IF NOT EXISTS idx_listings_part ON listings(part_id);
 CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	if _, err := db.Exec(schema); err != nil {
@@ -49,6 +54,11 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	db.Exec(`ALTER TABLE content_cache ADD COLUMN last_modified TEXT`)
 	db.Exec(`ALTER TABLE content_cache ADD COLUMN kind TEXT`)
 	db.Exec(`ALTER TABLE specs ADD COLUMN owned_ids TEXT`)
+	db.Exec(`ALTER TABLE listings ADD COLUMN vat_included INT`)
+	db.Exec(`ALTER TABLE listings ADD COLUMN vat_rate REAL`)
+	db.Exec(`ALTER TABLE listings ADD COLUMN qty_available INT`)
+	db.Exec(`ALTER TABLE listings ADD COLUMN in_stock INT`)
+	db.Exec(`ALTER TABLE listings ADD COLUMN lead_days INT`)
 	return &Store{db}, nil
 }
 
@@ -159,23 +169,99 @@ func (s *Store) partsByCategory(cat string) ([]Part, error) {
 	return out, nil
 }
 
+// nullBool maps *bool <-> a nullable INT column (NULL = unknown).
+func nullBool(b *bool) any {
+	if b == nil {
+		return nil
+	}
+	if *b {
+		return 1
+	}
+	return 0
+}
+
+func fromNullBool(n sql.NullInt64) *bool {
+	if !n.Valid {
+		return nil
+	}
+	b := n.Int64 == 1
+	return &b
+}
+
 func (s *Store) saveListing(l Listing) error {
 	ships, _ := json.Marshal(l.ShipsTo)
 	_, err := s.db.Exec(`INSERT INTO listings
-  (id,part_id,vendor,price,shipping,currency,condition,url,ships_to,seen_at)
-  VALUES (?,?,?,?,?,?,?,?,?,?)
+  (id,part_id,vendor,price,shipping,currency,condition,url,ships_to,seen_at,
+   vat_included,vat_rate,qty_available,in_stock,lead_days)
+  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET part_id=excluded.part_id,vendor=excluded.vendor,
   price=excluded.price,shipping=excluded.shipping,currency=excluded.currency,
   condition=excluded.condition,url=excluded.url,ships_to=excluded.ships_to,
-  seen_at=excluded.seen_at`,
+  seen_at=excluded.seen_at,vat_included=excluded.vat_included,
+  vat_rate=excluded.vat_rate,qty_available=excluded.qty_available,
+  in_stock=excluded.in_stock,lead_days=excluded.lead_days`,
 		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency, l.Condition,
-		l.URL, string(ships), l.SeenAt.Format(time.RFC3339))
-	return err
+		l.URL, string(ships), l.SeenAt.Format(time.RFC3339),
+		nullBool(l.VATIncluded), l.VATRate, l.QtyAvailable, nullBool(l.InStock), l.LeadDays)
+	if err != nil {
+		return err
+	}
+	s.recordHistory(l)
+	return nil
+}
+
+// recordHistory appends a price observation so re-saving a listing (same
+// part+vendor+condition id) never silently erases the previous price. Only
+// price movements are recorded — a repeat save at the same price is noise.
+// Best-effort: history must never fail a save.
+func (s *Store) recordHistory(l Listing) {
+	var price, shipping float64
+	err := s.db.QueryRow(`SELECT price, shipping FROM listing_history
+  WHERE listing_id=? ORDER BY seen_at DESC LIMIT 1`, l.ID).Scan(&price, &shipping)
+	if err == nil && price == l.Price && shipping == l.Shipping {
+		return
+	}
+	s.db.Exec(`INSERT INTO listing_history
+  (listing_id,part_id,vendor,price,shipping,currency,seen_at)
+  VALUES (?,?,?,?,?,?,?)`,
+		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency,
+		l.SeenAt.Format(time.RFC3339))
+}
+
+// PriceObs is one historical price observation for a listing.
+type PriceObs struct {
+	ListingID string    `json:"listing_id"`
+	Vendor    string    `json:"vendor,omitempty"`
+	Price     float64   `json:"price"`
+	Shipping  float64   `json:"shipping,omitempty"`
+	Currency  string    `json:"currency,omitempty"`
+	SeenAt    time.Time `json:"seen_at"`
+}
+
+func (s *Store) priceHistory(partID string) ([]PriceObs, error) {
+	rows, err := s.db.Query(`SELECT listing_id,vendor,price,shipping,currency,seen_at
+  FROM listing_history WHERE part_id=? ORDER BY seen_at`, partID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PriceObs
+	for rows.Next() {
+		var o PriceObs
+		var seen string
+		if err := rows.Scan(&o.ListingID, &o.Vendor, &o.Price, &o.Shipping, &o.Currency, &seen); err != nil {
+			return nil, err
+		}
+		o.SeenAt, _ = time.Parse(time.RFC3339, seen)
+		out = append(out, o)
+	}
+	return out, nil
 }
 
 func (s *Store) listingsFor(partID string) ([]Listing, error) {
 	rows, err := s.db.Query(`SELECT id,part_id,vendor,price,shipping,currency,
-  condition,url,ships_to,seen_at FROM listings WHERE part_id=?`, partID)
+  condition,url,ships_to,seen_at,vat_included,vat_rate,qty_available,in_stock,
+  lead_days FROM listings WHERE part_id=?`, partID)
 	if err != nil {
 		return nil, err
 	}
@@ -184,12 +270,19 @@ func (s *Store) listingsFor(partID string) ([]Listing, error) {
 	for rows.Next() {
 		var l Listing
 		var ships, seen string
+		var vatInc, inStock sql.NullInt64
+		var vatRate sql.NullFloat64
+		var qty, lead sql.NullInt64
 		if err := rows.Scan(&l.ID, &l.PartID, &l.Vendor, &l.Price, &l.Shipping,
-			&l.Currency, &l.Condition, &l.URL, &ships, &seen); err != nil {
+			&l.Currency, &l.Condition, &l.URL, &ships, &seen,
+			&vatInc, &vatRate, &qty, &inStock, &lead); err != nil {
 			return nil, err
 		}
 		json.Unmarshal([]byte(ships), &l.ShipsTo)
 		l.SeenAt, _ = time.Parse(time.RFC3339, seen)
+		l.VATIncluded, l.InStock = fromNullBool(vatInc), fromNullBool(inStock)
+		l.VATRate = vatRate.Float64
+		l.QtyAvailable, l.LeadDays = int(qty.Int64), int(lead.Int64)
 		out = append(out, l)
 	}
 	return out, nil
@@ -272,6 +365,57 @@ func (s *Store) loadSpec(id string) (name string, partIDs, ownedIDs []string, er
 	json.Unmarshal([]byte(owned.String), &ownedIDs)
 	json.Unmarshal([]byte(ids), &partIDs)
 	return name, partIDs, ownedIDs, nil
+}
+
+// expandSpecIDs flattens "spec:<id>" references in a part-id list into the
+// referenced spec's part ids, recursively — a rack spec can be 12x "spec:node"
+// plus switches and PDUs (repeat the ref for quantity). Sub-spec owned_ids
+// carry up, so an upgrade node reused in a rack keeps its owned parts. A
+// "spec:<id>" in the OWNED list means you own that whole sub-build. Cycle-safe.
+func (s *Store) expandSpecIDs(partIDs, ownedIDs []string) (parts, owned []string, err error) {
+	parts, owned, err = s.expand(partIDs, map[string]bool{})
+	if err != nil {
+		return nil, nil, err
+	}
+	op, oo, err := s.expand(ownedIDs, map[string]bool{})
+	if err != nil {
+		return nil, nil, err
+	}
+	owned = append(owned, op...)
+	owned = append(owned, oo...)
+	return parts, owned, nil
+}
+
+func (s *Store) expand(ids []string, visiting map[string]bool) (parts, owned []string, err error) {
+	for _, id := range ids {
+		sub, ok := strings.CutPrefix(id, "spec:")
+		if !ok {
+			parts = append(parts, id)
+			continue
+		}
+		if visiting[sub] {
+			return nil, nil, fmt.Errorf("spec cycle at %q", sub)
+		}
+		visiting[sub] = true
+		_, subParts, subOwned, err := s.loadSpec(sub)
+		if err != nil {
+			return nil, nil, fmt.Errorf("sub-spec %s: %w", sub, err)
+		}
+		p, o, err := s.expand(subParts, visiting)
+		if err != nil {
+			return nil, nil, err
+		}
+		so, soo, err := s.expand(subOwned, visiting)
+		if err != nil {
+			return nil, nil, err
+		}
+		delete(visiting, sub)
+		parts = append(parts, p...)
+		owned = append(owned, o...)
+		owned = append(owned, so...)
+		owned = append(owned, soo...)
+	}
+	return parts, owned, nil
 }
 
 // cacheRec is a persisted fetch with its HTTP validators and age.

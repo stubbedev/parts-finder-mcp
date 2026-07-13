@@ -121,21 +121,26 @@ type compareIn struct {
 	SpecIDs         []string `json:"spec_ids" jsonschema:"saved specs to compare side by side"`
 	Country         string   `json:"country,omitempty"`
 	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for totals; defaults to region currency"`
+	KWHPrice        float64  `json:"kwh_price,omitempty" jsonschema:"electricity price per kWh in the display currency; adds an indicative yearly power cost (24/7 at total TDP) per spec — capex vs opex in one view"`
 }
 type specOption struct {
-	ID           string      `json:"id"`
-	Name         string      `json:"name,omitempty"`
-	Compatible   bool        `json:"compatible"`
-	Violations   []Violation `json:"violations,omitempty"`
-	Gaps         []string    `json:"gaps,omitempty"`
-	Needs        []Need      `json:"needs,omitempty"`
-	TotalTDPW    int         `json:"total_tdp_w"`
-	TotalBest    float64     `json:"total_best"` // sum of best usable listings, converted
-	TotalCovers  int         `json:"total_covers"`
-	PartCount    int         `json:"part_count"`
-	OwnedCount   int         `json:"owned_count,omitempty"` // parts already owned, excluded from the total
-	BuyLinks     []string    `json:"buy_links,omitempty"`   // best usable URL per covered part
-	UncoveredIDs []string    `json:"uncovered_ids,omitempty"`
+	ID              string      `json:"id"`
+	Name            string      `json:"name,omitempty"`
+	Compatible      bool        `json:"compatible"`
+	Violations      []Violation `json:"violations,omitempty"`
+	Gaps            []string    `json:"gaps,omitempty"`
+	Needs           []Need      `json:"needs,omitempty"`
+	TotalTDPW       int         `json:"total_tdp_w"`
+	TotalBest       float64     `json:"total_best"`                  // sum of best usable listings, converted (gross as listed)
+	TotalExVAT      float64     `json:"total_ex_vat,omitempty"`      // ex-VAT sum over listings with known VAT basis
+	ExVATCovers     int         `json:"ex_vat_covers,omitempty"`     // units the ex-VAT total includes
+	VATUnknownCount int         `json:"vat_unknown_count,omitempty"` // best listings with unrecorded VAT basis
+	YearlyPowerCost float64     `json:"yearly_power_cost,omitempty"` // kwh_price * TDP * 24*365, indicative (TDP = peak)
+	TotalCovers     int         `json:"total_covers"`
+	PartCount       int         `json:"part_count"`
+	OwnedCount      int         `json:"owned_count,omitempty"` // units already owned, excluded from the total
+	BuyLinks        []string    `json:"buy_links,omitempty"`   // best usable URL per covered part
+	UncoveredIDs    []string    `json:"uncovered_ids,omitempty"`
 }
 type compareOut struct {
 	Region        Region       `json:"region"`
@@ -146,8 +151,8 @@ type compareOut struct {
 type saveSpecIn struct {
 	ID       string   `json:"id" jsonschema:"spec id (slug); reused id overwrites"`
 	Name     string   `json:"name,omitempty"`
-	PartIDs  []string `json:"part_ids"`
-	OwnedIDs []string `json:"owned_ids,omitempty" jsonschema:"part ids in this build you already own — excluded from the purchase total, never shopped"`
+	PartIDs  []string `json:"part_ids" jsonschema:"part ids; repeat for quantity; 'spec:<id>' inlines a saved build (racks = specs of specs)"`
+	OwnedIDs []string `json:"owned_ids,omitempty" jsonschema:"units in this build you already own, REPEATED PER UNIT (own 3 of 8 sticks = id 3 times); 'spec:<id>' = own that whole sub-build — excluded from the purchase total, never shopped"`
 }
 type loadSpecIn struct {
 	ID string `json:"id,omitempty" jsonschema:"spec id; omit to list all saved specs"`
@@ -169,11 +174,19 @@ type dealsOut struct {
 	Hits     []SearchHit `json:"search_hits,omitempty"`
 }
 
+type historyIn struct {
+	PartID string `json:"part_id"`
+}
+type historyOut struct {
+	Observations []PriceObs `json:"observations"` // oldest first
+}
+
 type substituteIn struct {
 	PartID   string  `json:"part_id"`
 	Budget   float64 `json:"budget,omitempty" jsonschema:"max total price in the comparison currency; 0 = no cap"`
 	Currency string  `json:"currency,omitempty" jsonschema:"currency to compare budget/prices in; defaults to region currency. Listings in other currencies are converted (indicative ECB rates)."`
 	Country  string  `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
+	RankBy   string  `json:"rank_by,omitempty" jsonschema:"rank candidates by this numeric attribute DESCENDING instead of cheapest-first — any saved attr, e.g. passmark, cores, perf_per_watt; candidates missing the attr sort last"`
 }
 type substituteOut struct {
 	Substitutes []Substitute `json:"substitutes"`
@@ -182,7 +195,7 @@ type substituteOut struct {
 type shopIn struct {
 	SpecID          string   `json:"spec_id,omitempty" jsonschema:"saved spec to shop for (or pass part_ids)"`
 	PartIDs         []string `json:"part_ids,omitempty" jsonschema:"parts to shop for when no spec_id"`
-	OwnedIDs        []string `json:"owned_ids,omitempty" jsonschema:"part ids you already own — excluded from the total (ignored when spec_id is used; the spec carries its own owned set)"`
+	OwnedIDs        []string `json:"owned_ids,omitempty" jsonschema:"part ids you already own, repeated per unit owned — excluded from the total (ignored when spec_id is used; the spec carries its own owned set)"`
 	Country         string   `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
 	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for the guiding totals; defaults to region currency"`
 	NoSearch        bool     `json:"no_search,omitempty" jsonschema:"skip web searches for parts that lack live listings"`
@@ -196,13 +209,48 @@ func toSet(ids []string) map[string]bool {
 	return m
 }
 
+// toCount tallies ids; repeats mean quantity — the same convention as
+// repeating a part id in a spec.
+func toCount(ids []string) map[string]int {
+	m := make(map[string]int, len(ids))
+	for _, id := range ids {
+		m[id]++
+	}
+	return m
+}
+
+// uniqueInOrder returns ids deduplicated, first-seen order preserved.
+func uniqueInOrder(ids []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, id := range ids {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 type shopItem struct {
 	Part         Part        `json:"part"`
-	Owned        bool        `json:"owned,omitempty"`        // already have it — not part of the purchase
+	Qty          int         `json:"qty"`                    // units this build needs (repeats in the spec)
+	OwnedQty     int         `json:"owned_qty,omitempty"`    // units already owned — only qty-owned_qty are bought
+	Owned        bool        `json:"owned,omitempty"`        // every needed unit is owned — nothing to buy
+	SupplyShort  bool        `json:"supply_short,omitempty"` // best listing has fewer units than needed — plan can't be filled from it alone
 	Best         *Listing    `json:"best,omitempty"`         // cheapest live, shippable listing — the link to click
 	Alternatives []Listing   `json:"alternatives,omitempty"` // other live options, sorted
 	SearchHits   []SearchHit `json:"search_hits,omitempty"`  // buy-page candidates when nothing is on record
 }
+
+// cart groups the purchase plan per vendor so shipping consolidation is
+// visible — 8 cheapest-per-part picks across 8 shops means 8x shipping.
+type cart struct {
+	Vendor   string   `json:"vendor"`             // host of the buy links
+	PartIDs  []string `json:"part_ids"`           // repeated per unit
+	Subtotal float64  `json:"subtotal,omitempty"` // converted gross subtotal
+}
+
 type shopOut struct {
 	Region          Region      `json:"region"`
 	Compatible      bool        `json:"compatible"`
@@ -212,9 +260,13 @@ type shopOut struct {
 	Gaps            []string    `json:"gaps,omitempty"`
 	Needs           []Need      `json:"needs,omitempty"` // resource shortages to also shop for (cables, adapters, ...)
 	Items           []shopItem  `json:"items"`
-	TotalBest       float64     `json:"total_best"` // sum of best totals, converted
+	Carts           []cart      `json:"carts,omitempty"`             // plan grouped per vendor (shipping consolidation)
+	TotalBest       float64     `json:"total_best"`                  // sum of best totals x qty, converted (gross as listed)
+	TotalExVAT      float64     `json:"total_ex_vat,omitempty"`      // ex-VAT sum over listings with known VAT basis
+	ExVATCovers     int         `json:"ex_vat_covers,omitempty"`     // units the ex-VAT total includes
+	VATUnknownCount int         `json:"vat_unknown_count,omitempty"` // best listings with unrecorded VAT basis — record vat_included to firm the totals
 	TotalCurrency   string      `json:"total_currency,omitempty"`
-	TotalCovers     int         `json:"total_covers"` // how many parts the total includes
+	TotalCovers     int         `json:"total_covers"` // how many units the total includes
 }
 
 type deepIn struct {
@@ -312,6 +364,19 @@ func bestContribution(l Listing, display string) (float64, bool) {
 	return 0, false
 }
 
+// exVATContribution is the ex-VAT counterpart — only listings whose VAT basis
+// is known contribute; the caller reports coverage so a partial ex-VAT total
+// can't masquerade as a full one.
+func exVATContribution(l Listing, display string) (float64, bool) {
+	if l.DisplayExVAT > 0 {
+		return l.DisplayExVAT, true
+	}
+	if ex, ok := l.exVATTotal(); ok && l.Currency == display {
+		return ex, true
+	}
+	return 0, false
+}
+
 // regionFor resolves the effective region for a call: an explicit country
 // override, else the detected region.
 func regionFor(ctx context.Context, country string) Region {
@@ -385,7 +450,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_part",
-		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. For full build validation across ANY part type, fill provides/requires with resource tokens ('kind:variant' -> count): motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3,\"m2:2280\":2}; RAM stick requires {\"dimm:ddr5\":1}; HBA requires {\"pcie:x8\":1}; case provides {\"bay:3.5\":8}; drive requires {\"bay:3.5\":1}. The engine checks sum(requires) <= sum(provides) per token; wider pcie slots satisfy narrower cards.",
+		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. For full build validation across ANY part type, fill provides/requires with resource tokens ('kind:variant' -> count): motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3,\"m2:2280\":2}; RAM stick requires {\"dimm:ddr5\":1}; HBA requires {\"pcie:x8\":1}; case provides {\"bay:3.5\":8}; drive requires {\"bay:3.5\":1}. Rack-scale uses the same tokens: rack provides {\"u:rack\":42}, PDU provides {\"outlet:c13\":24} and requires {\"u:rack\":1}, 2U chassis requires {\"u:rack\":2,\"outlet:c13\":2}, switch provides {\"port:sfp28\":48}, NIC requires {\"port:sfp28\":2}. The engine checks sum(requires) <= sum(provides) per token; wider pcie slots satisfy narrower cards, and sas ports satisfy sata drives (controller provides {\"port:sas\":8}, sata drive requires {\"port:sata\":1}). Attr conventions the compat engine also checks when present: mem_module (RDIMM/UDIMM/LRDIMM — on ram AND motherboard; mismatch won't boot), mem_type on cpu too (DDR4/DDR5 controller), capacity_gb per RAM stick vs motherboard mem_max_gb / dimm_max_gb, cooler height_mm + sockets (list) vs case cooler_max_mm + board socket, psu length_mm vs case psu_max_mm.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, p Part) (*mcp.CallToolResult, savePartOut, error) {
 		if p.Category == "" {
 			return nil, savePartOut{}, fmt.Errorf("category is required")
@@ -440,9 +505,13 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compose_spec",
-		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
+		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' to inline a saved build (repeat for quantity) — a rack is 12x 'spec:node' plus switches/PDUs. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, Spec, error) {
-		parts, err := store.getParts(in.PartIDs)
+		partIDs, _, err := store.expandSpecIDs(in.PartIDs, nil)
+		if err != nil {
+			return nil, Spec{}, err
+		}
+		parts, err := store.getParts(partIDs)
 		if err != nil {
 			return nil, Spec{}, err
 		}
@@ -451,7 +520,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_spec",
-		Description: "Persist a build (list of part ids) under an id for later recall. Repeat an id for quantity. List parts you ALREADY OWN in owned_ids — they still count for compatibility/TDP but are excluded from the purchase total and never shopped, so a build where you only need 1-2 new parts prices correctly.",
+		Description: "Persist a build (list of part ids) under an id for later recall. Repeat an id for quantity. Ids may be 'spec:<other-id>' to nest a saved build — a rack spec is 12x 'spec:node' + switches + PDU + rails; nested specs expand on load everywhere. List units you ALREADY OWN in owned_ids, REPEATED PER UNIT owned (own 3 of 8 DIMMs = the id 3 times; 'spec:<id>' = own that whole sub-build) — owned units still count for compatibility/TDP but are excluded from the purchase total and never shopped.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in saveSpecIn) (*mcp.CallToolResult, savePartOut, error) {
 		if in.ID == "" {
 			return nil, savePartOut{}, fmt.Errorf("id is required")
@@ -464,7 +533,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_listing",
-		Description: "Record a price observation for a stored part (extracted from a listing/reseller page). Prices are point-in-time; find_deals flags stale ones.",
+		Description: "Record a price observation for a stored part (extracted from a listing/reseller page). Prices are point-in-time; find_deals flags stale ones, and every price change is kept in history (price_history). ALWAYS record vat_included (+vat_rate) when the page states it — consumer shops list incl VAT, B2B resellers ex VAT, and a business buyer compares ex-VAT; omit when unstated (flagged, never guessed). Also record qty_available, in_stock, and lead_days when shown.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, l Listing) (*mcp.CallToolResult, savePartOut, error) {
 		if l.PartID == "" {
 			return nil, savePartOut{}, fmt.Errorf("part_id is required")
@@ -513,8 +582,22 @@ func registerTools(s *mcp.Server) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
+		Name:        "price_history",
+		Description: "Price observations over time for a part, oldest first — every save_listing price change is kept, so re-saving a listing never erases what it cost before. Use to judge 'buy now or wait' and whether a deal is actually below trend.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in historyIn) (*mcp.CallToolResult, historyOut, error) {
+		if in.PartID == "" {
+			return nil, historyOut{}, fmt.Errorf("part_id is required")
+		}
+		obs, err := store.priceHistory(in.PartID)
+		if err != nil {
+			return nil, historyOut{}, err
+		}
+		return nil, historyOut{Observations: obs}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
 		Name:        "find_substitute",
-		Description: "Find cheaper drop-in replacements for a part: same category, attribute-compatible (socket/mem/form factor), with a recorded listing within budget. Ranked cheapest first. Note: 'similar performance' is approximated by compatibility, not benchmark scores; listings here are NOT live-checked — confirm the pick with find_deals before buying.",
+		Description: "Find cheaper drop-in replacements for a part: same category, attribute-compatible (socket/mem/form factor), with a recorded listing within budget. Ranked cheapest first, or by any saved numeric attribute descending via rank_by (e.g. passmark, cores) — save benchmark scores as attrs to rank by real performance. Note: without rank_by, 'similar performance' is approximated by compatibility only; listings here are NOT live-checked — confirm the pick with find_deals before buying.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in substituteIn) (*mcp.CallToolResult, substituteOut, error) {
 		parts, err := store.getParts([]string{in.PartID})
 		if err != nil {
@@ -555,9 +638,27 @@ func registerTools(s *mcp.Server) {
 			}
 			scoredSubs = append(scoredSubs, scored{Substitute{Part: c, Listing: best}, total})
 		}
-		sort.Slice(scoredSubs, func(i, j int) bool {
-			return scoredSubs[i].total < scoredSubs[j].total
-		})
+		if in.RankBy != "" {
+			// Rank by the attribute descending (perf-style: more is better);
+			// candidates missing it sink; ties fall back to cheapest.
+			attr := strings.ToLower(strings.TrimSpace(in.RankBy))
+			val := func(p Part) (float64, bool) { return toFloat(flatten(p)[attr]) }
+			sort.SliceStable(scoredSubs, func(i, j int) bool {
+				vi, oki := val(scoredSubs[i].sub.Part)
+				vj, okj := val(scoredSubs[j].sub.Part)
+				if oki != okj {
+					return oki
+				}
+				if vi != vj {
+					return vi > vj
+				}
+				return scoredSubs[i].total < scoredSubs[j].total
+			})
+		} else {
+			sort.Slice(scoredSubs, func(i, j int) bool {
+				return scoredSubs[i].total < scoredSubs[j].total
+			})
+		}
 		subs := make([]Substitute, len(scoredSubs))
 		for i, s := range scoredSubs {
 			subs[i] = s.sub
@@ -567,7 +668,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "shop_spec",
-		Description: "One-stop purchase plan for a build: per part, the cheapest usable (live + ships-to-region) listing as the buy link, ALL other recorded listings as flagged alternatives (nothing filtered out), a converted build total, resource shortages to also shop for (needs: cables, adapters, bays), and buy-page search hits for parts with no usable listing. Repeat a part id in the spec to buy multiples. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
+		Description: "One-stop purchase plan for a build: per part, the cheapest usable (live + ships-to-region + in-stock) listing as the buy link, ALL other recorded listings as flagged alternatives (nothing filtered out), converted build totals (gross AND ex-VAT where the basis is known), per-vendor carts for shipping consolidation, resource shortages to also shop for (needs: cables, adapters, bays), and buy-page search hits for parts with no usable listing. Repeat a part id in the spec to buy multiples; supply_short flags a best listing with fewer units than needed. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in shopIn) (*mcp.CallToolResult, shopOut, error) {
 		partIDs := in.PartIDs
 		ownedIDs := in.OwnedIDs
@@ -578,6 +679,10 @@ func registerTools(s *mcp.Server) {
 			}
 			partIDs, ownedIDs = ids, owned
 		}
+		partIDs, ownedIDs, err := store.expandSpecIDs(partIDs, ownedIDs)
+		if err != nil {
+			return nil, shopOut{}, err
+		}
 		if len(partIDs) == 0 {
 			return nil, shopOut{}, fmt.Errorf("pass spec_id or part_ids")
 		}
@@ -585,7 +690,12 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, shopOut{}, err
 		}
-		owned := toSet(ownedIDs)
+		partByID := map[string]Part{}
+		for _, p := range parts {
+			partByID[p.ID] = p
+		}
+		demand := toCount(partIDs)
+		ownedQty := toCount(ownedIDs)
 		region := regionFor(ctx, in.Country)
 		display := in.DisplayCurrency
 		if display == "" {
@@ -599,10 +709,16 @@ func registerTools(s *mcp.Server) {
 			Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
 			TotalCurrency: display,
 		}
-		for _, p := range parts {
-			item := shopItem{Part: p}
-			if owned[p.ID] {
-				item.Owned = true // already have it: counts for compat/TDP, not for buying
+		carts := map[string]*cart{}
+		var cartOrder []string
+		for _, id := range uniqueInOrder(partIDs) {
+			p := partByID[id]
+			qty := demand[id]
+			ownedN := min(ownedQty[id], qty)
+			buyN := qty - ownedN
+			item := shopItem{Part: p, Qty: qty, OwnedQty: ownedN}
+			if buyN == 0 {
+				item.Owned = true // every unit on hand: counts for compat/TDP, not for buying
 				out.Items = append(out.Items, item)
 				continue
 			}
@@ -611,12 +727,38 @@ func registerTools(s *mcp.Server) {
 				return nil, shopOut{}, err
 			}
 			if len(ls) > 0 && ls[0].usable() {
-				item.Best = &ls[0]
+				best := ls[0]
+				item.Best = &best
 				item.Alternatives = ls[1:] // includes flagged dead/unshippable — nothing hidden
-				if v, ok := bestContribution(ls[0], display); ok {
-					out.TotalBest += v
-					out.TotalCovers++
+				// A 1-unit auction can't fill a 24-DIMM order: flag, never hide.
+				item.SupplyShort = best.QtyAvailable > 0 && best.QtyAvailable < buyN
+				if best.VATUnknown {
+					out.VATUnknownCount++
 				}
+				var contributed float64
+				if v, ok := bestContribution(best, display); ok {
+					contributed = v * float64(buyN)
+					out.TotalBest += contributed
+					out.TotalCovers += buyN
+				}
+				if v, ok := exVATContribution(best, display); ok {
+					out.TotalExVAT += v * float64(buyN)
+					out.ExVATCovers += buyN
+				}
+				vendor := hostOf(best.URL)
+				if vendor == "" {
+					vendor = best.Vendor
+				}
+				c, ok := carts[vendor]
+				if !ok {
+					c = &cart{Vendor: vendor}
+					carts[vendor] = c
+					cartOrder = append(cartOrder, vendor)
+				}
+				for range buyN {
+					c.PartIDs = append(c.PartIDs, p.ID)
+				}
+				c.Subtotal += contributed
 			} else {
 				item.Alternatives = ls // only flagged listings on record — show them all
 				if name := strings.TrimSpace(p.Vendor + " " + p.Model); !in.NoSearch && name != "" {
@@ -625,12 +767,18 @@ func registerTools(s *mcp.Server) {
 			}
 			out.Items = append(out.Items, item)
 		}
+		for _, v := range cartOrder {
+			out.Carts = append(out.Carts, *carts[v])
+		}
+		sort.SliceStable(out.Carts, func(i, j int) bool {
+			return len(out.Carts[i].PartIDs) > len(out.Carts[j].PartIDs)
+		})
 		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compare_specs",
-		Description: "Compare saved builds side by side to pick one: per spec — compatibility, gaps, needs, total TDP, live-checked converted price total (best usable listing per part), direct buy links, and which parts still lack a usable listing. Prices are probed live at call time.",
+		Description: "Compare saved builds side by side to pick one: per spec — compatibility, gaps, needs, total TDP, live-checked converted price totals (gross + ex-VAT where known; best usable listing per part x quantity), direct buy links, which parts still lack a usable listing, and (given kwh_price) an indicative yearly power cost. Prices are probed live at call time.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in compareIn) (*mcp.CallToolResult, compareOut, error) {
 		if len(in.SpecIDs) == 0 {
 			return nil, compareOut{}, fmt.Errorf("pass spec_ids")
@@ -642,7 +790,11 @@ func registerTools(s *mcp.Server) {
 		}
 		out := compareOut{Region: region, TotalCurrency: display}
 		for _, sid := range in.SpecIDs {
-			name, partIDs, ownedIDs, err := store.loadSpec(sid)
+			name, rawIDs, rawOwned, err := store.loadSpec(sid)
+			if err != nil {
+				return nil, compareOut{}, fmt.Errorf("spec %s: %w", sid, err)
+			}
+			partIDs, ownedIDs, err := store.expandSpecIDs(rawIDs, rawOwned)
 			if err != nil {
 				return nil, compareOut{}, fmt.Errorf("spec %s: %w", sid, err)
 			}
@@ -650,31 +802,49 @@ func registerTools(s *mcp.Server) {
 			if err != nil {
 				return nil, compareOut{}, err
 			}
-			owned := toSet(ownedIDs)
+			partByID := map[string]Part{}
+			for _, p := range parts {
+				partByID[p.ID] = p
+			}
+			demand := toCount(partIDs)
+			ownedQty := toCount(ownedIDs)
 			prewarmLiveness(ctx, partIDs)
 			spec := composeSpec(parts)
 			opt := specOption{
 				ID: sid, Name: name, Compatible: spec.Compatible,
 				Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
-				TotalTDPW: spec.TotalTDPW, PartCount: len(parts), OwnedCount: len(owned),
+				TotalTDPW: spec.TotalTDPW, PartCount: len(parts),
 			}
-			for _, p := range parts {
-				if owned[p.ID] {
-					continue // already owned — not a purchase
+			if in.KWHPrice > 0 {
+				opt.YearlyPowerCost = in.KWHPrice * float64(spec.TotalTDPW) / 1000 * 24 * 365
+			}
+			for _, id := range uniqueInOrder(partIDs) {
+				ownedN := min(ownedQty[id], demand[id])
+				buyN := demand[id] - ownedN
+				opt.OwnedCount += ownedN
+				if buyN == 0 {
+					continue // every unit owned — not a purchase
 				}
-				ls, err := pricePart(ctx, p.ID, region, display)
+				ls, err := pricePart(ctx, id, region, display)
 				if err != nil {
 					return nil, compareOut{}, err
 				}
 				if len(ls) > 0 && ls[0].usable() {
 					opt.BuyLinks = append(opt.BuyLinks, ls[0].URL)
+					if ls[0].VATUnknown {
+						opt.VATUnknownCount++
+					}
+					if v, ok := exVATContribution(ls[0], display); ok {
+						opt.TotalExVAT += v * float64(buyN)
+						opt.ExVATCovers += buyN
+					}
 					if v, ok := bestContribution(ls[0], display); ok {
-						opt.TotalBest += v
-						opt.TotalCovers++
+						opt.TotalBest += v * float64(buyN)
+						opt.TotalCovers += buyN
 						continue
 					}
 				}
-				opt.UncoveredIDs = append(opt.UncoveredIDs, p.ID)
+				opt.UncoveredIDs = append(opt.UncoveredIDs, id)
 			}
 			out.Options = append(out.Options, opt)
 		}
@@ -784,7 +954,11 @@ func registerTools(s *mcp.Server) {
 			}
 			return nil, loadSpecOut{Specs: specs}, nil
 		}
-		_, partIDs, ownedIDs, err := store.loadSpec(in.ID)
+		_, rawIDs, rawOwned, err := store.loadSpec(in.ID)
+		if err != nil {
+			return nil, loadSpecOut{}, err
+		}
+		partIDs, ownedIDs, err := store.expandSpecIDs(rawIDs, rawOwned)
 		if err != nil {
 			return nil, loadSpecOut{}, err
 		}

@@ -64,6 +64,54 @@ func TestCheapestConverted(t *testing.T) {
 	}
 }
 
+// VAT basis: ex-VAT is the comparison figure when known; unknown compares by
+// gross (overestimate, flagged) and never fails.
+func TestVATBasis(t *testing.T) {
+	tr, fa := true, false
+	incl := Listing{Price: 1250, VATIncluded: &tr, VATRate: 25}
+	if ex, ok := incl.exVATTotal(); !ok || ex != 1000 {
+		t.Errorf("incl 1250 @25%% should be ex 1000, got %v %v", ex, ok)
+	}
+	excl := Listing{Price: 1100, VATIncluded: &fa}
+	if ex, ok := excl.exVATTotal(); !ok || ex != 1100 {
+		t.Errorf("ex-VAT price passes through, got %v %v", ex, ok)
+	}
+	unknown := Listing{Price: 1050}
+	if _, ok := unknown.exVATTotal(); ok {
+		t.Errorf("unknown VAT basis must not be computable")
+	}
+	inclNoRate := Listing{Price: 1250, VATIncluded: &tr}
+	if _, ok := inclNoRate.exVATTotal(); ok {
+		t.Errorf("incl VAT with unknown rate must not be computable")
+	}
+	// Sorting: incl-VAT 1250 (ex 1000) must beat ex-VAT 1100 once ex totals are
+	// annotated — the whole point of the VAT basis.
+	ls := []Listing{
+		{ID: "b2b", Price: 1100, VATIncluded: &fa, DisplayExVAT: 1100, DisplayTotal: 1100},
+		{ID: "ebay", Price: 1250, VATIncluded: &tr, VATRate: 25, DisplayExVAT: 1000, DisplayTotal: 1250},
+	}
+	sortListings(ls)
+	if ls[0].ID != "ebay" {
+		t.Errorf("ex-VAT comparison should rank incl-VAT 1250 (ex 1000) first, got %s", ls[0].ID)
+	}
+}
+
+// Explicitly out-of-stock listings sink like dead ones; unknown stock stays usable.
+func TestOutOfStockSinks(t *testing.T) {
+	fa := false
+	ls := []Listing{
+		{ID: "oos", Price: 10, InStock: &fa},
+		{ID: "ok", Price: 100},
+	}
+	sortListings(ls)
+	if len(ls) != 2 || ls[0].ID != "ok" {
+		t.Fatalf("out-of-stock must sink, never drop: %+v", ls)
+	}
+	if ls[1].usable() {
+		t.Errorf("in_stock=false must not be usable")
+	}
+}
+
 func TestShipsTo(t *testing.T) {
 	cases := []struct {
 		tokens  []string

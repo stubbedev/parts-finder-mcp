@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -109,11 +110,103 @@ type SearchHit struct {
 	Snippet string `json:"snippet,omitempty"`
 }
 
-// search queries the keyless DuckDuckGo HTML endpoint, biased to the caller's
-// detected region, and ranks local/preferred vendors first. Falls back to
-// SearXNG (SEARXNG_URL) when DDG errors or returns nothing (rate-limited).
+// search queries a chain of keyless engines, biased to the caller's detected
+// region, and ranks local/preferred vendors first. Getting zero results
+// because ONE engine throttled us is unacceptable — search is the tool's
+// front door — so engines are tried in order and a rate-limited engine is
+// put on cooldown and skipped, never hammered deeper into a ban.
 func search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	return searchRegion(ctx, query, limit, detectRegion(ctx))
+}
+
+// errRateLimited marks an engine response as a throttle/bot-wall so the chain
+// cools that engine down instead of retrying it.
+var errRateLimited = errors.New("rate limited")
+
+// rateLimitedStatus: statuses search endpoints use to say "go away" — DDG
+// answers 202 with an anomaly page, others 403/429.
+func rateLimitedStatus(code int) bool {
+	return code == http.StatusAccepted || code == http.StatusForbidden ||
+		code == http.StatusTooManyRequests
+}
+
+type searchEngine struct {
+	name string
+	fn   func(context.Context, string, int, Region) ([]SearchHit, error)
+}
+
+// searchEngines is the fallback chain. A configured SearXNG (SEARXNG_URL)
+// goes first — the user's own instance has no rate-limit exposure. Then two
+// INDEPENDENT DuckDuckGo endpoints (html and lite throttle separately), then
+// Brave (own index) and Ecosia (Bing/Google-backed) — three unrelated
+// throttle regimes. All keyless, all through the hardened doRequest path.
+// Bing and Mojeek were evaluated and rejected: Bing serves degraded generic
+// results to non-JS clients (silently wrong is worse than failing), Mojeek
+// serves a JS challenge.
+func searchEngines() []searchEngine {
+	var es []searchEngine
+	if os.Getenv("SEARXNG_URL") != "" {
+		es = append(es, searchEngine{"searxng", searchSearXNG})
+	}
+	return append(es,
+		searchEngine{"ddg-html", searchDDG},
+		searchEngine{"ddg-lite", searchDDGLite},
+		searchEngine{"brave", searchBrave},
+		searchEngine{"ecosia", searchEcosia},
+	)
+}
+
+// Engine cooldowns: a rate-limited engine sits out; the chain moves on.
+var (
+	cooldownMu sync.Mutex
+	cooldowns  = map[string]time.Time{}
+)
+
+const engineCooldownFor = 5 * time.Minute
+
+func coolingDown(name string) bool {
+	cooldownMu.Lock()
+	defer cooldownMu.Unlock()
+	return time.Now().Before(cooldowns[name])
+}
+
+func startCooldown(name string) {
+	cooldownMu.Lock()
+	cooldowns[name] = time.Now().Add(engineCooldownFor)
+	cooldownMu.Unlock()
+	fmt.Fprintf(os.Stderr, "parts-finder: search engine %s rate-limited, cooling down %s\n", name, engineCooldownFor)
+}
+
+// searchChain runs the engines in order: first one to yield hits wins.
+// Rate-limits start a cooldown and move on. Distinguishes "every engine
+// failed" (error — the caller must know search is blind) from "engines
+// answered but the query has no results" (legit empty).
+func searchChain(ctx context.Context, engines []searchEngine, query string, limit int, r Region) ([]SearchHit, error) {
+	var errs []string
+	answered := false
+	for _, e := range engines {
+		if coolingDown(e.name) {
+			errs = append(errs, e.name+": cooling down")
+			continue
+		}
+		hits, err := e.fn(ctx, query, limit, r)
+		switch {
+		case errors.Is(err, errRateLimited):
+			startCooldown(e.name)
+			errs = append(errs, e.name+": rate limited")
+		case err != nil:
+			errs = append(errs, e.name+": "+err.Error())
+		case len(hits) > 0:
+			return hits, nil
+		default:
+			answered = true // engine worked, query just has no hits here
+			errs = append(errs, e.name+": 0 results")
+		}
+	}
+	if answered {
+		return nil, nil
+	}
+	return nil, fmt.Errorf("every search engine failed for %q [%s] — set SEARXNG_URL for a private, unthrottled fallback", query, strings.Join(errs, "; "))
 }
 
 // searchCache: repeat queries within a session (deep_specs angles, shop_spec
@@ -145,12 +238,7 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 		return hits, nil
 	}
 	searchMu.Unlock()
-	hits, err := searchDDG(ctx, query, limit, r)
-	if (err != nil || len(hits) == 0) && os.Getenv("SEARXNG_URL") != "" {
-		if sx, sxErr := searchSearXNG(ctx, query, limit, r); sxErr == nil && len(sx) > 0 {
-			hits, err = sx, nil
-		}
-	}
+	hits, err := searchChain(ctx, searchEngines(), query, limit, r)
 	if err == nil && len(hits) > 0 {
 		searchMu.Lock()
 		searchCache[key] = searchEntry{hits: append([]SearchHit(nil), hits...), at: time.Now()}
@@ -161,20 +249,33 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 	return hits, err
 }
 
-func searchDDG(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
-	u := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
-	if r.DDG != "" {
-		u += "&kl=" + url.QueryEscape(r.DDG)
-	}
+// fetchSearchPage GETs a search-results URL and returns the body, translating
+// throttle statuses and challenge pages into errRateLimited.
+func fetchSearchPage(ctx context.Context, u, engineLabel string) ([]byte, error) {
 	resp, err := get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("duckduckgo returned %s", resp.Status)
+	if rateLimitedStatus(resp.StatusCode) {
+		return nil, fmt.Errorf("%s %s: %w", engineLabel, resp.Status, errRateLimited)
 	}
-	doc, err := goquery.NewDocumentFromReader(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%s returned %s", engineLabel, resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+}
+
+func searchDDG(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
+	u := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	if r.DDG != "" {
+		u += "&kl=" + url.QueryEscape(r.DDG)
+	}
+	body, err := fetchSearchPage(ctx, u, "duckduckgo")
+	if err != nil {
+		return nil, err
+	}
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +291,120 @@ func searchDDG(ctx context.Context, query string, limit int, r Region) ([]Search
 			Title:   strings.TrimSpace(a.Text()),
 			URL:     link,
 			Snippet: strings.TrimSpace(s.Find(".result__snippet").Text()),
+		})
+		return len(hits) < limit
+	})
+	// DDG serves its bot-wall as a 200 "anomaly" page with zero results —
+	// that's a throttle, not an empty query.
+	if len(hits) == 0 && isDDGAnomaly(body) {
+		return nil, fmt.Errorf("duckduckgo anomaly page: %w", errRateLimited)
+	}
+	return hits, nil
+}
+
+// isDDGAnomaly recognizes DuckDuckGo's bot-challenge page.
+func isDDGAnomaly(body []byte) bool {
+	b := strings.ToLower(string(body))
+	return strings.Contains(b, "anomaly") || strings.Contains(b, "bots use duckduckgo")
+}
+
+// searchDDGLite scrapes lite.duckduckgo.com — a separate, simpler endpoint
+// with its own throttle bucket; often up when /html is angry.
+func searchDDGLite(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
+	u := "https://lite.duckduckgo.com/lite/?q=" + url.QueryEscape(query)
+	if r.DDG != "" {
+		u += "&kl=" + url.QueryEscape(r.DDG)
+	}
+	body, err := fetchSearchPage(ctx, u, "duckduckgo-lite")
+	if err != nil {
+		return nil, err
+	}
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	snippets := doc.Find("td.result-snippet")
+	var hits []SearchHit
+	doc.Find("a.result-link").EachWithBreak(func(i int, a *goquery.Selection) bool {
+		href, _ := a.Attr("href")
+		link := decodeDDGLink(href)
+		if link == "" {
+			return true
+		}
+		h := SearchHit{Title: strings.TrimSpace(a.Text()), URL: link}
+		if i < snippets.Length() {
+			h.Snippet = strings.TrimSpace(snippets.Eq(i).Text())
+		}
+		hits = append(hits, h)
+		return len(hits) < limit
+	})
+	if len(hits) == 0 && isDDGAnomaly(body) {
+		return nil, fmt.Errorf("duckduckgo-lite anomaly page: %w", errRateLimited)
+	}
+	return hits, nil
+}
+
+// searchBrave scrapes Brave Search's HTML — an independent index. Selectors
+// use stable class TOKENS (.snippet, .title, .snippet-description); the
+// svelte-* hash classes churn per deploy and are never referenced.
+func searchBrave(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
+	u := "https://search.brave.com/search?q=" + url.QueryEscape(query)
+	if r.Country != "" {
+		u += "&country=" + strings.ToLower(r.Country)
+	}
+	body, err := fetchSearchPage(ctx, u, "brave")
+	if err != nil {
+		return nil, err
+	}
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var hits []SearchHit
+	doc.Find("div.snippet").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		a := s.Find("a[href]").First()
+		href, _ := a.Attr("href")
+		if !strings.HasPrefix(href, "http") || strings.Contains(hostOf(href), "brave.com") {
+			return true
+		}
+		title := strings.TrimSpace(s.Find(".title").First().Text())
+		if title == "" {
+			return true // ads/widgets — organic snippets always carry a title
+		}
+		hits = append(hits, SearchHit{
+			Title:   title,
+			URL:     href,
+			Snippet: strings.TrimSpace(s.Find(".snippet-description, .generic-snippet").First().Text()),
+		})
+		return len(hits) < limit
+	})
+	return hits, nil
+}
+
+// searchEcosia scrapes ecosia.org, whose organic results come from
+// Bing/Google — big-index coverage without Bing's degraded bot page.
+// Selectors pin the stable data-test-id attributes, not styling classes.
+func searchEcosia(ctx context.Context, query string, limit int, _ Region) ([]SearchHit, error) {
+	u := "https://www.ecosia.org/search?q=" + url.QueryEscape(query)
+	body, err := fetchSearchPage(ctx, u, "ecosia")
+	if err != nil {
+		return nil, err
+	}
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	var hits []SearchHit
+	doc.Find("div.mainline__result-wrapper").EachWithBreak(func(_ int, s *goquery.Selection) bool {
+		a := s.Find(`a[data-test-id="result-link"]`).First()
+		href, _ := a.Attr("href")
+		if !strings.HasPrefix(href, "http") {
+			return true
+		}
+		hits = append(hits, SearchHit{
+			Title:   strings.TrimSpace(s.Find("div.result__title").First().Text()),
+			URL:     href,
+			Snippet: strings.TrimSpace(s.Find(`[data-test-id="result-description"]`).First().Text()),
 		})
 		return len(hits) < limit
 	})
@@ -214,7 +429,7 @@ func searchSearXNG(ctx context.Context, query string, limit int, r Region) ([]Se
 	case http.StatusForbidden:
 		return nil, fmt.Errorf("searxng 403: enable the 'json' format in the instance settings.yml")
 	case http.StatusTooManyRequests:
-		return nil, fmt.Errorf("searxng 429: rate limited")
+		return nil, fmt.Errorf("searxng 429: %w", errRateLimited)
 	default:
 		return nil, fmt.Errorf("searxng returned %s", resp.Status)
 	}

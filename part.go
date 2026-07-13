@@ -67,41 +67,148 @@ func first(ps []Part) (Part, bool) {
 	return ps[0], true
 }
 
-// rules seeds the core server-build predicates. ~15 rules eventually cover 90%
-// of server builds; M1 seeds the high-value ones that use unambiguous fields.
-var rules = []rule{
-	// CPU socket must match motherboard socket.
-	func(c map[string][]Part) []Violation {
-		cpu, ok1 := first(c["cpu"])
-		mb, ok2 := first(c["motherboard"])
-		if !ok1 || !ok2 || cpu.Socket == "" || mb.Socket == "" {
-			return nil
-		}
-		if cpu.Socket != mb.Socket {
-			return []Violation{{"cpu_socket", []string{cpu.ID, mb.ID},
-				fmt.Sprintf("CPU socket %s != motherboard socket %s", cpu.Socket, mb.Socket)}}
-		}
-		return nil
-	},
-	// RAM memory type must match motherboard memory type.
-	func(c map[string][]Part) []Violation {
-		var vs []Violation
-		mb, ok := first(c["motherboard"])
-		if !ok || mb.MemType == "" {
-			return nil
-		}
-		for _, ram := range c["ram"] {
-			if ram.MemType != "" && ram.MemType != mb.MemType {
-				vs = append(vs, Violation{"ram_mem_type", []string{ram.ID, mb.ID},
-					fmt.Sprintf("RAM %s is %s, motherboard needs %s", ram.ID, ram.MemType, mb.MemType)})
+// matchRules: attribute pairs that must be EQUAL between two categories when
+// BOTH sides declare them (unknown = gap, never a violation). Data, not code —
+// extend coverage by adding a row. Values are read through flatten (scalar
+// fields and free-form attrs alike) and compared normalized ("DDR-5"=="ddr5").
+// mode "eq" is exact equality; "in" means A's value must appear among B's
+// comma/space-separated tokens (e.g. a cooler's supported-sockets list).
+var matchRules = []struct {
+	catA, attrA, catB, attrB, ruleName, mode string
+}{
+	{"cpu", "socket", "motherboard", "socket", "cpu_socket", "eq"},
+	{"ram", "mem_type", "motherboard", "mem_type", "ram_mem_type", "eq"},
+	{"cpu", "mem_type", "motherboard", "mem_type", "cpu_mem_type", "eq"},
+	// RDIMM/UDIMM/LRDIMM: registered DIMMs on an unbuffered board (or vice
+	// versa) simply won't boot — the classic used-server-RAM trap.
+	{"ram", "mem_module", "motherboard", "mem_module", "ram_module_type", "eq"},
+	{"motherboard", "socket", "cooler", "sockets", "cooler_socket", "in"},
+}
+
+// capacityRules: numeric limits one category imposes on another, as data.
+// mode "sum": usage across ALL instances must fit the limit (memory capacity);
+// mode "each": every instance alone must fit (physical clearance). Unknown on
+// either side = no check (gap territory), never a violation.
+var capacityRules = []struct {
+	limCat, limAttr, useCat, useAttr, ruleName, mode string
+}{
+	{"motherboard", "mem_max_gb", "ram", "capacity_gb", "mem_capacity", "sum"},
+	{"motherboard", "dimm_max_gb", "ram", "capacity_gb", "dimm_capacity", "each"},
+	{"case", "length_mm", "gpu", "length_mm", "gpu_length", "each"},
+	{"case", "cooler_max_mm", "cooler", "height_mm", "cooler_height", "each"},
+	{"case", "psu_max_mm", "psu", "length_mm", "psu_length", "each"},
+}
+
+// attrRuleViolations evaluates the two data tables above over a build.
+func attrRuleViolations(byCat map[string][]Part) []Violation {
+	var vs []Violation
+	for _, r := range matchRules {
+		for _, a := range byCat[r.catA] {
+			av, aok := flattenStr(a, r.attrA)
+			if !aok {
+				continue
+			}
+			for _, b := range byCat[r.catB] {
+				bv, bok := flattenStr(b, r.attrB)
+				if !bok {
+					continue
+				}
+				ok := normFF(av) == normFF(bv)
+				if r.mode == "in" {
+					ok = tokensContain(bv, av)
+				}
+				if !ok {
+					vs = append(vs, Violation{r.ruleName, []string{a.ID, b.ID},
+						fmt.Sprintf("%s %s=%q incompatible with %s %s=%q", a.ID, r.attrA, av, b.ID, r.attrB, bv)})
+				}
 			}
 		}
-		return vs
-	},
-	// PSU must supply total TDP with 30% headroom.
+	}
+	for _, r := range capacityRules {
+		lim, ok := first(byCat[r.limCat])
+		if !ok {
+			continue
+		}
+		limV, lok := flattenNum(lim, r.limAttr)
+		if !lok {
+			continue
+		}
+		var sum float64
+		var users []string
+		for _, u := range byCat[r.useCat] {
+			uv, uok := flattenNum(u, r.useAttr)
+			if !uok {
+				continue
+			}
+			if r.mode == "each" && uv > limV {
+				vs = append(vs, Violation{r.ruleName, []string{u.ID, lim.ID},
+					fmt.Sprintf("%s %s=%g exceeds %s %s=%g", u.ID, r.useAttr, uv, lim.ID, r.limAttr, limV)})
+			}
+			sum += uv
+			users = append(users, u.ID)
+		}
+		if r.mode == "sum" && sum > limV {
+			vs = append(vs, Violation{r.ruleName, append(users, lim.ID),
+				fmt.Sprintf("total %s %g exceeds %s %s=%g", r.useAttr, sum, lim.ID, r.limAttr, limV)})
+		}
+	}
+	return vs
+}
+
+// flattenStr reads a part attribute as a non-empty string ("" = unknown).
+func flattenStr(p Part, attr string) (string, bool) {
+	v, ok := flatten(p)[attr]
+	if !ok || v == nil {
+		return "", false
+	}
+	s := strings.TrimSpace(fmt.Sprint(v))
+	if s == "" || s == "0" {
+		return "", false
+	}
+	return s, true
+}
+
+// flattenNum reads a part attribute as a positive number (0 = unknown).
+func flattenNum(p Part, attr string) (float64, bool) {
+	v, ok := toFloat(flatten(p)[attr])
+	if !ok || v <= 0 {
+		return 0, false
+	}
+	return v, true
+}
+
+// tokensContain reports whether needle equals one of the comma/slash/space
+// separated tokens in list, normalized — so "SP5" matches "SP5, SP6" but a
+// substring like "AM4" never matches "AM45".
+func tokensContain(list, needle string) bool {
+	n := normFF(needle)
+	for _, t := range strings.FieldsFunc(list, func(r rune) bool {
+		return r == ',' || r == '/' || r == ' ' || r == ';'
+	}) {
+		if normFF(t) == n {
+			return true
+		}
+	}
+	return false
+}
+
+// rules seeds the core server-build predicates that need bespoke logic; the
+// simple equality/limit pairs live in matchRules/capacityRules as data.
+var rules = []rule{
+	attrRuleViolations,
+	// Combined PSU output must supply total TDP with 30% headroom. Summing
+	// covers dual/quad-PSU servers; whether the pair also gives N+1 redundancy
+	// is reported as a gap in composeSpec, not a violation.
 	func(c map[string][]Part) []Violation {
-		psu, ok := first(c["psu"])
-		if !ok || psu.Watts == 0 {
+		var sum int
+		var ids []string
+		for _, psu := range c["psu"] {
+			if psu.Watts > 0 {
+				sum += psu.Watts
+				ids = append(ids, psu.ID)
+			}
+		}
+		if sum == 0 {
 			return nil
 		}
 		total := totalTDP(c)
@@ -109,26 +216,11 @@ var rules = []rule{
 			return nil
 		}
 		need := int(float64(total) * 1.3)
-		if psu.Watts < need {
-			return []Violation{{"psu_headroom", []string{psu.ID},
-				fmt.Sprintf("PSU %dW < %dW needed (total TDP %dW * 1.3)", psu.Watts, need, total)}}
+		if sum < need {
+			return []Violation{{"psu_headroom", ids,
+				fmt.Sprintf("PSU output %dW < %dW needed (total TDP %dW * 1.3)", sum, need, total)}}
 		}
 		return nil
-	},
-	// GPU must physically fit the case.
-	func(c map[string][]Part) []Violation {
-		var vs []Violation
-		cs, ok := first(c["case"])
-		if !ok || cs.LengthMM == 0 {
-			return nil
-		}
-		for _, gpu := range c["gpu"] {
-			if gpu.LengthMM != 0 && gpu.LengthMM > cs.LengthMM {
-				vs = append(vs, Violation{"gpu_length", []string{gpu.ID, cs.ID},
-					fmt.Sprintf("GPU %s is %dmm, case fits %dmm max", gpu.ID, gpu.LengthMM, cs.LengthMM)})
-			}
-		}
-		return vs
 	},
 	// Motherboard form factor must fit the case. A case's form factor is the
 	// largest board it accepts (an ATX case also fits mATX/mITX).
@@ -228,11 +320,32 @@ func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
 				}
 			}
 		}
+		// Superset tokens: fill remaining deficit from tokens that satisfy
+		// this one by standard (SAS ports run SATA drives).
+		for _, super := range tokenSupersets[tok] {
+			if deficit == 0 {
+				break
+			}
+			if avail := provides[super]; avail > 0 {
+				take := min(avail, deficit)
+				provides[super] -= take
+				deficit -= take
+			}
+		}
 		if deficit > 0 {
 			deficits[tok] = deficit
 		}
 	}
 	return deficits, users
+}
+
+// tokenSupersets maps a resource token to tokens that satisfy it by protocol
+// standard — spec facts, not vendor preference. A SATA drive plugs into a SAS
+// port/backplane; never the reverse.
+var tokenSupersets = map[string][]string{
+	// NOT bay:2.5 <- bay:3.5: that needs an adapter tray — hiding it would
+	// silently swallow a real purchase; let it surface as a need instead.
+	"port:sata": {"port:sas"},
 }
 
 // pcieWidth parses "pcie:x8" -> 8; 0 for non-pcie tokens.
@@ -307,7 +420,12 @@ type Where struct {
 // unknown", and queries are for FINDING things, so unknowns don't qualify.
 func matchWhere(p Part, w Where) bool {
 	v, ok := flatten(p)[strings.ToLower(strings.TrimSpace(w.Attr))]
-	if !ok || v == nil || v == "" || v == 0 {
+	if !ok || v == nil || v == "" {
+		return false
+	}
+	// Numeric zero = unknown, whatever the concrete type — JSON attrs decode as
+	// float64, scalar fields are int; `v == 0` would miss float64(0).
+	if f, isNum := toFloat(v); isNum && f == 0 {
 		return false
 	}
 	if w.Op == "exists" {
@@ -424,6 +542,31 @@ func composeSpec(parts []Part) Spec {
 	for _, p := range parts {
 		if (p.Category == "cpu" || p.Category == "gpu") && p.TDPW == 0 {
 			gaps = append(gaps, "unknown TDP for "+p.ID)
+		}
+	}
+	// RAM faster than the board's max isn't a failure — it downclocks — but
+	// it IS paid-for headroom you don't get. Surface it; don't violate.
+	if mb, ok := first(byCat["motherboard"]); ok && mb.MemSpeed > 0 {
+		for _, ram := range byCat["ram"] {
+			if ram.MemSpeed > mb.MemSpeed {
+				gaps = append(gaps, fmt.Sprintf("%s: %d MT/s will downclock to %s's %d MT/s max — paying for unused speed",
+					ram.ID, ram.MemSpeed, mb.ID, mb.MemSpeed))
+			}
+		}
+	}
+	// Multi-PSU: capacity passes on the SUM, but redundancy needs the largest
+	// single PSU to carry the load alone. Loss of N+1 is a gap (often the whole
+	// point of dual PSUs), not a violation (combined-only can be intentional).
+	if psus := byCat["psu"]; len(psus) > 1 {
+		maxW := 0
+		for _, p := range psus {
+			if p.Watts > maxW {
+				maxW = p.Watts
+			}
+		}
+		if need := int(float64(totalTDP(byCat)) * 1.3); maxW > 0 && need > 0 && maxW < need {
+			gaps = append(gaps, fmt.Sprintf(
+				"no N+1 redundancy: largest PSU %dW < %dW needed — build only survives with all PSUs running", maxW, need))
 		}
 	}
 	// Freshness: stale part data is as dangerous as missing data — models and

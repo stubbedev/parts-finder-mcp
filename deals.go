@@ -22,17 +22,33 @@ type Listing struct {
 	ShipsTo   []string  `json:"ships_to,omitempty"` // country codes / "EU" / "WORLD"; empty = unknown
 	SeenAt    time.Time `json:"seen_at,omitempty"`
 
+	// VAT basis. Consumer marketplaces list incl-VAT, B2B resellers ex-VAT —
+	// comparing the two raw skews picks by the VAT rate. nil = the page didn't
+	// say (flagged, never guessed).
+	VATIncluded *bool   `json:"vat_included,omitempty" jsonschema:"whether the price includes VAT; omit when the listing doesn't say — never guess"`
+	VATRate     float64 `json:"vat_rate,omitempty" jsonschema:"VAT percent of the listing's country, e.g. 25 for DK, 19 for DE"`
+
+	// Availability. Zero/nil = unknown; unknowns are never penalized.
+	QtyAvailable int   `json:"qty_available,omitempty" jsonschema:"units available at this price (auction/lot size); 0 = unknown"`
+	InStock      *bool `json:"in_stock,omitempty" jsonschema:"whether the item is in stock; omit when unknown"`
+	LeadDays     int   `json:"lead_days,omitempty" jsonschema:"delivery/lead time in days when stated"`
+
 	// Derived on read, not stored. Deals are never dropped for these — they
 	// are flagged and sorted below usable ones, so nothing is hidden.
 	Stale        bool    `json:"stale,omitempty"`
-	Dead         bool    `json:"dead,omitempty"`          // URL no longer reachable (live-check)
-	Unshippable  bool    `json:"unshippable,omitempty"`   // doesn't ship to the region
-	DisplayTotal float64 `json:"display_total,omitempty"` // total converted to display currency
+	Dead         bool    `json:"dead,omitempty"`           // URL no longer reachable (live-check)
+	Unshippable  bool    `json:"unshippable,omitempty"`    // doesn't ship to the region
+	VATUnknown   bool    `json:"vat_unknown,omitempty"`    // VAT basis not recorded — total may be ±VAT vs peers
+	DisplayTotal float64 `json:"display_total,omitempty"`  // total converted to display currency
+	DisplayExVAT float64 `json:"display_ex_vat,omitempty"` // ex-VAT total converted (when VAT basis known)
 	DisplayCurr  string  `json:"display_currency,omitempty"`
 }
 
-// usable = clickable right now: reachable and ships to the region.
-func (l Listing) usable() bool { return !l.Dead && !l.Unshippable }
+// usable = clickable and buyable right now: reachable, ships to the region,
+// and not explicitly out of stock (unknown stock stays usable).
+func (l Listing) usable() bool {
+	return !l.Dead && !l.Unshippable && (l.InStock == nil || *l.InStock)
+}
 
 func markShippable(ls []Listing, country string) {
 	for i := range ls {
@@ -51,6 +67,34 @@ func (l Listing) effectiveTotal() float64 {
 	return l.total()
 }
 
+// exVATTotal returns the listing total excluding VAT when the VAT basis is
+// known: ex-VAT prices pass through, incl-VAT prices are divided out by the
+// rate. Unknown basis (nil), or incl-VAT with no rate, is not computable.
+func (l Listing) exVATTotal() (float64, bool) {
+	if l.VATIncluded == nil {
+		return 0, false
+	}
+	if !*l.VATIncluded {
+		return l.total(), true
+	}
+	if l.VATRate <= 0 {
+		return 0, false
+	}
+	return l.total() / (1 + l.VATRate/100), true
+}
+
+// comparisonTotal is the ranking figure: the ex-VAT converted total when the
+// VAT basis is known (the business-buyer basis — VAT is deducted), else the
+// gross total. Unknown-VAT listings therefore compare by gross, which can only
+// OVERestimate them vs known-ex-VAT peers, never sneak them ahead; they carry
+// the VATUnknown flag so the skew is visible.
+func (l Listing) comparisonTotal() float64 {
+	if l.DisplayExVAT > 0 {
+		return l.DisplayExVAT
+	}
+	return l.effectiveTotal()
+}
+
 // stalenessDays: a listing older than this is flagged stale.
 // ponytail: fixed 14d threshold; make it a tool arg if it ever needs tuning.
 const stalenessDays = 14
@@ -62,16 +106,17 @@ func markStale(ls []Listing, now time.Time) {
 	}
 }
 
-// sortListings orders usable (live + shippable) first, then cheapest
-// (converted total when available); ties broken by most recent. Dead and
-// unshippable listings sink to the bottom but are never removed.
+// sortListings orders usable (live + shippable + in stock) first, then
+// cheapest by comparisonTotal (ex-VAT basis when known); ties broken by most
+// recent. Dead/unshippable/out-of-stock listings sink to the bottom but are
+// never removed.
 func sortListings(ls []Listing) {
 	sort.SliceStable(ls, func(i, j int) bool {
 		if ls[i].usable() != ls[j].usable() {
 			return ls[i].usable()
 		}
-		if ls[i].effectiveTotal() != ls[j].effectiveTotal() {
-			return ls[i].effectiveTotal() < ls[j].effectiveTotal()
+		if ls[i].comparisonTotal() != ls[j].comparisonTotal() {
+			return ls[i].comparisonTotal() < ls[j].comparisonTotal()
 		}
 		return ls[i].SeenAt.After(ls[j].SeenAt)
 	})
@@ -106,20 +151,24 @@ type Substitute struct {
 	Listing Listing `json:"listing"`
 }
 
-// annotateDisplay fills DisplayTotal/DisplayCurr by converting each listing's
-// total into the display currency. Best-effort: on conversion error the display
-// fields stay empty rather than failing the whole call.
+// annotateDisplay fills DisplayTotal/DisplayExVAT/DisplayCurr by converting
+// each listing's totals into the display currency, and flags listings whose
+// VAT basis is unrecorded. Best-effort: on conversion error the display fields
+// stay empty rather than failing the whole call.
 func annotateDisplay(ctx context.Context, ls []Listing, display string) {
-	if display == "" {
-		return
-	}
 	for i := range ls {
-		if ls[i].Currency == "" {
+		ls[i].VATUnknown = ls[i].VATIncluded == nil
+		if display == "" || ls[i].Currency == "" {
 			continue
 		}
 		if v, err := convert(ctx, ls[i].total(), ls[i].Currency, display); err == nil {
 			ls[i].DisplayTotal = v
 			ls[i].DisplayCurr = display
+		}
+		if ex, ok := ls[i].exVATTotal(); ok {
+			if v, err := convert(ctx, ex, ls[i].Currency, display); err == nil {
+				ls[i].DisplayExVAT = v
+			}
 		}
 	}
 }
