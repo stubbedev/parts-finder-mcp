@@ -46,13 +46,13 @@ filter.
 
 | Tool | Does |
 |------|------|
-| `search_parts(query, category?, limit?)` | keyless DuckDuckGo search → result links |
-| `fetch_content(url, render?)` | fetch + readability → text (cached); PDF-aware; `render=true` uses lightpanda |
-| `save_part(Part)` | persist a structured part; derives id from vendor/model if omitted |
-| `get_part(id)` | load a stored part |
-| `check_compat(part_ids[])` | run compat rules → violations |
-| `compose_spec(part_ids[])` | build report: compat, gaps, total TDP |
-| `save_spec(id, name?, part_ids[])` / `load_spec(id)` | persist/recall builds |
+| `search_parts(query, category?, limit?)` | LIVE keyless region-biased search → result links (web is truth, not training data) |
+| `fetch_content(url, render?)` | fetch + readability → text (cached); PDF-aware; tables kept; `render=true` uses lightpanda |
+| `save_part(Part)` | persist a part: scalars + provides/requires + free-form `attrs` |
+| `query_parts(ids? \| category?, where[]?)` | query parts by any attribute: `cuda_compute >= 8.9`, `l3_cache_mb >= 256`; ops eq/ne/gt/gte/lt/lte/contains/exists |
+| `compose_spec(part_ids[])` | build report: compat over known data, loud gaps, needs, total TDP |
+| `save_spec(id, name?, part_ids[])` / `load_spec(id?)` | persist/recall builds; `load_spec` without id lists all |
+| `compare_specs(spec_ids[])` | side-by-side configurations: compat, TDP, live-checked converted totals, buy links, uncovered parts |
 | `save_listing(Listing)` | record a point-in-time price for a part |
 | `find_deals(part_id, search?, country?, display_currency?, ...)` | live-checked, region-filtered deals, cheapest-converted first + staleness |
 | `find_substitute(part_id, budget?, currency?, country?)` | cheaper drop-in replacements within budget (cross-currency aware) |
@@ -108,3 +108,12 @@ telling you exactly what extras to add.
    alternatives + converted build total. Parts without usable listings come
    back with buy-page search hits — `fetch_content` + `save_listing` those,
    re-run `shop_spec`.
+5. Build 2–3 candidate specs → `compare_specs` → pick by compat, TDP, and
+   live-checked total.
+
+## Freshness guarantees
+
+- Every `shop_spec`/`find_deals`/`compare_specs` call live-probes listing URLs.
+- Part data older than 30 days gets a gap: refresh with `deep_specs`.
+- The live web is the source of truth: tool descriptions instruct the client to
+  never deny a model's existence from training data — always search first.

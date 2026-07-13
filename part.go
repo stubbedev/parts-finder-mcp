@@ -38,6 +38,12 @@ type Part struct {
 	Provides map[string]int `json:"provides,omitempty"`
 	Requires map[string]int `json:"requires,omitempty"`
 
+	// Attrs holds any further typed attribute worth querying on — cache sizes,
+	// CUDA compute capability, core counts, rotational speed, whatever the
+	// spec sheet yields ("l3_cache_mb": 384, "cuda_compute": 8.9,
+	// "cores": 32). query_parts filters over these plus the scalar fields.
+	Attrs map[string]any `json:"attrs,omitempty"`
+
 	RawSpecs  string    `json:"raw_specs,omitempty"` // original scraped blob (json/text)
 	SourceURL string    `json:"source_url,omitempty"`
 	FetchedAt time.Time `json:"fetched_at,omitempty"`
@@ -274,6 +280,94 @@ func totalTDP(byCat map[string][]Part) int {
 	return t
 }
 
+// flatten exposes a part's scalar fields and free-form attrs as one queryable
+// key space, so "socket" and "l3_cache_mb" filter through the same path.
+func flatten(p Part) map[string]any {
+	m := map[string]any{
+		"id": p.ID, "category": p.Category, "vendor": p.Vendor, "model": p.Model,
+		"socket": p.Socket, "mem_type": p.MemType, "mem_speed": p.MemSpeed,
+		"form_factor": p.FormFactor, "tdp_w": p.TDPW, "pcie_gen": p.PCIeGen,
+		"pcie_lanes": p.PCIeLanes, "length_mm": p.LengthMM, "watts": p.Watts,
+	}
+	for k, v := range p.Attrs {
+		m[strings.ToLower(strings.TrimSpace(k))] = v
+	}
+	return m
+}
+
+// Where is one query clause: attr op value.
+type Where struct {
+	Attr  string `json:"attr"`
+	Op    string `json:"op" jsonschema:"one of: eq, ne, gt, gte, lt, lte, contains, exists"`
+	Value any    `json:"value,omitempty" jsonschema:"number or string; omit for exists"`
+}
+
+// matchWhere evaluates one clause against a part. Unknown attribute => no
+// match for every op except a failed exists — consistent with "absent means
+// unknown", and queries are for FINDING things, so unknowns don't qualify.
+func matchWhere(p Part, w Where) bool {
+	v, ok := flatten(p)[strings.ToLower(strings.TrimSpace(w.Attr))]
+	if !ok || v == nil || v == "" || v == 0 {
+		return false
+	}
+	if w.Op == "exists" {
+		return true
+	}
+	an, aok := toFloat(v)
+	bn, bok := toFloat(w.Value)
+	if aok && bok { // numeric comparison ("cuda_compute" >= 8.9)
+		switch w.Op {
+		case "eq":
+			return an == bn
+		case "ne":
+			return an != bn
+		case "gt":
+			return an > bn
+		case "gte":
+			return an >= bn
+		case "lt":
+			return an < bn
+		case "lte":
+			return an <= bn
+		}
+		return false
+	}
+	as := strings.ToLower(fmt.Sprint(v))
+	bs := strings.ToLower(fmt.Sprint(w.Value))
+	switch w.Op {
+	case "eq":
+		return as == bs
+	case "ne":
+		return as != bs
+	case "contains":
+		return strings.Contains(as, bs)
+	case "gt":
+		return as > bs
+	case "gte":
+		return as >= bs
+	case "lt":
+		return as < bs
+	case "lte":
+		return as <= bs
+	}
+	return false
+}
+
+func toFloat(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case int:
+		return float64(x), true
+	case string:
+		var f float64
+		if _, err := fmt.Sscanf(strings.TrimSpace(x), "%g", &f); err == nil {
+			return f, true
+		}
+	}
+	return 0, false
+}
+
 // checkCompat runs every rule over the parts and returns all violations.
 func checkCompat(parts []Part) []Violation {
 	byCat := groupByCategory(parts)
@@ -306,6 +400,10 @@ type Spec struct {
 // requiredCategories is the minimum for a bootable server build.
 var requiredCategories = []string{"cpu", "motherboard", "ram", "psu"}
 
+// partDataMaxAge: part data older than this gets a freshness gap.
+// ponytail: fixed 30d; make it a tool arg if it ever needs tuning.
+const partDataMaxAge = 30 * 24 * time.Hour
+
 func composeSpec(parts []Part) Spec {
 	byCat := groupByCategory(parts)
 	vs := checkCompat(parts)
@@ -319,6 +417,13 @@ func composeSpec(parts []Part) Spec {
 	for _, p := range parts {
 		if (p.Category == "cpu" || p.Category == "gpu") && p.TDPW == 0 {
 			gaps = append(gaps, "unknown TDP for "+p.ID)
+		}
+	}
+	// Freshness: stale part data is as dangerous as missing data — models and
+	// revisions change. Flag anything not refreshed recently.
+	for _, p := range parts {
+		if age := time.Since(p.FetchedAt); !p.FetchedAt.IsZero() && age > partDataMaxAge {
+			gaps = append(gaps, fmt.Sprintf("%s: part data %d days old — refresh with deep_specs", p.ID, int(age.Hours()/24)))
 		}
 	}
 	// "Compatible" only covers KNOWN data. Anything unverifiable gets a loud

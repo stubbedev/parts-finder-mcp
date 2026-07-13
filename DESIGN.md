@@ -70,6 +70,11 @@ gpu.length_mm <= case.max_gpu_mm
 - **M3 — done:** SearXNG fallback (`SEARXNG_URL`), lightpanda headless render
   (`LIGHTPANDA_URL`, opt-in via `fetch_content(render=true)`), 2 more compat
   rules (form-factor fit, GPU power connectors).
+- **M7 — done:** consolidation + arbitrary attributes + config comparison.
+  `Part.Attrs` free-form typed attributes; `query_parts` with where-clauses
+  (numeric + string ops) over scalars and attrs; `compare_specs` side-by-side
+  options with live totals; `load_spec` lists specs; part-data freshness gaps
+  (30d); killed `check_compat` (⊂ compose_spec) and `get_part` (⊂ query_parts).
 - **M6 — done:** full sweep. Never-drop policy: dead/unshippable/stale listings
   flagged + sorted last, never filtered. Structured `needs` (resource deficits)
   = shopping list for small stuff (cables, adapters); quantities via repeated

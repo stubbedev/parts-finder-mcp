@@ -103,6 +103,57 @@ func TestQuantityAndNeeds(t *testing.T) {
 	}
 }
 
+// Attribute queries: numeric + string ops over scalar fields AND free attrs.
+func TestMatchWhere(t *testing.T) {
+	gpu := Part{ID: "gpu", Category: "gpu", TDPW: 140,
+		Attrs: map[string]any{"cuda_compute": 8.9, "vram_gb": 20, "interface": "PCIe 4.0 x16"}}
+	cpu := Part{ID: "cpu", Category: "cpu",
+		Attrs: map[string]any{"l3_cache_mb": 384, "cores": 32}}
+	cases := []struct {
+		p    Part
+		w    Where
+		want bool
+	}{
+		{gpu, Where{"cuda_compute", "gte", 8.9}, true},
+		{gpu, Where{"cuda_compute", "gt", 9.0}, false},
+		{gpu, Where{"vram_gb", "gte", 16}, true},
+		{gpu, Where{"tdp_w", "lte", 150.0}, true},          // scalar field via same path
+		{gpu, Where{"interface", "contains", "pcie 4"}, true}, // case-folded contains
+		{gpu, Where{"l3_cache_mb", "gte", 1}, false},       // absent attr never matches
+		{cpu, Where{"l3_cache_mb", "gte", 256.0}, true},
+		{cpu, Where{"l3_cache_mb", "exists", nil}, true},
+		{gpu, Where{"l3_cache_mb", "exists", nil}, false},
+		{cpu, Where{"cores", "eq", "32"}, true},            // string "32" vs number coerces numeric
+	}
+	for _, c := range cases {
+		if got := matchWhere(c.p, c.w); got != c.want {
+			t.Errorf("matchWhere(%s, %+v)=%v want %v", c.p.ID, c.w, got, c.want)
+		}
+	}
+}
+
+// Attrs must survive a store round-trip (JSON column).
+func TestAttrsRoundTrip(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := Part{ID: "g", Category: "gpu", Attrs: map[string]any{"cuda_compute": 8.9, "name": "ada"}}
+	if err := st.savePart(in); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.getParts([]string{"g"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := toFloat(got[0].Attrs["cuda_compute"]); v != 8.9 {
+		t.Errorf("cuda_compute lost: %+v", got[0].Attrs)
+	}
+	if got[0].Attrs["name"] != "ada" {
+		t.Errorf("string attr lost: %+v", got[0].Attrs)
+	}
+}
+
 // Unknown attributes must be gaps, never violations.
 func TestUnknownNoFalseViolation(t *testing.T) {
 	parts := []Part{

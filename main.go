@@ -64,9 +64,40 @@ type savePartOut struct {
 type idsIn struct {
 	PartIDs []string `json:"part_ids" jsonschema:"stored part IDs to evaluate together"`
 }
-type compatOut struct {
-	OK         bool        `json:"ok"`
-	Violations []Violation `json:"violations"`
+
+type queryIn struct {
+	IDs      []string `json:"ids,omitempty" jsonschema:"exact part ids to fetch"`
+	Category string   `json:"category,omitempty" jsonschema:"restrict to one category; empty = all"`
+	Where    []Where  `json:"where,omitempty" jsonschema:"attribute clauses, ANDed"`
+	Limit    int      `json:"limit,omitempty"`
+}
+type queryOut struct {
+	Parts []Part `json:"parts"`
+}
+
+type compareIn struct {
+	SpecIDs         []string `json:"spec_ids" jsonschema:"saved specs to compare side by side"`
+	Country         string   `json:"country,omitempty"`
+	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for totals; defaults to region currency"`
+}
+type specOption struct {
+	ID            string      `json:"id"`
+	Name          string      `json:"name,omitempty"`
+	Compatible    bool        `json:"compatible"`
+	Violations    []Violation `json:"violations,omitempty"`
+	Gaps          []string    `json:"gaps,omitempty"`
+	Needs         []Need      `json:"needs,omitempty"`
+	TotalTDPW     int         `json:"total_tdp_w"`
+	TotalBest     float64     `json:"total_best"` // sum of best usable listings, converted
+	TotalCovers   int         `json:"total_covers"`
+	PartCount     int         `json:"part_count"`
+	BuyLinks      []string    `json:"buy_links,omitempty"` // best usable URL per covered part
+	UncoveredIDs  []string    `json:"uncovered_ids,omitempty"`
+}
+type compareOut struct {
+	Region        Region       `json:"region"`
+	TotalCurrency string       `json:"total_currency,omitempty"`
+	Options       []specOption `json:"options"`
 }
 
 type saveSpecIn struct {
@@ -75,7 +106,11 @@ type saveSpecIn struct {
 	PartIDs []string `json:"part_ids"`
 }
 type loadSpecIn struct {
-	ID string `json:"id"`
+	ID string `json:"id,omitempty" jsonschema:"spec id; omit to list all saved specs"`
+}
+type loadSpecOut struct {
+	Spec  *Spec      `json:"spec,omitempty"`
+	Specs []SpecInfo `json:"specs,omitempty"` // when listing
 }
 
 type dealsIn struct {
@@ -181,6 +216,33 @@ type convertOut struct {
 	Converted float64 `json:"converted"`
 }
 
+// pricePart returns a part's listings fully evaluated for buying NOW:
+// staleness-marked, live-checked, shippability-flagged, converted to the
+// display currency, usable-first sorted. Nothing dropped.
+func pricePart(ctx context.Context, partID string, region Region, display string) ([]Listing, error) {
+	ls, err := store.listingsFor(partID)
+	if err != nil {
+		return nil, err
+	}
+	markStale(ls, time.Now())
+	liveCheckAll(ctx, ls)
+	markShippable(ls, region.Country)
+	annotateDisplay(ctx, ls, display)
+	sortListings(ls)
+	return ls, nil
+}
+
+// bestContribution adds a best listing's converted total into a running sum.
+func bestContribution(l Listing, display string) (float64, bool) {
+	if l.DisplayTotal > 0 {
+		return l.DisplayTotal, true
+	}
+	if l.Currency == display {
+		return l.total(), true
+	}
+	return 0, false
+}
+
 // regionFor resolves the effective region for a call: an explicit country
 // override, else the detected region.
 func regionFor(ctx context.Context, country string) Region {
@@ -196,7 +258,7 @@ func regionFor(ctx context.Context, country string) Region {
 func registerTools(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "search_parts",
-		Description: "Search the web (keyless DuckDuckGo) for hardware parts/spec pages. Returns result links to fetch.",
+		Description: "LIVE region-biased web search for hardware parts/spec pages. Returns result links to fetch. The live web is the source of truth for what exists: NEVER claim a model/SKU doesn't exist from prior knowledge — hardware releases outpace training data, so search first and trust the results.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in searchIn) (*mcp.CallToolResult, searchOut, error) {
 		q := in.Query
 		if in.Category != "" {
@@ -251,26 +313,36 @@ func registerTools(s *mcp.Server) {
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
-		Name:        "get_part",
-		Description: "Fetch a stored Part by id.",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in loadSpecIn) (*mcp.CallToolResult, Part, error) {
-		ps, err := store.getParts([]string{in.ID})
-		if err != nil {
-			return nil, Part{}, err
+		Name:        "query_parts",
+		Description: "Query stored parts by ids, category, and/or attribute clauses over scalar fields AND free-form attrs — e.g. find a GPU with cuda_compute >= 8.9, or a CPU with l3_cache_mb >= 256. Ops: eq, ne, gt, gte, lt, lte, contains, exists. Numeric when both sides parse as numbers. Parts missing the attribute never match — deep_specs them first if the pool looks thin. The store only knows what was saved: an empty result means 'not ingested yet', NOT 'does not exist' — use search_parts to look live.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in queryIn) (*mcp.CallToolResult, queryOut, error) {
+		var parts []Part
+		var err error
+		if len(in.IDs) > 0 {
+			parts, err = store.getParts(in.IDs)
+		} else {
+			parts, err = store.partsByCategory(in.Category)
 		}
-		return nil, ps[0], nil
-	})
-
-	mcp.AddTool(s, &mcp.Tool{
-		Name:        "check_compat",
-		Description: "Check whether stored parts are compatible. Returns violations (empty = compatible).",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, compatOut, error) {
-		parts, err := store.getParts(in.PartIDs)
 		if err != nil {
-			return nil, compatOut{}, err
+			return nil, queryOut{}, err
 		}
-		vs := checkCompat(parts)
-		return nil, compatOut{OK: len(vs) == 0, Violations: vs}, nil
+		var out []Part
+		for _, p := range parts {
+			match := true
+			for _, w := range in.Where {
+				if !matchWhere(p, w) {
+					match = false
+					break
+				}
+			}
+			if match {
+				out = append(out, p)
+			}
+		}
+		if in.Limit > 0 && len(out) > in.Limit {
+			out = out[:in.Limit]
+		}
+		return nil, queryOut{Parts: out}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -432,23 +504,15 @@ func registerTools(s *mcp.Server) {
 		}
 		for _, p := range parts {
 			item := shopItem{Part: p}
-			ls, err := store.listingsFor(p.ID)
+			ls, err := pricePart(ctx, p.ID, region, display)
 			if err != nil {
 				return nil, shopOut{}, err
 			}
-			markStale(ls, time.Now())
-			liveCheckAll(ctx, ls)
-			markShippable(ls, region.Country) // flag, never drop
-			annotateDisplay(ctx, ls, display)
-			sortListings(ls) // usable first, then cheapest; flagged ones sink
 			if len(ls) > 0 && ls[0].usable() {
 				item.Best = &ls[0]
 				item.Alternatives = ls[1:] // includes flagged dead/unshippable — nothing hidden
-				if ls[0].DisplayTotal > 0 {
-					out.TotalBest += ls[0].DisplayTotal
-					out.TotalCovers++
-				} else if ls[0].Currency == display {
-					out.TotalBest += ls[0].total()
+				if v, ok := bestContribution(ls[0], display); ok {
+					out.TotalBest += v
 					out.TotalCovers++
 				}
 			} else {
@@ -459,6 +523,54 @@ func registerTools(s *mcp.Server) {
 				}
 			}
 			out.Items = append(out.Items, item)
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "compare_specs",
+		Description: "Compare saved builds side by side to pick one: per spec — compatibility, gaps, needs, total TDP, live-checked converted price total (best usable listing per part), direct buy links, and which parts still lack a usable listing. Prices are probed live at call time.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in compareIn) (*mcp.CallToolResult, compareOut, error) {
+		if len(in.SpecIDs) == 0 {
+			return nil, compareOut{}, fmt.Errorf("pass spec_ids")
+		}
+		region := regionFor(ctx, in.Country)
+		display := in.DisplayCurrency
+		if display == "" {
+			display = region.Currency
+		}
+		out := compareOut{Region: region, TotalCurrency: display}
+		for _, sid := range in.SpecIDs {
+			name, partIDs, err := store.loadSpec(sid)
+			if err != nil {
+				return nil, compareOut{}, fmt.Errorf("spec %s: %w", sid, err)
+			}
+			parts, err := store.getParts(partIDs)
+			if err != nil {
+				return nil, compareOut{}, err
+			}
+			spec := composeSpec(parts)
+			opt := specOption{
+				ID: sid, Name: name, Compatible: spec.Compatible,
+				Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
+				TotalTDPW: spec.TotalTDPW, PartCount: len(parts),
+			}
+			for _, p := range parts {
+				ls, err := pricePart(ctx, p.ID, region, display)
+				if err != nil {
+					return nil, compareOut{}, err
+				}
+				if len(ls) > 0 && ls[0].usable() {
+					opt.BuyLinks = append(opt.BuyLinks, ls[0].URL)
+					if v, ok := bestContribution(ls[0], display); ok {
+						opt.TotalBest += v
+						opt.TotalCovers++
+						continue
+					}
+				}
+				opt.UncoveredIDs = append(opt.UncoveredIDs, p.ID)
+			}
+			out.Options = append(out.Options, opt)
 		}
 		return nil, out, nil
 	})
@@ -526,17 +638,25 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "load_spec",
-		Description: "Load a saved build by id and re-compose it (fresh compat + gaps against current part data).",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in loadSpecIn) (*mcp.CallToolResult, Spec, error) {
+		Description: "Load a saved build by id and re-compose it (fresh compat + gaps against current part data). Without an id, lists every saved spec (id, name, part_ids).",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in loadSpecIn) (*mcp.CallToolResult, loadSpecOut, error) {
+		if in.ID == "" {
+			specs, err := store.listSpecs()
+			if err != nil {
+				return nil, loadSpecOut{}, err
+			}
+			return nil, loadSpecOut{Specs: specs}, nil
+		}
 		_, partIDs, err := store.loadSpec(in.ID)
 		if err != nil {
-			return nil, Spec{}, err
+			return nil, loadSpecOut{}, err
 		}
 		parts, err := store.getParts(partIDs)
 		if err != nil {
-			return nil, Spec{}, err
+			return nil, loadSpecOut{}, err
 		}
-		return nil, composeSpec(parts), nil
+		spec := composeSpec(parts)
+		return nil, loadSpecOut{Spec: &spec}, nil
 	})
 }
 

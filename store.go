@@ -44,6 +44,7 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	// Migrate pre-existing DBs; "duplicate column" errors are expected noise.
 	db.Exec(`ALTER TABLE parts ADD COLUMN provides TEXT`)
 	db.Exec(`ALTER TABLE parts ADD COLUMN requires TEXT`)
+	db.Exec(`ALTER TABLE parts ADD COLUMN attrs TEXT`)
 	return &Store{db}, nil
 }
 
@@ -51,42 +52,44 @@ func (s *Store) savePart(p Part) error {
 	conns, _ := json.Marshal(p.PowerConnectors)
 	prov, _ := json.Marshal(p.Provides)
 	req, _ := json.Marshal(p.Requires)
+	attrs, _ := json.Marshal(p.Attrs)
 	_, err := s.db.Exec(`
 INSERT INTO parts (id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
   tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
-  raw_specs,source_url,fetched_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  attrs,raw_specs,source_url,fetched_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET category=excluded.category,vendor=excluded.vendor,
   model=excluded.model,socket=excluded.socket,mem_type=excluded.mem_type,
   mem_speed=excluded.mem_speed,form_factor=excluded.form_factor,tdp_w=excluded.tdp_w,
   pcie_gen=excluded.pcie_gen,pcie_lanes=excluded.pcie_lanes,
   power_connectors=excluded.power_connectors,length_mm=excluded.length_mm,
   watts=excluded.watts,provides=excluded.provides,requires=excluded.requires,
-  raw_specs=excluded.raw_specs,source_url=excluded.source_url,
+  attrs=excluded.attrs,raw_specs=excluded.raw_specs,source_url=excluded.source_url,
   fetched_at=excluded.fetched_at`,
 		p.ID, p.Category, p.Vendor, p.Model, p.Socket, p.MemType, p.MemSpeed,
 		p.FormFactor, p.TDPW, p.PCIeGen, p.PCIeLanes, string(conns), p.LengthMM,
-		p.Watts, string(prov), string(req), p.RawSpecs, p.SourceURL,
+		p.Watts, string(prov), string(req), string(attrs), p.RawSpecs, p.SourceURL,
 		p.FetchedAt.Format(time.RFC3339))
 	return err
 }
 
 const partCols = `id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
   tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
-  raw_specs,source_url,fetched_at`
+  attrs,raw_specs,source_url,fetched_at`
 
 func scanPart(rows *sql.Rows) (Part, error) {
 	var p Part
-	var conns, prov, req, fetched sql.NullString
+	var conns, prov, req, attrs, fetched sql.NullString
 	if err := rows.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
 		&p.MemType, &p.MemSpeed, &p.FormFactor, &p.TDPW, &p.PCIeGen, &p.PCIeLanes,
-		&conns, &p.LengthMM, &p.Watts, &prov, &req, &p.RawSpecs, &p.SourceURL,
-		&fetched); err != nil {
+		&conns, &p.LengthMM, &p.Watts, &prov, &req, &attrs, &p.RawSpecs,
+		&p.SourceURL, &fetched); err != nil {
 		return Part{}, err
 	}
 	json.Unmarshal([]byte(conns.String), &p.PowerConnectors)
 	json.Unmarshal([]byte(prov.String), &p.Provides)
 	json.Unmarshal([]byte(req.String), &p.Requires)
+	json.Unmarshal([]byte(attrs.String), &p.Attrs)
 	p.FetchedAt, _ = time.Parse(time.RFC3339, fetched.String)
 	return p, nil
 }
@@ -130,8 +133,13 @@ func (s *Store) getParts(ids []string) ([]Part, error) {
 	return out, nil
 }
 
+// partsByCategory returns parts in a category; empty cat returns everything.
 func (s *Store) partsByCategory(cat string) ([]Part, error) {
-	rows, err := s.db.Query(`SELECT `+partCols+` FROM parts WHERE category=?`, cat)
+	q, args := `SELECT `+partCols+` FROM parts`, []any{}
+	if cat != "" {
+		q, args = q+` WHERE category=?`, []any{cat}
+	}
+	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -217,6 +225,32 @@ func (s *Store) saveSpec(id, name string, partIDs []string) error {
 ON CONFLICT(id) DO UPDATE SET name=excluded.name,part_ids=excluded.part_ids`,
 		id, name, string(ids), time.Now().Format(time.RFC3339))
 	return err
+}
+
+// SpecInfo is a saved spec's identity for listing.
+type SpecInfo struct {
+	ID      string   `json:"id"`
+	Name    string   `json:"name,omitempty"`
+	PartIDs []string `json:"part_ids"`
+}
+
+func (s *Store) listSpecs() ([]SpecInfo, error) {
+	rows, err := s.db.Query(`SELECT id,name,part_ids FROM specs ORDER BY created_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SpecInfo
+	for rows.Next() {
+		var si SpecInfo
+		var ids string
+		if err := rows.Scan(&si.ID, &si.Name, &ids); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(ids), &si.PartIDs)
+		out = append(out, si)
+	}
+	return out, nil
 }
 
 func (s *Store) loadSpec(id string) (name string, partIDs []string, err error) {
