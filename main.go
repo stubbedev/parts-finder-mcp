@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -74,6 +75,24 @@ type saveSpecIn struct {
 }
 type loadSpecIn struct {
 	ID string `json:"id"`
+}
+
+type dealsIn struct {
+	PartID string `json:"part_id"`
+	Search bool   `json:"search,omitempty" jsonschema:"also run a live web search for buy pages to populate more listings (default false)"`
+}
+type dealsOut struct {
+	Listings []Listing   `json:"listings"`
+	Hits     []SearchHit `json:"search_hits,omitempty"`
+}
+
+type substituteIn struct {
+	PartID   string  `json:"part_id"`
+	Budget   float64 `json:"budget,omitempty" jsonschema:"max total price (price+shipping); 0 = no cap"`
+	Currency string  `json:"currency,omitempty" jsonschema:"ISO currency to compare in; listings in other currencies are skipped (no FX conversion)"`
+}
+type substituteOut struct {
+	Substitutes []Substitute `json:"substitutes"`
 }
 
 func registerTools(s *mcp.Server) {
@@ -174,6 +193,85 @@ func registerTools(s *mcp.Server) {
 			return nil, savePartOut{}, err
 		}
 		return nil, savePartOut{ID: in.ID}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "save_listing",
+		Description: "Record a price observation for a stored part (extracted from a listing/reseller page). Prices are point-in-time; find_deals flags stale ones.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, l Listing) (*mcp.CallToolResult, savePartOut, error) {
+		if l.PartID == "" {
+			return nil, savePartOut{}, fmt.Errorf("part_id is required")
+		}
+		if l.ID == "" {
+			l.ID = slug(l.PartID, l.Vendor, l.Condition)
+		}
+		if l.SeenAt.IsZero() {
+			l.SeenAt = time.Now()
+		}
+		if err := store.saveListing(l); err != nil {
+			return nil, savePartOut{}, err
+		}
+		return nil, savePartOut{ID: l.ID}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "find_deals",
+		Description: "List recorded deals for a part, cheapest total first, with staleness flags. With search=true, also returns fresh web results (vendor + reseller) to fetch and save_listing.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dealsIn) (*mcp.CallToolResult, dealsOut, error) {
+		parts, err := store.getParts([]string{in.PartID})
+		if err != nil {
+			return nil, dealsOut{}, err
+		}
+		listings, err := store.listingsFor(in.PartID)
+		if err != nil {
+			return nil, dealsOut{}, err
+		}
+		markStale(listings, time.Now())
+		sortListings(listings)
+		out := dealsOut{Listings: listings}
+		if in.Search {
+			p := parts[0]
+			q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
+			out.Hits, _ = search(ctx, q, 10) // best-effort; ignore search errors
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "find_substitute",
+		Description: "Find cheaper drop-in replacements for a part: same category, attribute-compatible (socket/mem/form factor), with a recorded listing within budget. Ranked cheapest first. Note: 'similar performance' is approximated by compatibility, not benchmark scores.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, in substituteIn) (*mcp.CallToolResult, substituteOut, error) {
+		parts, err := store.getParts([]string{in.PartID})
+		if err != nil {
+			return nil, substituteOut{}, err
+		}
+		orig := parts[0]
+		cands, err := store.partsByCategory(orig.Category)
+		if err != nil {
+			return nil, substituteOut{}, err
+		}
+		var subs []Substitute
+		for _, c := range cands {
+			if !substituteMatch(orig, c) {
+				continue
+			}
+			ls, err := store.listingsFor(c.ID)
+			if err != nil {
+				return nil, substituteOut{}, err
+			}
+			best, ok := cheapest(ls, in.Currency)
+			if !ok {
+				continue
+			}
+			if in.Budget > 0 && best.total() > in.Budget {
+				continue
+			}
+			subs = append(subs, Substitute{Part: c, Listing: best})
+		}
+		sort.Slice(subs, func(i, j int) bool {
+			return subs[i].Listing.total() < subs[j].Listing.total()
+		})
+		return nil, substituteOut{Substitutes: subs}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

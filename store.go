@@ -30,7 +30,13 @@ CREATE TABLE IF NOT EXISTS specs (
 );
 CREATE TABLE IF NOT EXISTS content_cache (
   url TEXT PRIMARY KEY, title TEXT, content TEXT, fetched_at TEXT
-);`
+);
+CREATE TABLE IF NOT EXISTS listings (
+  id TEXT PRIMARY KEY, part_id TEXT, vendor TEXT, price REAL, shipping REAL,
+  currency TEXT, condition TEXT, url TEXT, seen_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_listings_part ON listings(part_id);
+CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
@@ -98,6 +104,63 @@ func (s *Store) getParts(ids []string) ([]Part, error) {
 	}
 	if len(missing) > 0 {
 		return out, fmt.Errorf("unknown part ids: %s", strings.Join(missing, ", "))
+	}
+	return out, nil
+}
+
+func (s *Store) partsByCategory(cat string) ([]Part, error) {
+	rows, err := s.db.Query(`SELECT id,category,vendor,model,socket,mem_type,mem_speed,
+  form_factor,tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,raw_specs,
+  source_url,fetched_at FROM parts WHERE category=?`, cat)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Part
+	for rows.Next() {
+		var p Part
+		var conns, fetched string
+		if err := rows.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
+			&p.MemType, &p.MemSpeed, &p.FormFactor, &p.TDPW, &p.PCIeGen, &p.PCIeLanes,
+			&conns, &p.LengthMM, &p.Watts, &p.RawSpecs, &p.SourceURL, &fetched); err != nil {
+			return nil, err
+		}
+		json.Unmarshal([]byte(conns), &p.PowerConnectors)
+		p.FetchedAt, _ = time.Parse(time.RFC3339, fetched)
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (s *Store) saveListing(l Listing) error {
+	_, err := s.db.Exec(`INSERT INTO listings
+  (id,part_id,vendor,price,shipping,currency,condition,url,seen_at)
+  VALUES (?,?,?,?,?,?,?,?,?)
+ON CONFLICT(id) DO UPDATE SET part_id=excluded.part_id,vendor=excluded.vendor,
+  price=excluded.price,shipping=excluded.shipping,currency=excluded.currency,
+  condition=excluded.condition,url=excluded.url,seen_at=excluded.seen_at`,
+		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency, l.Condition,
+		l.URL, l.SeenAt.Format(time.RFC3339))
+	return err
+}
+
+func (s *Store) listingsFor(partID string) ([]Listing, error) {
+	rows, err := s.db.Query(`SELECT id,part_id,vendor,price,shipping,currency,
+  condition,url,seen_at FROM listings WHERE part_id=?`, partID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Listing
+	for rows.Next() {
+		var l Listing
+		var seen string
+		if err := rows.Scan(&l.ID, &l.PartID, &l.Vendor, &l.Price, &l.Shipping,
+			&l.Currency, &l.Condition, &l.URL, &seen); err != nil {
+			return nil, err
+		}
+		l.SeenAt, _ = time.Parse(time.RFC3339, seen)
+		out = append(out, l)
 	}
 	return out, nil
 }

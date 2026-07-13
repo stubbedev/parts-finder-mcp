@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/PuerkitoBio/goquery"
 	readability "github.com/go-shiori/go-readability"
+	"github.com/ledongthuc/pdf"
 )
 
 // ponytail: real browser (lightpanda) deferred to M3; plain HTTP + DDG HTML
@@ -94,7 +97,8 @@ func decodeDDGLink(href string) string {
 	return ""
 }
 
-// fetchContent downloads a URL and extracts readable text via readability.
+// fetchContent downloads a URL and extracts readable text. PDFs (spec sheets)
+// go through the PDF text extractor; everything else through readability.
 func fetchContent(ctx context.Context, rawURL string) (title, text string, err error) {
 	resp, err := get(ctx, rawURL)
 	if err != nil {
@@ -104,10 +108,34 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("fetch %s: %s", rawURL, resp.Status)
 	}
+	ct := resp.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/pdf") || strings.HasSuffix(strings.ToLower(rawURL), ".pdf") {
+		return extractPDF(resp.Body)
+	}
 	pageURL, _ := url.Parse(rawURL)
 	art, err := readability.FromReader(resp.Body, pageURL)
 	if err != nil {
 		return "", "", err
 	}
 	return art.Title, art.TextContent, nil
+}
+
+func extractPDF(body io.Reader) (title, text string, err error) {
+	buf, err := io.ReadAll(body)
+	if err != nil {
+		return "", "", err
+	}
+	r, err := pdf.NewReader(bytes.NewReader(buf), int64(len(buf)))
+	if err != nil {
+		return "", "", fmt.Errorf("parse pdf: %w", err)
+	}
+	tr, err := r.GetPlainText()
+	if err != nil {
+		return "", "", fmt.Errorf("pdf text: %w", err)
+	}
+	out, err := io.ReadAll(tr)
+	if err != nil {
+		return "", "", err
+	}
+	return "", string(out), nil
 }
