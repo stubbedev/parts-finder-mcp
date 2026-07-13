@@ -90,53 +90,66 @@ var euCountries = map[string]bool{
 	"SI": true, "ES": true, "SE": true,
 }
 
-// euServerResellers are trusted EU refurb/enterprise vendors to boost regardless
-// of ccTLD. Edit freely as new vendors surface.
-var euServerResellers = []string{
-	"server-parts.eu", "servershop24.de", "serverando.de", "interbolt.eu",
-	"secondhandserver.eu", "servermall.com", "renewtech.com",
-	"directhardwaresupply.com", "pcserverandparts.com", "gekko-computer.de",
+// ccTLDAlias maps DNS ccTLDs that differ from their ISO-3166 country code.
+var ccTLDAlias = map[string]string{"uk": "GB"}
+
+// tldCountry returns the ISO country a host's TLD belongs to, or "" for generic
+// TLDs (.com/.net/.org/.eu/...) and unknowns. Purely structural — no vendor
+// knowledge.
+func tldCountry(host string) string {
+	i := strings.LastIndex(host, ".")
+	if i < 0 {
+		return ""
+	}
+	tld := host[i+1:]
+	if len(tld) != 2 { // ccTLDs are 2 letters; .com/.info/etc are not
+		return ""
+	}
+	if a, ok := ccTLDAlias[tld]; ok {
+		return a
+	}
+	return strings.ToUpper(tld)
 }
 
-// usOnlyVendors get demoted for non-US regions (ship poorly / wrong currency).
-var usOnlyVendors = []string{
-	"newegg.com", "microcenter.com", "bhphotovideo.com", "walmart.com",
-	"bestbuy.com", "provantage.com",
-}
-
-// rankScore: lower sorts first. 0 = local/preferred, 1 = neutral, 2 = demoted.
-func rankScore(hitURL string, r Region) int {
+// rankScore ranks a hit by geographic proximity to the region plus vendors we've
+// actually transacted with (learned from the store). Lower sorts first.
+// 0 = local / known-good, 1 = neutral, 2 = clearly foreign. No hardcoded vendor
+// list: preference is derived from the domain's TLD and accrued listing data.
+func rankScore(hitURL string, r Region, known map[string]bool) int {
 	host := hostOf(hitURL)
 	if host == "" {
 		return 1
 	}
-	if r.Country != "" && strings.HasSuffix(host, "."+strings.ToLower(r.Country)) {
-		return 0 // local ccTLD, e.g. .dk
+	if known[host] { // a vendor we've stored a region-shippable listing from
+		return 0
 	}
-	for _, v := range euServerResellers {
-		if strings.Contains(host, v) {
-			if euCountries[r.Country] {
-				return 0
-			}
-			return 1
-		}
+	if r.Country == "" {
+		return 1
 	}
-	for _, v := range usOnlyVendors {
-		if strings.Contains(host, v) && r.Country != "" && r.Country != "US" {
-			return 2
-		}
+	cc := tldCountry(host)
+	switch {
+	case cc == r.Country: // local ccTLD, e.g. .dk in DK
+		return 0
+	case strings.HasSuffix(host, ".eu") && euCountries[r.Country]: // pan-EU vendor
+		return 0
+	case cc == "": // generic TLD (.com/.net/...) — can't place it, stay neutral
+		return 1
+	case euCountries[cc] && euCountries[r.Country]: // EU neighbour, still close
+		return 1
+	default: // a foreign country's ccTLD
+		return 2
 	}
-	return 1
 }
 
-// rankHits stably reorders hits to surface local/preferred vendors first,
-// without dropping anything (bias, not filter).
-func rankHits(hits []SearchHit, r Region) {
-	if r.Country == "" {
+// rankHits stably reorders hits to surface local / known-good vendors first,
+// without dropping anything (bias, not filter). `known` is the set of vendor
+// domains learned from stored listings that ship to the region.
+func rankHits(hits []SearchHit, r Region, known map[string]bool) {
+	if r.Country == "" && len(known) == 0 {
 		return
 	}
 	sort.SliceStable(hits, func(i, j int) bool {
-		return rankScore(hits[i].URL, r) < rankScore(hits[j].URL, r)
+		return rankScore(hits[i].URL, r, known) < rankScore(hits[j].URL, r, known)
 	})
 }
 

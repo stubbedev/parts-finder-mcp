@@ -168,6 +168,34 @@ func (s *Store) listingsFor(partID string) ([]Listing, error) {
 	return out, nil
 }
 
+// knownVendors returns the set of vendor domains (host of listing URL) we've
+// stored a listing from that ships to the given country. This is the learned,
+// data-driven signal for ranking search results — it replaces any hardcoded
+// vendor list and improves as more listings are saved.
+func (s *Store) knownVendors(country string) (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT url, ships_to FROM listings WHERE url != ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var u, ships string
+		if err := rows.Scan(&u, &ships); err != nil {
+			return nil, err
+		}
+		var tokens []string
+		json.Unmarshal([]byte(ships), &tokens)
+		if !shipsTo(tokens, country) {
+			continue
+		}
+		if h := hostOf(u); h != "" {
+			out[h] = true
+		}
+	}
+	return out, nil
+}
+
 func (s *Store) saveSpec(id, name string, partIDs []string) error {
 	ids, _ := json.Marshal(partIDs)
 	_, err := s.db.Exec(`INSERT INTO specs (id,name,part_ids,created_at) VALUES (?,?,?,?)

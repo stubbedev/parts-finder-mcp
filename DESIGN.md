@@ -77,12 +77,46 @@ gpu.length_mm <= case.max_gpu_mm
   currency conversion (frankfurter ECB rates) for a single guiding figure +
   `convert_currency` tool.
 
+## Region ranking (generic, no vendor list)
+
+Search results are ranked by geographic proximity derived from the domain — no
+hardcoded vendor names. `rankScore` (region.go):
+
+- vendor domain we've stored a region-shippable listing from → boost (learned)
+- local ccTLD (`.dk` in DK) → boost
+- `.eu` when region is in the EU → boost
+- generic TLD (`.com`/`.net`) → neutral
+- EU-neighbour ccTLD when region is EU → neutral
+- any other foreign ccTLD → demote
+
+Preference is data-driven and improves as listings accrue; nothing is dropped
+(bias, not filter).
+
 ## Prior art (checked)
 
 No server/hardware-specific buying MCP exists. Closest: eBay MCP (Sell-side
 APIs), unofficial Amazon MCP, retailerapi MCP (US-only, UPC lookup + price
 history). None region-aware or build-composing — this project's niche holds.
-Seed EU/DK vendors live in `region.go` (`euServerResellers`).
+
+## Lessons from kindly (github Shelpuk-AI-.../kindly-web-search-mcp-server)
+
+Studied its search/scrape stack. Applied now:
+- PDF detection sniffs payload magic bytes (`%PDF-`), not just content-type /
+  URL suffix — spec sheets are often mislabeled.
+- SearXNG fallback: validate result URLs, map 403 (json format disabled) / 429
+  (rate limit) to clear errors, pass a `language` param from the region.
+
+Deferred (noted for later):
+- **Table-preserving extraction.** kindly uses trafilatura with
+  `include_tables=True`; go-readability's `TextContent` flattens tables. Hardware
+  spec sheets *are* tables — a table-aware HTML→markdown pass would materially
+  improve field extraction. Top future scrape improvement.
+- Headless hardening (for when lightpanda gets serious): readiness via
+  `/json/version` (already done in render.go), retry/backoff on connect errors,
+  abort-wait if the browser process exits, process-group kill.
+- Per-source structured handlers before generic HTML (kindly has
+  StackExchange/GitHub/Wikipedia/arXiv API paths). Our analog would be
+  API-based fetch for eBay etc. — opt-in, only if generic scraping falls short.
 
 ## Open risks
 

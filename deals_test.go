@@ -67,20 +67,29 @@ func TestShipsTo(t *testing.T) {
 
 func TestRankHits(t *testing.T) {
 	dk := Region{Country: "DK"}
+	// A vendor learned from stored listings (no hardcoded list).
+	known := map[string]bool{"komplett.dk": true}
 	hits := []SearchHit{
-		{URL: "https://www.newegg.com/x"},        // US-only => demote
-		{URL: "https://example.com/y"},           // neutral
-		{URL: "https://proshop.dk/z"},            // local ccTLD => boost
-		{URL: "https://server-parts.eu/w"},       // EU reseller => boost (DK is EU)
+		{URL: "https://shop.jp/x"},          // foreign ccTLD => demote
+		{URL: "https://www.newegg.com/y"},   // generic .com => neutral
+		{URL: "https://proshop.dk/z"},       // local ccTLD => boost
+		{URL: "https://server-parts.eu/w"},  // .eu + DK is EU => boost
 	}
-	rankHits(hits, dk)
-	// First two must be the boosted ones (order among them stable).
+	rankHits(hits, dk, known)
 	top := map[string]bool{hostOf(hits[0].URL): true, hostOf(hits[1].URL): true}
 	if !top["proshop.dk"] || !top["server-parts.eu"] {
 		t.Errorf("local/EU vendors should rank first, got %s, %s", hits[0].URL, hits[1].URL)
 	}
-	if hostOf(hits[3].URL) != "newegg.com" {
-		t.Errorf("newegg should be demoted last, got %s", hits[3].URL)
+	if hostOf(hits[3].URL) != "shop.jp" {
+		t.Errorf("foreign ccTLD should sort last, got %s", hits[3].URL)
+	}
+	// Learned vendor scores as boost even though it's just a .dk here; verify
+	// the known-set path directly.
+	if rankScore("https://komplett.dk/a", dk, known) != 0 {
+		t.Errorf("known vendor should score 0")
+	}
+	if rankScore("https://randomshop.com/a", dk, known) != 1 {
+		t.Errorf("unknown generic .com should be neutral")
 	}
 }
 

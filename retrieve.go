@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -54,11 +55,12 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 	}
 	hits, err := searchDDG(ctx, query, limit, r)
 	if (err != nil || len(hits) == 0) && os.Getenv("SEARXNG_URL") != "" {
-		if sx, sxErr := searchSearXNG(ctx, query, limit); sxErr == nil && len(sx) > 0 {
+		if sx, sxErr := searchSearXNG(ctx, query, limit, r); sxErr == nil && len(sx) > 0 {
 			hits, err = sx, nil
 		}
 	}
-	rankHits(hits, r)
+	known, _ := store.knownVendors(r.Country) // learned vendor preference; nil on error is fine
+	rankHits(hits, r, known)
 	return hits, err
 }
 
@@ -99,15 +101,24 @@ func searchDDG(ctx context.Context, query string, limit int, r Region) ([]Search
 
 // searchSearXNG queries a self-hosted SearXNG instance's JSON API.
 // SEARXNG_URL is the base URL, e.g. http://localhost:8888.
-func searchSearXNG(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+func searchSearXNG(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
 	base := strings.TrimRight(os.Getenv("SEARXNG_URL"), "/")
 	u := base + "/search?format=json&q=" + url.QueryEscape(query)
+	if lang := ddgLangCode(r.DDG); lang != "" {
+		u += "&language=" + lang // bias to the region's language, like the DDG kl param
+	}
 	resp, err := get(ctx, u)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch resp.StatusCode {
+	case http.StatusOK:
+	case http.StatusForbidden:
+		return nil, fmt.Errorf("searxng 403: enable the 'json' format in the instance settings.yml")
+	case http.StatusTooManyRequests:
+		return nil, fmt.Errorf("searxng 429: rate limited")
+	default:
 		return nil, fmt.Errorf("searxng returned %s", resp.Status)
 	}
 	var body struct {
@@ -119,16 +130,24 @@ func searchSearXNG(ctx context.Context, query string, limit int) ([]SearchHit, e
 		return nil, err
 	}
 	var hits []SearchHit
-	for _, r := range body.Results {
-		if r.URL == "" {
+	for _, res := range body.Results {
+		if !strings.HasPrefix(res.URL, "http") { // skip malformed / relative URLs
 			continue
 		}
-		hits = append(hits, SearchHit{Title: r.Title, URL: r.URL, Snippet: r.Content})
+		hits = append(hits, SearchHit{Title: res.Title, URL: res.URL, Snippet: res.Content})
 		if len(hits) >= limit {
 			break
 		}
 	}
 	return hits, nil
+}
+
+// ddgLangCode extracts the language part of a DDG kl code (e.g. "dk-da" -> "da").
+func ddgLangCode(kl string) string {
+	if i := strings.Index(kl, "-"); i >= 0 {
+		return kl[i+1:]
+	}
+	return ""
 }
 
 // decodeDDGLink unwraps DDG's //duckduckgo.com/l/?uddg=<encoded> redirect.
@@ -163,12 +182,19 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("fetch %s: %s", rawURL, resp.Status)
 	}
+	// Sniff PDF by content-type, URL suffix, AND payload magic bytes — spec
+	// sheets are often served with a generic/wrong content-type. (kindly does
+	// the same %PDF- check.)
+	br := bufio.NewReader(resp.Body)
 	ct := resp.Header.Get("Content-Type")
-	if strings.Contains(ct, "application/pdf") || strings.HasSuffix(strings.ToLower(rawURL), ".pdf") {
-		return extractPDF(resp.Body)
+	magic, _ := br.Peek(5)
+	if strings.Contains(ct, "application/pdf") ||
+		strings.HasSuffix(strings.ToLower(rawURL), ".pdf") ||
+		bytes.HasPrefix(magic, []byte("%PDF-")) {
+		return extractPDF(br)
 	}
 	pageURL, _ := url.Parse(rawURL)
-	art, err := readability.FromReader(resp.Body, pageURL)
+	art, err := readability.FromReader(br, pageURL)
 	if err != nil {
 		return "", "", err
 	}
