@@ -38,7 +38,9 @@ func main() {
 	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: version}, nil)
 	registerTools(s)
 
+	defer stopRenderer() // kill any lightpanda we spawned
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+		stopRenderer()
 		log.Fatal(err)
 	}
 }
@@ -56,7 +58,7 @@ type searchOut struct {
 
 type fetchIn struct {
 	URL    string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
-	Render bool   `json:"render,omitempty" jsonschema:"render with headless browser (lightpanda) for JS-heavy pages; requires LIGHTPANDA_URL"`
+	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed lightpanda). Bot-blocked sites (403/429) escalate to this automatically"`
 }
 type fetchOut struct {
 	Title  string `json:"title"`

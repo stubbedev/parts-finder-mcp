@@ -214,7 +214,14 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
-		return "", "", fmt.Errorf("fetch %s: %s — site blocks plain HTTP (bot detection); retry with render=true (needs LIGHTPANDA_URL) or extract what you can from the search snippet", rawURL, resp.Status)
+		// Bot-blocked (eBay/Akamai and friends). Auto-escalate through the
+		// headless renderer — zero config, lightpanda is spawned (and even
+		// downloaded) on demand.
+		if t, x, rerr := fetchRendered(ctx, rawURL); rerr == nil {
+			return t, x, nil
+		} else {
+			return "", "", fmt.Errorf("fetch %s: %s — site blocks plain HTTP and the render fallback failed (%v); extract what you can from the search snippet", rawURL, resp.Status, rerr)
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("fetch %s: %s", rawURL, resp.Status)

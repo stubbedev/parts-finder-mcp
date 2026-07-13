@@ -37,9 +37,12 @@ DB path defaults to `~/.parts-finder.db`; override with `PARTS_DB`.
 Optional env:
 - `SEARXNG_URL` — base URL of a SearXNG instance; used as fallback when
   DuckDuckGo returns nothing (rate-limited).
-- `LIGHTPANDA_URL` — CDP endpoint of a running
-  [lightpanda](https://github.com/lightpanda-io/browser) (`http://127.0.0.1:9222`
-  or a `ws://` URL); enables `fetch_content(render=true)` for JS-heavy pages.
+- `LIGHTPANDA_URL` — CDP endpoint of an externally managed
+  [lightpanda](https://github.com/lightpanda-io/browser)/Chrome. **Optional**:
+  without it, parts-finder finds `lightpanda` on PATH, or downloads it to
+  `~/.cache/parts-finder/` and spawns it on demand. Bot-blocked sites (eBay
+  et al. return 403 to plain HTTP) automatically escalate through the
+  renderer — zero configuration needed.
 - `REGION_COUNTRY` / `REGION_CURRENCY` — override the IP-detected region
   (e.g. `DK` / `DKK`). By default the region is auto-detected from your IP
   (ip-api.com) and cached for the process.
