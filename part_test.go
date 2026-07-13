@@ -69,6 +69,40 @@ func TestResourceAccounting(t *testing.T) {
 	}
 }
 
+// Repeating a part id in a spec = quantity: each instance consumes resources
+// and counts toward TDP; deficits surface as structured Needs.
+func TestQuantityAndNeeds(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	psu := Part{ID: "psu", Category: "psu", Watts: 1000,
+		Provides: map[string]int{"cable:8pin-eps": 1}}
+	cpu := Part{ID: "cpu", Category: "cpu", TDPW: 200,
+		Requires: map[string]int{"cable:8pin-eps": 1}}
+	for _, p := range []Part{psu, cpu} {
+		if err := st.savePart(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Dual-CPU build: cpu twice.
+	parts, err := st.getParts([]string{"psu", "cpu", "cpu"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 3 {
+		t.Fatalf("duplicates must be preserved, got %d parts", len(parts))
+	}
+	spec := composeSpec(parts)
+	if spec.TotalTDPW != 400 {
+		t.Errorf("2x cpu TDP should be 400, got %d", spec.TotalTDPW)
+	}
+	// 2 CPUs need 2 EPS cables, PSU provides 1 -> Need{cable:8pin-eps, 1}.
+	if len(spec.Needs) != 1 || spec.Needs[0].Resource != "cable:8pin-eps" || spec.Needs[0].Count != 1 {
+		t.Fatalf("want need cable:8pin-eps x1, got %+v", spec.Needs)
+	}
+}
+
 // Unknown attributes must be gaps, never violations.
 func TestUnknownNoFalseViolation(t *testing.T) {
 	parts := []Part{

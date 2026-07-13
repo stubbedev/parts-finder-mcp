@@ -22,11 +22,22 @@ type Listing struct {
 	ShipsTo   []string  `json:"ships_to,omitempty"` // country codes / "EU" / "WORLD"; empty = unknown
 	SeenAt    time.Time `json:"seen_at,omitempty"`
 
-	// Derived on read, not stored:
+	// Derived on read, not stored. Deals are never dropped for these — they
+	// are flagged and sorted below usable ones, so nothing is hidden.
 	Stale        bool    `json:"stale,omitempty"`
-	Dead         bool    `json:"dead,omitempty"`            // URL no longer reachable (live-check)
-	DisplayTotal float64 `json:"display_total,omitempty"`  // total converted to display currency
+	Dead         bool    `json:"dead,omitempty"`        // URL no longer reachable (live-check)
+	Unshippable  bool    `json:"unshippable,omitempty"` // doesn't ship to the region
+	DisplayTotal float64 `json:"display_total,omitempty"` // total converted to display currency
 	DisplayCurr  string  `json:"display_currency,omitempty"`
+}
+
+// usable = clickable right now: reachable and ships to the region.
+func (l Listing) usable() bool { return !l.Dead && !l.Unshippable }
+
+func markShippable(ls []Listing, country string) {
+	for i := range ls {
+		ls[i].Unshippable = !shipsTo(ls[i].ShipsTo, country)
+	}
 }
 
 func (l Listing) total() float64 { return l.Price + l.Shipping }
@@ -51,10 +62,14 @@ func markStale(ls []Listing, now time.Time) {
 	}
 }
 
-// sortListings orders cheapest first (converted total when available); ties
-// broken by most recent.
+// sortListings orders usable (live + shippable) first, then cheapest
+// (converted total when available); ties broken by most recent. Dead and
+// unshippable listings sink to the bottom but are never removed.
 func sortListings(ls []Listing) {
 	sort.SliceStable(ls, func(i, j int) bool {
+		if ls[i].usable() != ls[j].usable() {
+			return ls[i].usable()
+		}
 		if ls[i].effectiveTotal() != ls[j].effectiveTotal() {
 			return ls[i].effectiveTotal() < ls[j].effectiveTotal()
 		}

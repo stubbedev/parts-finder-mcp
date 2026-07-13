@@ -27,6 +27,25 @@ func TestListingsSortAndStale(t *testing.T) {
 	}
 }
 
+// Dead/unshippable listings sink but are NEVER removed.
+func TestFlaggedListingsSinkNotDropped(t *testing.T) {
+	ls := []Listing{
+		{ID: "dead-cheap", Price: 10, Dead: true},
+		{ID: "unship", Price: 20, Unshippable: true},
+		{ID: "ok", Price: 100},
+	}
+	sortListings(ls)
+	if len(ls) != 3 {
+		t.Fatalf("nothing may be dropped, got %d", len(ls))
+	}
+	if ls[0].ID != "ok" {
+		t.Errorf("usable must sort first, got %s", ls[0].ID)
+	}
+	if ls[1].ID != "dead-cheap" || ls[2].ID != "unship" {
+		t.Errorf("flagged sorted by price after usable: %s, %s", ls[1].ID, ls[2].ID)
+	}
+}
+
 func TestCheapestConverted(t *testing.T) {
 	// Same-currency comparison needs no network (no convert() call).
 	ls := []Listing{

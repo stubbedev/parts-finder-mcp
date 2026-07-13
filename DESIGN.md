@@ -70,6 +70,11 @@ gpu.length_mm <= case.max_gpu_mm
 - **M3 — done:** SearXNG fallback (`SEARXNG_URL`), lightpanda headless render
   (`LIGHTPANDA_URL`, opt-in via `fetch_content(render=true)`), 2 more compat
   rules (form-factor fit, GPU power connectors).
+- **M6 — done:** full sweep. Never-drop policy: dead/unshippable/stale listings
+  flagged + sorted last, never filtered. Structured `needs` (resource deficits)
+  = shopping list for small stuff (cables, adapters); quantities via repeated
+  part ids in specs. `deep_specs` tool: multi-angle search + top-source fetch +
+  empty-field checklist per part for accuracy passes.
 - **M5 — done:** one-stop shop. Generic provides/requires resource accounting
   (any part type: drives, HBAs, NICs, bays, DIMM slots, PCIe with width
   flexibility) — one engine rule, no rule-per-pair. `shop_spec` purchase plan:

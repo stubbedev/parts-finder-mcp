@@ -37,9 +37,10 @@ listing totals in other currencies are converted with indicative ECB rates
 (frankfurter.app) so you get one guiding figure. `convert_currency` exposes the
 same conversion directly.
 
-`find_deals` always live-checks each listing URL and drops dead ones (404 /
-unreachable) and listings that don't ship to your region, plus flags stale
-prices (>14 days). Use `include_dead` / `include_unshippable` to keep them.
+`find_deals` and `shop_spec` live-check every listing URL — but **nothing is
+ever dropped**: dead (404/unreachable), unshippable, and stale (>14 days)
+listings are flagged and sorted below usable ones, so no deal is hidden by a
+filter.
 
 ## M1 tools
 
@@ -55,7 +56,8 @@ prices (>14 days). Use `include_dead` / `include_unshippable` to keep them.
 | `save_listing(Listing)` | record a point-in-time price for a part |
 | `find_deals(part_id, search?, country?, display_currency?, ...)` | live-checked, region-filtered deals, cheapest-converted first + staleness |
 | `find_substitute(part_id, budget?, currency?, country?)` | cheaper drop-in replacements within budget (cross-currency aware) |
-| `shop_spec(spec_id \| part_ids, ...)` | one-stop purchase plan: per part the best live link + alternatives, converted build total, search hits for uncovered parts |
+| `shop_spec(spec_id \| part_ids, ...)` | one-stop purchase plan: per part the best usable link + ALL alternatives (flagged, never dropped), converted total, needs (cables/adapters short), search hits for uncovered parts |
+| `deep_specs(part_id, queries?)` | deep-drill a part: multi-angle search + fetch top sources (tables kept) + checklist of still-empty fields |
 | `convert_currency(amount, from, to)` | indicative ECB currency conversion |
 
 Typical flow: `search_parts` → `fetch_content` on a spec page (HTML or PDF) →
@@ -88,11 +90,21 @@ backplanes — any category — without new code per pair.
 `fetch_content` preserves `<table>` data as markdown (spec sheets are tables),
 so the client can extract these tokens reliably.
 
+Quantities: repeat a part id in a spec (`["mb","cpu","cpu","psu"]` = dual CPU).
+Each instance consumes resources and counts toward TDP, so cable/slot shortages
+surface per unit. Small stuff (cables, adapters, rails) are just parts too —
+`compose_spec`/`shop_spec` return structured `needs` (resource → count short)
+telling you exactly what extras to add.
+
 ## Typical one-stop flow
 
 1. `search_parts` (region-biased) → `fetch_content` spec pages → `save_part`
    with attributes + provides/requires.
-2. `compose_spec` → fix violations/gaps → `save_spec`.
-3. `shop_spec(spec_id)` → per part: best live, region-shippable link to click,
-   plus converted build total. Parts without listings come back with buy-page
-   search hits — `fetch_content` + `save_listing` those, re-run `shop_spec`.
+2. `deep_specs(part_id)` per part → fill every empty field from the fetched
+   sources → `save_part` again (accuracy pass).
+3. `compose_spec` → fix violations/gaps, shop the `needs` (cables etc.) →
+   `save_spec`.
+4. `shop_spec(spec_id)` → per part: best usable link to click + all flagged
+   alternatives + converted build total. Parts without usable listings come
+   back with buy-page search hits — `fetch_content` + `save_listing` those,
+   re-run `shop_spec`.

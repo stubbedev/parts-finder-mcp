@@ -83,8 +83,6 @@ type dealsIn struct {
 	Search          bool   `json:"search,omitempty" jsonschema:"also run a region-biased web search for buy pages to populate more listings"`
 	Country         string `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2, e.g. DK)"`
 	DisplayCurrency string `json:"display_currency,omitempty" jsonschema:"convert every total into this currency for comparison; defaults to region currency"`
-	IncludeDead     bool   `json:"include_dead,omitempty" jsonschema:"keep listings whose URL is no longer reachable (default: drop them)"`
-	IncludeUnshippable bool `json:"include_unshippable,omitempty" jsonschema:"keep listings that don't ship to the region (default: drop them)"`
 }
 type dealsOut struct {
 	Region   Region      `json:"region"`
@@ -120,10 +118,55 @@ type shopOut struct {
 	Compatible    bool        `json:"compatible"`
 	Violations    []Violation `json:"violations,omitempty"`
 	Gaps          []string    `json:"gaps,omitempty"`
+	Needs         []Need      `json:"needs,omitempty"` // resource shortages to also shop for (cables, adapters, ...)
 	Items         []shopItem  `json:"items"`
 	TotalBest     float64     `json:"total_best"`               // sum of best totals, converted
 	TotalCurrency string      `json:"total_currency,omitempty"`
 	TotalCovers   int         `json:"total_covers"` // how many parts the total includes
+}
+
+type deepIn struct {
+	PartID  string   `json:"part_id"`
+	Queries []string `json:"queries,omitempty" jsonschema:"override the default search angles (specifications / datasheet pdf / manual)"`
+}
+type deepSource struct {
+	URL   string `json:"url"`
+	Title string `json:"title,omitempty"`
+	Text  string `json:"text"`
+}
+type deepOut struct {
+	Part        Part         `json:"part"`
+	EmptyFields []string     `json:"empty_fields"` // what still needs filling for full accuracy
+	Sources     []deepSource `json:"sources"`
+}
+
+const (
+	maxDeepSources     = 3
+	maxDeepSourceChars = 20000
+)
+
+// emptyFields lists the Part attributes that are still unknown — the deep-drill
+// checklist. Category-blind on purpose: the client knows which of these apply.
+func emptyFields(p Part) []string {
+	var f []string
+	add := func(name string, empty bool) {
+		if empty {
+			f = append(f, name)
+		}
+	}
+	add("socket", p.Socket == "")
+	add("mem_type", p.MemType == "")
+	add("mem_speed", p.MemSpeed == 0)
+	add("form_factor", p.FormFactor == "")
+	add("tdp_w", p.TDPW == 0)
+	add("pcie_gen", p.PCIeGen == 0)
+	add("pcie_lanes", p.PCIeLanes == 0)
+	add("power_connectors", len(p.PowerConnectors) == 0)
+	add("length_mm", p.LengthMM == 0)
+	add("watts", p.Watts == 0)
+	add("provides", len(p.Provides) == 0)
+	add("requires", len(p.Requires) == 0)
+	return f
 }
 
 type convertIn struct {
@@ -232,7 +275,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compose_spec",
-		Description: "Compose a build from stored parts: compatibility, gaps (missing categories/attrs), and total TDP.",
+		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, Spec, error) {
 		parts, err := store.getParts(in.PartIDs)
 		if err != nil {
@@ -275,7 +318,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "find_deals",
-		Description: "List recorded deals for a part, cheapest total first, with staleness flags. With search=true, also returns fresh web results (vendor + reseller) to fetch and save_listing.",
+		Description: "ALL recorded deals for a part — nothing filtered out. Usable (live + ships-to-region) sorted first by converted total; dead/unshippable/stale ones flagged and sorted last. With search=true, also returns fresh region-ranked web results to fetch and save_listing.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in dealsIn) (*mcp.CallToolResult, dealsOut, error) {
 		parts, err := store.getParts([]string{in.PartID})
 		if err != nil {
@@ -287,19 +330,8 @@ func registerTools(s *mcp.Server) {
 			return nil, dealsOut{}, err
 		}
 		markStale(listings, time.Now())
-		liveCheckAll(ctx, listings) // always probe URLs so gone deals get dropped
-		// Drop dead / unshippable listings unless explicitly kept.
-		kept := listings[:0]
-		for _, l := range listings {
-			if l.Dead && !in.IncludeDead {
-				continue
-			}
-			if !in.IncludeUnshippable && !shipsTo(l.ShipsTo, region.Country) {
-				continue
-			}
-			kept = append(kept, l)
-		}
-		listings = kept
+		liveCheckAll(ctx, listings)               // probe URLs so gone deals get FLAGGED
+		markShippable(listings, region.Country)   // flag, never drop — no deal is hidden
 		display := in.DisplayCurrency
 		if display == "" {
 			display = region.Currency
@@ -317,7 +349,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "find_substitute",
-		Description: "Find cheaper drop-in replacements for a part: same category, attribute-compatible (socket/mem/form factor), with a recorded listing within budget. Ranked cheapest first. Note: 'similar performance' is approximated by compatibility, not benchmark scores.",
+		Description: "Find cheaper drop-in replacements for a part: same category, attribute-compatible (socket/mem/form factor), with a recorded listing within budget. Ranked cheapest first. Note: 'similar performance' is approximated by compatibility, not benchmark scores; listings here are NOT live-checked — confirm the pick with find_deals before buying.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in substituteIn) (*mcp.CallToolResult, substituteOut, error) {
 		parts, err := store.getParts([]string{in.PartID})
 		if err != nil {
@@ -370,7 +402,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "shop_spec",
-		Description: "One-stop purchase plan for a build: per part, the cheapest LIVE listing that ships to your region (direct link to buy), alternatives, a converted build total, and fresh buy-page search hits for parts with no recorded listing. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
+		Description: "One-stop purchase plan for a build: per part, the cheapest usable (live + ships-to-region) listing as the buy link, ALL other recorded listings as flagged alternatives (nothing filtered out), a converted build total, resource shortages to also shop for (needs: cables, adapters, bays), and buy-page search hits for parts with no usable listing. Repeat a part id in the spec to buy multiples. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in shopIn) (*mcp.CallToolResult, shopOut, error) {
 		partIDs := in.PartIDs
 		if in.SpecID != "" {
@@ -395,7 +427,7 @@ func registerTools(s *mcp.Server) {
 		spec := composeSpec(parts)
 		out := shopOut{
 			Region: region, Compatible: spec.Compatible,
-			Violations: spec.Violations, Gaps: spec.Gaps,
+			Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
 			TotalCurrency: display,
 		}
 		for _, p := range parts {
@@ -406,29 +438,77 @@ func registerTools(s *mcp.Server) {
 			}
 			markStale(ls, time.Now())
 			liveCheckAll(ctx, ls)
-			live := ls[:0]
-			for _, l := range ls {
-				if !l.Dead && shipsTo(l.ShipsTo, region.Country) {
-					live = append(live, l)
-				}
-			}
-			annotateDisplay(ctx, live, display)
-			sortListings(live)
-			if len(live) > 0 {
-				item.Best = &live[0]
-				item.Alternatives = live[1:]
-				if live[0].DisplayTotal > 0 {
-					out.TotalBest += live[0].DisplayTotal
+			markShippable(ls, region.Country) // flag, never drop
+			annotateDisplay(ctx, ls, display)
+			sortListings(ls) // usable first, then cheapest; flagged ones sink
+			if len(ls) > 0 && ls[0].usable() {
+				item.Best = &ls[0]
+				item.Alternatives = ls[1:] // includes flagged dead/unshippable — nothing hidden
+				if ls[0].DisplayTotal > 0 {
+					out.TotalBest += ls[0].DisplayTotal
 					out.TotalCovers++
-				} else if live[0].Currency == display {
-					out.TotalBest += live[0].total()
+				} else if ls[0].Currency == display {
+					out.TotalBest += ls[0].total()
 					out.TotalCovers++
 				}
-			} else if !in.NoSearch {
-				q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
-				item.SearchHits, _ = searchRegion(ctx, q, 5, region) // best-effort
+			} else {
+				item.Alternatives = ls // only flagged listings on record — show them all
+				if !in.NoSearch {
+					q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
+					item.SearchHits, _ = searchRegion(ctx, q, 5, region) // best-effort
+				}
 			}
 			out.Items = append(out.Items, item)
+		}
+		return nil, out, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "deep_specs",
+		Description: "Deep-drill a part's specifications: multi-angle web search (spec page, datasheet PDF, manual), fetch the top sources (tables preserved), and report which Part fields are still empty. Use the returned source texts to fill EVERY attribute + provides/requires, then save_part. Re-run with extra queries if fields stay empty.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in deepIn) (*mcp.CallToolResult, deepOut, error) {
+		parts, err := store.getParts([]string{in.PartID})
+		if err != nil {
+			return nil, deepOut{}, err
+		}
+		p := parts[0]
+		name := strings.TrimSpace(p.Vendor + " " + p.Model)
+		if name == "" {
+			return nil, deepOut{}, fmt.Errorf("part %s has no vendor/model to search by", p.ID)
+		}
+		queries := in.Queries
+		if len(queries) == 0 {
+			queries = []string{
+				name + " specifications",
+				name + " datasheet pdf",
+				name + " " + p.Category + " manual",
+			}
+		}
+		region := detectRegion(ctx)
+		out := deepOut{Part: p, EmptyFields: emptyFields(p)}
+		seen := map[string]bool{p.SourceURL: true, "": true}
+		for _, q := range queries {
+			hits, _ := searchRegion(ctx, q, 5, region)
+			for _, h := range hits {
+				if seen[h.URL] || len(out.Sources) >= maxDeepSources {
+					continue
+				}
+				seen[h.URL] = true
+				title, text, ok := store.getCached(h.URL)
+				if !ok {
+					if title, text, err = fetchContent(ctx, h.URL); err != nil {
+						continue // unreadable source — move on, search gave us more
+					}
+					store.putCached(h.URL, title, text)
+				}
+				if len(text) > maxDeepSourceChars {
+					text = text[:maxDeepSourceChars] + "\n…(truncated)"
+				}
+				out.Sources = append(out.Sources, deepSource{URL: h.URL, Title: title, Text: text})
+			}
+			if len(out.Sources) >= maxDeepSources {
+				break
+			}
 		}
 		return nil, out, nil
 	})

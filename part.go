@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 )
@@ -171,6 +172,19 @@ var rules = []rule{
 // an x16 slot satisfies an x8 card. Parts with no Requires/Provides simply
 // don't participate (unknown = no constraint, consistent with the other rules).
 func resourceViolations(parts []Part) []Violation {
+	deficits, users := resourceDeficits(parts)
+	var vs []Violation
+	for tok, d := range deficits {
+		vs = append(vs, Violation{"resource", users[tok],
+			fmt.Sprintf("resource %q short by %d — add a part providing it (cable, adapter, slot, bay, ...)", tok, d)})
+	}
+	return vs
+}
+
+// resourceDeficits returns, per resource token, how many units the build is
+// short — the structured shopping list for the small stuff (extra cables,
+// adapters, rails). Also returns which part IDs touch each token.
+func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
 	provides := map[string]int{}
 	requires := map[string]int{}
 	users := map[string][]string{} // token -> part IDs involved (for the report)
@@ -186,7 +200,7 @@ func resourceViolations(parts []Part) []Violation {
 			users[tok] = append(users[tok], p.ID)
 		}
 	}
-	var vs []Violation
+	deficits := map[string]int{}
 	for tok, need := range requires {
 		have := provides[tok]
 		if have >= need {
@@ -209,11 +223,10 @@ func resourceViolations(parts []Part) []Violation {
 			}
 		}
 		if deficit > 0 {
-			vs = append(vs, Violation{"resource", users[tok],
-				fmt.Sprintf("resource %q short by %d (need %d, have %d)", tok, deficit, need, have)})
+			deficits[tok] = deficit
 		}
 	}
-	return vs
+	return deficits, users
 }
 
 // pcieWidth parses "pcie:x8" -> 8; 0 for non-pcie tokens.
@@ -272,12 +285,21 @@ func checkCompat(parts []Part) []Violation {
 	return vs
 }
 
-// Spec is a composed build: the parts plus derived compat + gaps.
+// Need is a concrete shortage the build must fill — the actionable shopping
+// list for small stuff (cables, adapters, rails, spare slots).
+type Need struct {
+	Resource string   `json:"resource"`
+	Count    int      `json:"count"`
+	Parts    []string `json:"parts,omitempty"` // parts that create/touch the shortage
+}
+
+// Spec is a composed build: the parts plus derived compat + gaps + needs.
 type Spec struct {
 	Parts      []Part      `json:"parts"`
 	Compatible bool        `json:"compatible"`
 	Violations []Violation `json:"violations"`
 	Gaps       []string    `json:"gaps"`
+	Needs      []Need      `json:"needs,omitempty"` // resource shortages to shop for
 	TotalTDPW  int         `json:"total_tdp_w"`
 }
 
@@ -299,11 +321,30 @@ func composeSpec(parts []Part) Spec {
 			gaps = append(gaps, "unknown TDP for "+p.ID)
 		}
 	}
+	// "Compatible" only covers KNOWN data. Anything unverifiable gets a loud
+	// gap so a missing length or undeclared power cable can't hide behind a
+	// green checkmark. Generic: no category list — driven by what's absent.
+	cs, hasCase := first(byCat["case"])
+	for _, p := range parts {
+		if len(p.Provides) == 0 && len(p.Requires) == 0 {
+			gaps = append(gaps, p.ID+": no provides/requires declared — power cables, slots, bays unverified (run deep_specs)")
+		}
+		if p.Category == "gpu" && hasCase && (p.LengthMM == 0 || cs.LengthMM == 0) {
+			gaps = append(gaps, p.ID+": physical fit vs "+cs.ID+" unverified — card length or case clearance unknown")
+		}
+	}
+	deficits, dusers := resourceDeficits(parts)
+	var needs []Need
+	for tok, d := range deficits {
+		needs = append(needs, Need{Resource: tok, Count: d, Parts: dusers[tok]})
+	}
+	sort.Slice(needs, func(i, j int) bool { return needs[i].Resource < needs[j].Resource })
 	return Spec{
 		Parts:      parts,
 		Compatible: len(vs) == 0,
 		Violations: vs,
 		Gaps:       gaps,
+		Needs:      needs,
 		TotalTDPW:  totalTDP(byCat),
 	}
 }
