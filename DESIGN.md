@@ -70,6 +70,19 @@ gpu.length_mm <= case.max_gpu_mm
 - **M3 — done:** SearXNG fallback (`SEARXNG_URL`), lightpanda headless render
   (`LIGHTPANDA_URL`, opt-in via `fetch_content(render=true)`), 2 more compat
   rules (form-factor fit, GPU power connectors).
+- **M4 — done:** region-awareness + deal freshness. IP-detected region
+  (ip-api.com; `REGION_COUNTRY`/`REGION_CURRENCY` override); search biased by
+  DDG `kl` + local/EU-reseller ranking (bias, not filter); `find_deals` always
+  live-checks URLs (drops dead), filters ships-to region, flags staleness;
+  currency conversion (frankfurter ECB rates) for a single guiding figure +
+  `convert_currency` tool.
+
+## Prior art (checked)
+
+No server/hardware-specific buying MCP exists. Closest: eBay MCP (Sell-side
+APIs), unofficial Amazon MCP, retailerapi MCP (US-only, UPC lookup + price
+history). None region-aware or build-composing — this project's niche holds.
+Seed EU/DK vendors live in `region.go` (`euServerResellers`).
 
 ## Open risks
 

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -26,18 +27,60 @@ func TestListingsSortAndStale(t *testing.T) {
 	}
 }
 
-func TestCheapestCurrencyFilter(t *testing.T) {
+func TestCheapestConverted(t *testing.T) {
+	// Same-currency comparison needs no network (no convert() call).
 	ls := []Listing{
-		{Price: 50, Currency: "USD"},
-		{Price: 30, Currency: "EUR"}, // cheaper but wrong currency
-		{Price: 60, Currency: "USD"},
+		{ID: "a", Price: 50, Shipping: 10, Currency: "USD"}, // total 60
+		{ID: "b", Price: 55, Currency: "USD"},               // total 55 <- cheapest
+		{ID: "c", Price: 90, Currency: "USD"},
 	}
-	best, ok := cheapest(ls, "USD")
-	if !ok || best.Price != 50 {
-		t.Fatalf("want cheapest USD 50, got ok=%v price=%v", ok, best.Price)
+	best, total, ok := cheapestConverted(context.Background(), ls, "USD")
+	if !ok || best.ID != "b" || total != 55 {
+		t.Fatalf("want b/55, got ok=%v id=%v total=%v", ok, best.ID, total)
 	}
-	if _, ok := cheapest(ls, "GBP"); ok {
-		t.Errorf("no GBP listings, should not match")
+	// currency=="" compares native totals as-is, unknown-currency listings included.
+	best, total, ok = cheapestConverted(context.Background(), ls, "")
+	if !ok || best.ID != "b" || total != 55 {
+		t.Fatalf("native: want b/55, got ok=%v id=%v total=%v", ok, best.ID, total)
+	}
+}
+
+func TestShipsTo(t *testing.T) {
+	cases := []struct {
+		tokens  []string
+		country string
+		want    bool
+	}{
+		{nil, "DK", true},                    // unknown => don't exclude
+		{[]string{"DK"}, "DK", true},         // exact
+		{[]string{"EU"}, "DK", true},         // EU member
+		{[]string{"EU"}, "US", false},        // non-member
+		{[]string{"WORLD"}, "DK", true},      // worldwide
+		{[]string{"US", "CA"}, "DK", false},  // not listed
+	}
+	for _, c := range cases {
+		if got := shipsTo(c.tokens, c.country); got != c.want {
+			t.Errorf("shipsTo(%v,%q)=%v want %v", c.tokens, c.country, got, c.want)
+		}
+	}
+}
+
+func TestRankHits(t *testing.T) {
+	dk := Region{Country: "DK"}
+	hits := []SearchHit{
+		{URL: "https://www.newegg.com/x"},        // US-only => demote
+		{URL: "https://example.com/y"},           // neutral
+		{URL: "https://proshop.dk/z"},            // local ccTLD => boost
+		{URL: "https://server-parts.eu/w"},       // EU reseller => boost (DK is EU)
+	}
+	rankHits(hits, dk)
+	// First two must be the boosted ones (order among them stable).
+	top := map[string]bool{hostOf(hits[0].URL): true, hostOf(hits[1].URL): true}
+	if !top["proshop.dk"] || !top["server-parts.eu"] {
+		t.Errorf("local/EU vendors should rank first, got %s, %s", hits[0].URL, hits[1].URL)
+	}
+	if hostOf(hits[3].URL) != "newegg.com" {
+		t.Errorf("newegg should be demoted last, got %s", hits[3].URL)
 	}
 }
 

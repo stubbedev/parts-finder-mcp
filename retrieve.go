@@ -41,24 +41,32 @@ type SearchHit struct {
 	Snippet string `json:"snippet,omitempty"`
 }
 
-// search queries the keyless DuckDuckGo HTML endpoint. If DDG errors or returns
-// nothing (rate-limited) and SEARXNG_URL is set, it falls back to SearXNG's
-// JSON API — the drop-in upgrade for when DDG throttles.
+// search queries the keyless DuckDuckGo HTML endpoint, biased to the caller's
+// detected region, and ranks local/preferred vendors first. Falls back to
+// SearXNG (SEARXNG_URL) when DDG errors or returns nothing (rate-limited).
 func search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+	return searchRegion(ctx, query, limit, detectRegion(ctx))
+}
+
+func searchRegion(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 10
 	}
-	hits, err := searchDDG(ctx, query, limit)
+	hits, err := searchDDG(ctx, query, limit, r)
 	if (err != nil || len(hits) == 0) && os.Getenv("SEARXNG_URL") != "" {
 		if sx, sxErr := searchSearXNG(ctx, query, limit); sxErr == nil && len(sx) > 0 {
-			return sx, nil
+			hits, err = sx, nil
 		}
 	}
+	rankHits(hits, r)
 	return hits, err
 }
 
-func searchDDG(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+func searchDDG(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
 	u := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
+	if r.DDG != "" {
+		u += "&kl=" + url.QueryEscape(r.DDG)
+	}
 	resp, err := get(ctx, u)
 	if err != nil {
 		return nil, err

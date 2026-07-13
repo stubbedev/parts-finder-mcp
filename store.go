@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS content_cache (
 );
 CREATE TABLE IF NOT EXISTS listings (
   id TEXT PRIMARY KEY, part_id TEXT, vendor TEXT, price REAL, shipping REAL,
-  currency TEXT, condition TEXT, url TEXT, seen_at TEXT
+  currency TEXT, condition TEXT, url TEXT, ships_to TEXT, seen_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_listings_part ON listings(part_id);
 CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
@@ -133,20 +133,22 @@ func (s *Store) partsByCategory(cat string) ([]Part, error) {
 }
 
 func (s *Store) saveListing(l Listing) error {
+	ships, _ := json.Marshal(l.ShipsTo)
 	_, err := s.db.Exec(`INSERT INTO listings
-  (id,part_id,vendor,price,shipping,currency,condition,url,seen_at)
-  VALUES (?,?,?,?,?,?,?,?,?)
+  (id,part_id,vendor,price,shipping,currency,condition,url,ships_to,seen_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET part_id=excluded.part_id,vendor=excluded.vendor,
   price=excluded.price,shipping=excluded.shipping,currency=excluded.currency,
-  condition=excluded.condition,url=excluded.url,seen_at=excluded.seen_at`,
+  condition=excluded.condition,url=excluded.url,ships_to=excluded.ships_to,
+  seen_at=excluded.seen_at`,
 		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency, l.Condition,
-		l.URL, l.SeenAt.Format(time.RFC3339))
+		l.URL, string(ships), l.SeenAt.Format(time.RFC3339))
 	return err
 }
 
 func (s *Store) listingsFor(partID string) ([]Listing, error) {
 	rows, err := s.db.Query(`SELECT id,part_id,vendor,price,shipping,currency,
-  condition,url,seen_at FROM listings WHERE part_id=?`, partID)
+  condition,url,ships_to,seen_at FROM listings WHERE part_id=?`, partID)
 	if err != nil {
 		return nil, err
 	}
@@ -154,11 +156,12 @@ func (s *Store) listingsFor(partID string) ([]Listing, error) {
 	var out []Listing
 	for rows.Next() {
 		var l Listing
-		var seen string
+		var ships, seen string
 		if err := rows.Scan(&l.ID, &l.PartID, &l.Vendor, &l.Price, &l.Shipping,
-			&l.Currency, &l.Condition, &l.URL, &seen); err != nil {
+			&l.Currency, &l.Condition, &l.URL, &ships, &seen); err != nil {
 			return nil, err
 		}
+		json.Unmarshal([]byte(ships), &l.ShipsTo)
 		l.SeenAt, _ = time.Parse(time.RFC3339, seen)
 		out = append(out, l)
 	}

@@ -79,21 +79,51 @@ type loadSpecIn struct {
 }
 
 type dealsIn struct {
-	PartID string `json:"part_id"`
-	Search bool   `json:"search,omitempty" jsonschema:"also run a live web search for buy pages to populate more listings (default false)"`
+	PartID          string `json:"part_id"`
+	Search          bool   `json:"search,omitempty" jsonschema:"also run a region-biased web search for buy pages to populate more listings"`
+	Country         string `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2, e.g. DK)"`
+	DisplayCurrency string `json:"display_currency,omitempty" jsonschema:"convert every total into this currency for comparison; defaults to region currency"`
+	IncludeDead     bool   `json:"include_dead,omitempty" jsonschema:"keep listings whose URL is no longer reachable (default: drop them)"`
+	IncludeUnshippable bool `json:"include_unshippable,omitempty" jsonschema:"keep listings that don't ship to the region (default: drop them)"`
 }
 type dealsOut struct {
+	Region   Region      `json:"region"`
 	Listings []Listing   `json:"listings"`
 	Hits     []SearchHit `json:"search_hits,omitempty"`
 }
 
 type substituteIn struct {
-	PartID   string  `json:"part_id"`
-	Budget   float64 `json:"budget,omitempty" jsonschema:"max total price (price+shipping); 0 = no cap"`
-	Currency string  `json:"currency,omitempty" jsonschema:"ISO currency to compare in; listings in other currencies are skipped (no FX conversion)"`
+	PartID          string  `json:"part_id"`
+	Budget          float64 `json:"budget,omitempty" jsonschema:"max total price in the comparison currency; 0 = no cap"`
+	Currency        string  `json:"currency,omitempty" jsonschema:"currency to compare budget/prices in; defaults to region currency. Listings in other currencies are converted (indicative ECB rates)."`
+	Country         string  `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
 }
 type substituteOut struct {
 	Substitutes []Substitute `json:"substitutes"`
+}
+
+type convertIn struct {
+	Amount float64 `json:"amount"`
+	From   string  `json:"from" jsonschema:"ISO currency code"`
+	To     string  `json:"to" jsonschema:"ISO currency code"`
+}
+type convertOut struct {
+	Amount    float64 `json:"amount"`
+	From      string  `json:"from"`
+	To        string  `json:"to"`
+	Converted float64 `json:"converted"`
+}
+
+// regionFor resolves the effective region for a call: an explicit country
+// override, else the detected region.
+func regionFor(ctx context.Context, country string) Region {
+	if country != "" {
+		r := detectRegion(ctx)
+		r.Country = strings.ToUpper(country)
+		r.DDG = ddgRegion(r.Country)
+		return r
+	}
+	return detectRegion(ctx)
 }
 
 func registerTools(s *mcp.Server) {
@@ -227,17 +257,36 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, dealsOut{}, err
 		}
+		region := regionFor(ctx, in.Country)
 		listings, err := store.listingsFor(in.PartID)
 		if err != nil {
 			return nil, dealsOut{}, err
 		}
 		markStale(listings, time.Now())
+		liveCheckAll(ctx, listings) // always probe URLs so gone deals get dropped
+		// Drop dead / unshippable listings unless explicitly kept.
+		kept := listings[:0]
+		for _, l := range listings {
+			if l.Dead && !in.IncludeDead {
+				continue
+			}
+			if !in.IncludeUnshippable && !shipsTo(l.ShipsTo, region.Country) {
+				continue
+			}
+			kept = append(kept, l)
+		}
+		listings = kept
+		display := in.DisplayCurrency
+		if display == "" {
+			display = region.Currency
+		}
+		annotateDisplay(ctx, listings, display)
 		sortListings(listings)
-		out := dealsOut{Listings: listings}
+		out := dealsOut{Region: region, Listings: listings}
 		if in.Search {
 			p := parts[0]
 			q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
-			out.Hits, _ = search(ctx, q, 10) // best-effort; ignore search errors
+			out.Hits, _ = searchRegion(ctx, q, 10, region) // best-effort
 		}
 		return nil, out, nil
 	})
@@ -245,17 +294,26 @@ func registerTools(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "find_substitute",
 		Description: "Find cheaper drop-in replacements for a part: same category, attribute-compatible (socket/mem/form factor), with a recorded listing within budget. Ranked cheapest first. Note: 'similar performance' is approximated by compatibility, not benchmark scores.",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in substituteIn) (*mcp.CallToolResult, substituteOut, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in substituteIn) (*mcp.CallToolResult, substituteOut, error) {
 		parts, err := store.getParts([]string{in.PartID})
 		if err != nil {
 			return nil, substituteOut{}, err
 		}
 		orig := parts[0]
+		region := regionFor(ctx, in.Country)
+		currency := in.Currency
+		if currency == "" {
+			currency = region.Currency
+		}
 		cands, err := store.partsByCategory(orig.Category)
 		if err != nil {
 			return nil, substituteOut{}, err
 		}
-		var subs []Substitute
+		type scored struct {
+			sub   Substitute
+			total float64
+		}
+		var scoredSubs []scored
 		for _, c := range cands {
 			if !substituteMatch(orig, c) {
 				continue
@@ -264,19 +322,37 @@ func registerTools(s *mcp.Server) {
 			if err != nil {
 				return nil, substituteOut{}, err
 			}
-			best, ok := cheapest(ls, in.Currency)
+			best, total, ok := cheapestConverted(ctx, ls, currency)
 			if !ok {
 				continue
 			}
-			if in.Budget > 0 && best.total() > in.Budget {
+			if in.Budget > 0 && total > in.Budget {
 				continue
 			}
-			subs = append(subs, Substitute{Part: c, Listing: best})
+			if currency != "" {
+				best.DisplayTotal, best.DisplayCurr = total, currency
+			}
+			scoredSubs = append(scoredSubs, scored{Substitute{Part: c, Listing: best}, total})
 		}
-		sort.Slice(subs, func(i, j int) bool {
-			return subs[i].Listing.total() < subs[j].Listing.total()
+		sort.Slice(scoredSubs, func(i, j int) bool {
+			return scoredSubs[i].total < scoredSubs[j].total
 		})
+		subs := make([]Substitute, len(scoredSubs))
+		for i, s := range scoredSubs {
+			subs[i] = s.sub
+		}
 		return nil, substituteOut{Substitutes: subs}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "convert_currency",
+		Description: "Convert an amount between currencies using indicative ECB reference rates (frankfurter.app). For guiding figures, not accounting.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in convertIn) (*mcp.CallToolResult, convertOut, error) {
+		v, err := convert(ctx, in.Amount, in.From, in.To)
+		if err != nil {
+			return nil, convertOut{}, err
+		}
+		return nil, convertOut{Amount: in.Amount, From: strings.ToUpper(in.From), To: strings.ToUpper(in.To), Converted: v}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
