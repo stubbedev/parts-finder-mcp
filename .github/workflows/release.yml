@@ -166,7 +166,9 @@ jobs:
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- Formula/parts-finder.rb 2>/dev/null && [ -f Formula/parts-finder.rb ]; then
+          # status --porcelain sees untracked files too; diff --quiet does NOT,
+          # which silently skipped the very first formula commit.
+          if [ -z "$(git status --porcelain -- Formula/parts-finder.rb)" ]; then
             echo "Formula already up to date for ${VERSION}; nothing to do."
             exit 0
           fi
