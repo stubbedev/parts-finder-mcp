@@ -5,7 +5,7 @@ import (
 	"image"
 	_ "image/gif" // register GIF decoder
 	"image/jpeg"
-	_ "image/png" // register PNG decoder
+	"image/png"
 	"math"
 
 	_ "golang.org/x/image/bmp" // register BMP decoder
@@ -66,13 +66,6 @@ func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
 	w, h := b.Dx(), b.Dy()
 	scale := fitScale(w, h)
 
-	// Already within caps, already a compact colour raster, and caller wants
-	// colour: nothing to gain — leave it.
-	if keepColor && scale == 1 && len(data) <= 400*1024 &&
-		(mime == "image/jpeg" || mime == "image/png") {
-		return data, mime
-	}
-
 	nw, nh := int(float64(w)*scale), int(float64(h)*scale)
 	if nw < 1 {
 		nw = 1
@@ -89,12 +82,39 @@ func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
 	}
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
 
-	var buf bytes.Buffer
-	if err := jpeg.Encode(&buf, dst, &jpeg.Options{Quality: 82}); err != nil {
+	// Encode both ways and keep whichever is smaller. JPEG wins on photos;
+	// PNG (lossless, DEFLATE) wins on text/diagrams/screenshots AND avoids the
+	// ringing artifacts JPEG smears around sharp glyph edges — smaller AND
+	// crisper for the exact content we read specs from.
+	best, bestMIME := encodeJPEG(dst), "image/jpeg"
+	if p := encodePNG(dst); p != nil && len(p) < len(best) {
+		best, bestMIME = p, "image/png"
+	}
+	if best == nil {
 		return data, mime
 	}
-	if buf.Len() >= len(data) && scale == 1 && keepColor {
-		return data, mime // re-encode didn't help — keep original
+	// If the source was already smaller than anything we can produce (and we
+	// didn't need to resize/desaturate), keep it.
+	if scale == 1 && keepColor && len(data) <= len(best) &&
+		(mime == "image/jpeg" || mime == "image/png") {
+		return data, mime
 	}
-	return buf.Bytes(), "image/jpeg"
+	return best, bestMIME
+}
+
+func encodeJPEG(img image.Image) []byte {
+	var buf bytes.Buffer
+	if jpeg.Encode(&buf, img, &jpeg.Options{Quality: 82}) != nil {
+		return nil
+	}
+	return buf.Bytes()
+}
+
+func encodePNG(img image.Image) []byte {
+	var buf bytes.Buffer
+	enc := png.Encoder{CompressionLevel: png.BestCompression}
+	if enc.Encode(&buf, img) != nil {
+		return nil
+	}
+	return buf.Bytes()
 }
