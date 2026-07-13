@@ -3,9 +3,27 @@
 Local Go MCP server for speccing servers from compatible hardware. See
 [DESIGN.md](DESIGN.md) for the full design.
 
-## Build
+## Install
+
+Homebrew (macOS + Linux):
 
 ```sh
+brew install stubbedev/parts-finder/parts-finder
+```
+
+Nix flake:
+
+```sh
+nix run github:stubbedev/parts-finder-mcp
+# or
+nix profile install github:stubbedev/parts-finder-mcp
+```
+
+From source:
+
+```sh
+just build        # ./bin/parts-finder
+# or
 go build -o parts-finder .
 ```
 
