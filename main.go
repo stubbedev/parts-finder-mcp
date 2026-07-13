@@ -102,6 +102,30 @@ type substituteOut struct {
 	Substitutes []Substitute `json:"substitutes"`
 }
 
+type shopIn struct {
+	SpecID          string   `json:"spec_id,omitempty" jsonschema:"saved spec to shop for (or pass part_ids)"`
+	PartIDs         []string `json:"part_ids,omitempty" jsonschema:"parts to shop for when no spec_id"`
+	Country         string   `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
+	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for the guiding totals; defaults to region currency"`
+	NoSearch        bool     `json:"no_search,omitempty" jsonschema:"skip web searches for parts that lack live listings"`
+}
+type shopItem struct {
+	Part         Part        `json:"part"`
+	Best         *Listing    `json:"best,omitempty"`         // cheapest live, shippable listing — the link to click
+	Alternatives []Listing   `json:"alternatives,omitempty"` // other live options, sorted
+	SearchHits   []SearchHit `json:"search_hits,omitempty"`  // buy-page candidates when nothing is on record
+}
+type shopOut struct {
+	Region        Region      `json:"region"`
+	Compatible    bool        `json:"compatible"`
+	Violations    []Violation `json:"violations,omitempty"`
+	Gaps          []string    `json:"gaps,omitempty"`
+	Items         []shopItem  `json:"items"`
+	TotalBest     float64     `json:"total_best"`               // sum of best totals, converted
+	TotalCurrency string      `json:"total_currency,omitempty"`
+	TotalCovers   int         `json:"total_covers"` // how many parts the total includes
+}
+
 type convertIn struct {
 	Amount float64 `json:"amount"`
 	From   string  `json:"from" jsonschema:"ISO currency code"`
@@ -163,7 +187,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_part",
-		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities.",
+		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. For full build validation across ANY part type, fill provides/requires with resource tokens ('kind:variant' -> count): motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3,\"m2:2280\":2}; RAM stick requires {\"dimm:ddr5\":1}; HBA requires {\"pcie:x8\":1}; case provides {\"bay:3.5\":8}; drive requires {\"bay:3.5\":1}. The engine checks sum(requires) <= sum(provides) per token; wider pcie slots satisfy narrower cards.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, p Part) (*mcp.CallToolResult, savePartOut, error) {
 		if p.Category == "" {
 			return nil, savePartOut{}, fmt.Errorf("category is required")
@@ -342,6 +366,71 @@ func registerTools(s *mcp.Server) {
 			subs[i] = s.sub
 		}
 		return nil, substituteOut{Substitutes: subs}, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "shop_spec",
+		Description: "One-stop purchase plan for a build: per part, the cheapest LIVE listing that ships to your region (direct link to buy), alternatives, a converted build total, and fresh buy-page search hits for parts with no recorded listing. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in shopIn) (*mcp.CallToolResult, shopOut, error) {
+		partIDs := in.PartIDs
+		if in.SpecID != "" {
+			_, ids, err := store.loadSpec(in.SpecID)
+			if err != nil {
+				return nil, shopOut{}, err
+			}
+			partIDs = ids
+		}
+		if len(partIDs) == 0 {
+			return nil, shopOut{}, fmt.Errorf("pass spec_id or part_ids")
+		}
+		parts, err := store.getParts(partIDs)
+		if err != nil {
+			return nil, shopOut{}, err
+		}
+		region := regionFor(ctx, in.Country)
+		display := in.DisplayCurrency
+		if display == "" {
+			display = region.Currency
+		}
+		spec := composeSpec(parts)
+		out := shopOut{
+			Region: region, Compatible: spec.Compatible,
+			Violations: spec.Violations, Gaps: spec.Gaps,
+			TotalCurrency: display,
+		}
+		for _, p := range parts {
+			item := shopItem{Part: p}
+			ls, err := store.listingsFor(p.ID)
+			if err != nil {
+				return nil, shopOut{}, err
+			}
+			markStale(ls, time.Now())
+			liveCheckAll(ctx, ls)
+			live := ls[:0]
+			for _, l := range ls {
+				if !l.Dead && shipsTo(l.ShipsTo, region.Country) {
+					live = append(live, l)
+				}
+			}
+			annotateDisplay(ctx, live, display)
+			sortListings(live)
+			if len(live) > 0 {
+				item.Best = &live[0]
+				item.Alternatives = live[1:]
+				if live[0].DisplayTotal > 0 {
+					out.TotalBest += live[0].DisplayTotal
+					out.TotalCovers++
+				} else if live[0].Currency == display {
+					out.TotalBest += live[0].total()
+					out.TotalCovers++
+				}
+			} else if !in.NoSearch {
+				q := strings.TrimSpace(p.Vendor+" "+p.Model) + " buy price"
+				item.SearchHits, _ = searchRegion(ctx, q, 5, region) // best-effort
+			}
+			out.Items = append(out.Items, item)
+		}
+		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

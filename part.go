@@ -26,9 +26,20 @@ type Part struct {
 	PowerConnectors []string  `json:"power_connectors,omitempty"`
 	LengthMM        int       `json:"length_mm,omitempty"` // gpu = card length; case = max gpu clearance
 	Watts           int       `json:"watts,omitempty"`     // psu rated output
-	RawSpecs        string    `json:"raw_specs,omitempty"` // original scraped blob (json/text)
-	SourceURL       string    `json:"source_url,omitempty"`
-	FetchedAt       time.Time `json:"fetched_at,omitempty"`
+
+	// Generic resource accounting — covers every part type without a rule per
+	// pair. A part PROVIDES resources (motherboard: "dimm:ddr5":12,
+	// "pcie:x16":3; case: "bay:3.5":8) and REQUIRES them (RAM stick:
+	// "dimm:ddr5":1; HBA: "pcie:x8":1; drive: "bay:3.5":1). One engine rule
+	// checks that, per resource, sum(requires) <= sum(provides). Tokens are
+	// free-form "kind:variant" strings the client normalizes at save time.
+	// Larger PCIe slots satisfy smaller cards via pcieWidth.
+	Provides map[string]int `json:"provides,omitempty"`
+	Requires map[string]int `json:"requires,omitempty"`
+
+	RawSpecs  string    `json:"raw_specs,omitempty"` // original scraped blob (json/text)
+	SourceURL string    `json:"source_url,omitempty"`
+	FetchedAt time.Time `json:"fetched_at,omitempty"`
 }
 
 // Violation is a compat rule that a set of parts fails.
@@ -155,6 +166,65 @@ var rules = []rule{
 	},
 }
 
+// resourceViolations does generic provider/consumer accounting: per resource
+// token, total required must not exceed total provided. PCIe is width-aware —
+// an x16 slot satisfies an x8 card. Parts with no Requires/Provides simply
+// don't participate (unknown = no constraint, consistent with the other rules).
+func resourceViolations(parts []Part) []Violation {
+	provides := map[string]int{}
+	requires := map[string]int{}
+	users := map[string][]string{} // token -> part IDs involved (for the report)
+	for _, p := range parts {
+		for tok, n := range p.Provides {
+			tok = strings.ToLower(strings.TrimSpace(tok))
+			provides[tok] += n
+			users[tok] = append(users[tok], p.ID)
+		}
+		for tok, n := range p.Requires {
+			tok = strings.ToLower(strings.TrimSpace(tok))
+			requires[tok] += n
+			users[tok] = append(users[tok], p.ID)
+		}
+	}
+	var vs []Violation
+	for tok, need := range requires {
+		have := provides[tok]
+		if have >= need {
+			provides[tok] -= need
+			continue
+		}
+		deficit := need - have
+		provides[tok] = 0
+		// PCIe width flexibility: fill remaining deficit from wider slots.
+		if w := pcieWidth(tok); w > 0 {
+			for wider, avail := range provides {
+				if avail > 0 && pcieWidth(wider) > w {
+					take := min(avail, deficit)
+					provides[wider] -= take
+					deficit -= take
+					if deficit == 0 {
+						break
+					}
+				}
+			}
+		}
+		if deficit > 0 {
+			vs = append(vs, Violation{"resource", users[tok],
+				fmt.Sprintf("resource %q short by %d (need %d, have %d)", tok, deficit, need, have)})
+		}
+	}
+	return vs
+}
+
+// pcieWidth parses "pcie:x8" -> 8; 0 for non-pcie tokens.
+func pcieWidth(tok string) int {
+	var w int
+	if _, err := fmt.Sscanf(tok, "pcie:x%d", &w); err != nil {
+		return 0
+	}
+	return w
+}
+
 // formFactorSize ranks board/case sizes; a case fits any board of equal or
 // smaller size. ponytail: covers the common server/desktop set; add entries
 // when a new form factor shows up.
@@ -198,6 +268,7 @@ func checkCompat(parts []Part) []Violation {
 	for _, r := range rules {
 		vs = append(vs, r(byCat)...)
 	}
+	vs = append(vs, resourceViolations(parts)...)
 	return vs
 }
 

@@ -55,6 +55,7 @@ prices (>14 days). Use `include_dead` / `include_unshippable` to keep them.
 | `save_listing(Listing)` | record a point-in-time price for a part |
 | `find_deals(part_id, search?, country?, display_currency?, ...)` | live-checked, region-filtered deals, cheapest-converted first + staleness |
 | `find_substitute(part_id, budget?, currency?, country?)` | cheaper drop-in replacements within budget (cross-currency aware) |
+| `shop_spec(spec_id \| part_ids, ...)` | one-stop purchase plan: per part the best live link + alternatives, converted build total, search hits for uncovered parts |
 | `convert_currency(amount, from, to)` | indicative ECB currency conversion |
 
 Typical flow: `search_parts` → `fetch_content` on a spec page (HTML or PDF) →
@@ -72,3 +73,26 @@ go test ./...
 Compat rules: cpu/mobo socket, ram/mobo mem type, PSU headroom (×1.3), GPU
 length vs case, motherboard form factor vs case, GPU power connectors vs PSU.
 Unknown attributes are always treated as gaps, never violations.
+
+## Generic resource accounting (any part type)
+
+Beyond the named rules, every part can declare `provides` / `requires` maps of
+resource tokens (`"kind:variant" -> count`): a motherboard provides
+`{"dimm:ddr5":12,"pcie:x16":3,"m2:2280":2}`, a RAM stick requires
+`{"dimm:ddr5":1}`, an HBA requires `{"pcie:x8":1}`, a case provides
+`{"bay:3.5":8}`, a drive requires `{"bay:3.5":1}`. One engine rule checks
+`sum(requires) <= sum(provides)` per token; wider PCIe slots satisfy narrower
+cards. This validates builds across drives, controllers, NICs, risers,
+backplanes — any category — without new code per pair.
+
+`fetch_content` preserves `<table>` data as markdown (spec sheets are tables),
+so the client can extract these tokens reliably.
+
+## Typical one-stop flow
+
+1. `search_parts` (region-biased) → `fetch_content` spec pages → `save_part`
+   with attributes + provides/requires.
+2. `compose_spec` → fix violations/gaps → `save_spec`.
+3. `shop_spec(spec_id)` → per part: best live, region-shippable link to click,
+   plus converted build total. Parts without listings come back with buy-page
+   search hits — `fetch_content` + `save_listing` those, re-run `shop_spec`.

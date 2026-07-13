@@ -193,12 +193,59 @@ func fetchContent(ctx context.Context, rawURL string) (title, text string, err e
 		bytes.HasPrefix(magic, []byte("%PDF-")) {
 		return extractPDF(br)
 	}
-	pageURL, _ := url.Parse(rawURL)
-	art, err := readability.FromReader(br, pageURL)
+	// Buffer the HTML: readability flattens <table>s, but hardware specs ARE
+	// tables — extract them separately and append as markdown.
+	buf, err := io.ReadAll(io.LimitReader(br, 4<<20)) // 4MB page cap
 	if err != nil {
 		return "", "", err
 	}
-	return art.Title, art.TextContent, nil
+	pageURL, _ := url.Parse(rawURL)
+	art, err := readability.FromReader(bytes.NewReader(buf), pageURL)
+	if err != nil {
+		return "", "", err
+	}
+	text = art.TextContent
+	if tables := extractTables(bytes.NewReader(buf)); tables != "" {
+		text += "\n\n## Tables\n\n" + tables
+	}
+	return art.Title, text, nil
+}
+
+// extractTables renders every <table> on the page as a markdown table so
+// key/value spec data survives extraction. Best-effort: returns "" on any
+// parse problem or when there are no tables.
+func extractTables(r io.Reader) string {
+	doc, err := goquery.NewDocumentFromReader(r)
+	if err != nil {
+		return ""
+	}
+	doc.Find("style, script").Remove() // inline CSS/JS would leak into cell text
+	var b strings.Builder
+	doc.Find("table").Each(func(_ int, tbl *goquery.Selection) {
+		rows := tbl.Find("tr")
+		if rows.Length() == 0 || rows.Length() > 500 { // skip empty/layout monsters
+			return
+		}
+		wrote := false
+		rows.Each(func(ri int, tr *goquery.Selection) {
+			var cells []string
+			tr.Find("th, td").Each(func(_ int, c *goquery.Selection) {
+				cells = append(cells, strings.Join(strings.Fields(c.Text()), " "))
+			})
+			if len(cells) == 0 {
+				return
+			}
+			b.WriteString("| " + strings.Join(cells, " | ") + " |\n")
+			if ri == 0 { // header separator after first row
+				b.WriteString("|" + strings.Repeat(" --- |", len(cells)) + "\n")
+			}
+			wrote = true
+		})
+		if wrote {
+			b.WriteString("\n")
+		}
+	})
+	return strings.TrimSpace(b.String())
 }
 
 func extractPDF(body io.Reader) (title, text string, err error) {

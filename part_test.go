@@ -36,6 +36,39 @@ func TestCompat(t *testing.T) {
 	}
 }
 
+// Generic resource accounting: any part type participates via provides/requires.
+func TestResourceAccounting(t *testing.T) {
+	mobo := Part{ID: "mb", Category: "motherboard",
+		Provides: map[string]int{"dimm:ddr5": 4, "pcie:x16": 1, "pcie:x8": 1}}
+	ram := Part{ID: "ram", Category: "ram", Requires: map[string]int{"dimm:ddr5": 4}}
+	hba := Part{ID: "hba", Category: "hba", Requires: map[string]int{"pcie:x8": 1}}
+	nic := Part{ID: "nic", Category: "nic", Requires: map[string]int{"pcie:x8": 1}}
+	cse := Part{ID: "case", Category: "case", Provides: map[string]int{"bay:3.5": 2}}
+	hdd := Part{ID: "hdd", Category: "storage", Requires: map[string]int{"bay:3.5": 1}}
+
+	// Good: nic's x8 fits the spare x16 slot (width flexibility).
+	if vs := resourceViolations([]Part{mobo, ram, hba, nic, cse, hdd}); len(vs) != 0 {
+		t.Fatalf("should fit (x8 into x16), got: %+v", vs)
+	}
+	// Bad: 3 drives into 2 bays.
+	hdd2 := Part{ID: "hdd2", Category: "storage", Requires: map[string]int{"bay:3.5": 1}}
+	hdd3 := Part{ID: "hdd3", Category: "storage", Requires: map[string]int{"bay:3.5": 1}}
+	vs := resourceViolations([]Part{cse, hdd, hdd2, hdd3})
+	if len(vs) != 1 || vs[0].Rule != "resource" {
+		t.Fatalf("want 1 resource violation for bays, got: %+v", vs)
+	}
+	// Bad: x16 GPU can't go into an x8 slot (narrower never satisfies wider).
+	gpu := Part{ID: "gpu", Category: "gpu", Requires: map[string]int{"pcie:x16": 1}}
+	onlyX8 := Part{ID: "mb2", Category: "motherboard", Provides: map[string]int{"pcie:x8": 2}}
+	if vs := resourceViolations([]Part{onlyX8, gpu}); len(vs) != 1 {
+		t.Fatalf("x16 into x8 must violate, got: %+v", vs)
+	}
+	// Parts with no maps don't constrain anything.
+	if vs := resourceViolations([]Part{{ID: "x", Category: "cpu"}}); len(vs) != 0 {
+		t.Fatalf("no maps => no violations, got: %+v", vs)
+	}
+}
+
 // Unknown attributes must be gaps, never violations.
 func TestUnknownNoFalseViolation(t *testing.T) {
 	parts := []Part{

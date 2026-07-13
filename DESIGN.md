@@ -70,6 +70,12 @@ gpu.length_mm <= case.max_gpu_mm
 - **M3 — done:** SearXNG fallback (`SEARXNG_URL`), lightpanda headless render
   (`LIGHTPANDA_URL`, opt-in via `fetch_content(render=true)`), 2 more compat
   rules (form-factor fit, GPU power connectors).
+- **M5 — done:** one-stop shop. Generic provides/requires resource accounting
+  (any part type: drives, HBAs, NICs, bays, DIMM slots, PCIe with width
+  flexibility) — one engine rule, no rule-per-pair. `shop_spec` purchase plan:
+  per part cheapest live region-shippable link + alternatives + converted build
+  total + search hits for uncovered parts. Table-preserving extraction in
+  `fetch_content` (spec tables → markdown).
 - **M4 — done:** region-awareness + deal freshness. IP-detected region
   (ip-api.com; `REGION_COUNTRY`/`REGION_CURRENCY` override); search biased by
   DDG `kl` + local/EU-reseller ranking (bias, not filter); `find_deals` always

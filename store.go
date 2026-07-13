@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS parts (
   id TEXT PRIMARY KEY, category TEXT, vendor TEXT, model TEXT,
   socket TEXT, mem_type TEXT, mem_speed INT, form_factor TEXT,
   tdp_w INT, pcie_gen INT, pcie_lanes INT, power_connectors TEXT,
-  length_mm INT, watts INT, raw_specs TEXT, source_url TEXT, fetched_at TEXT
+  length_mm INT, watts INT, provides TEXT, requires TEXT,
+  raw_specs TEXT, source_url TEXT, fetched_at TEXT
 );
 CREATE TABLE IF NOT EXISTS specs (
   id TEXT PRIMARY KEY, name TEXT, part_ids TEXT, created_at TEXT
@@ -40,26 +41,54 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
+	// Migrate pre-existing DBs; "duplicate column" errors are expected noise.
+	db.Exec(`ALTER TABLE parts ADD COLUMN provides TEXT`)
+	db.Exec(`ALTER TABLE parts ADD COLUMN requires TEXT`)
 	return &Store{db}, nil
 }
 
 func (s *Store) savePart(p Part) error {
 	conns, _ := json.Marshal(p.PowerConnectors)
+	prov, _ := json.Marshal(p.Provides)
+	req, _ := json.Marshal(p.Requires)
 	_, err := s.db.Exec(`
 INSERT INTO parts (id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
-  tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,raw_specs,source_url,fetched_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
+  raw_specs,source_url,fetched_at)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET category=excluded.category,vendor=excluded.vendor,
   model=excluded.model,socket=excluded.socket,mem_type=excluded.mem_type,
   mem_speed=excluded.mem_speed,form_factor=excluded.form_factor,tdp_w=excluded.tdp_w,
   pcie_gen=excluded.pcie_gen,pcie_lanes=excluded.pcie_lanes,
   power_connectors=excluded.power_connectors,length_mm=excluded.length_mm,
-  watts=excluded.watts,raw_specs=excluded.raw_specs,source_url=excluded.source_url,
+  watts=excluded.watts,provides=excluded.provides,requires=excluded.requires,
+  raw_specs=excluded.raw_specs,source_url=excluded.source_url,
   fetched_at=excluded.fetched_at`,
 		p.ID, p.Category, p.Vendor, p.Model, p.Socket, p.MemType, p.MemSpeed,
 		p.FormFactor, p.TDPW, p.PCIeGen, p.PCIeLanes, string(conns), p.LengthMM,
-		p.Watts, p.RawSpecs, p.SourceURL, p.FetchedAt.Format(time.RFC3339))
+		p.Watts, string(prov), string(req), p.RawSpecs, p.SourceURL,
+		p.FetchedAt.Format(time.RFC3339))
 	return err
+}
+
+const partCols = `id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
+  tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
+  raw_specs,source_url,fetched_at`
+
+func scanPart(rows *sql.Rows) (Part, error) {
+	var p Part
+	var conns, prov, req, fetched sql.NullString
+	if err := rows.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
+		&p.MemType, &p.MemSpeed, &p.FormFactor, &p.TDPW, &p.PCIeGen, &p.PCIeLanes,
+		&conns, &p.LengthMM, &p.Watts, &prov, &req, &p.RawSpecs, &p.SourceURL,
+		&fetched); err != nil {
+		return Part{}, err
+	}
+	json.Unmarshal([]byte(conns.String), &p.PowerConnectors)
+	json.Unmarshal([]byte(prov.String), &p.Provides)
+	json.Unmarshal([]byte(req.String), &p.Requires)
+	p.FetchedAt, _ = time.Parse(time.RFC3339, fetched.String)
+	return p, nil
 }
 
 func (s *Store) getParts(ids []string) ([]Part, error) {
@@ -72,24 +101,17 @@ func (s *Store) getParts(ids []string) ([]Part, error) {
 	for i, id := range ids {
 		args[i] = id
 	}
-	rows, err := s.db.Query(`SELECT id,category,vendor,model,socket,mem_type,mem_speed,
-  form_factor,tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,raw_specs,
-  source_url,fetched_at FROM parts WHERE id IN (`+ph+`)`, args...)
+	rows, err := s.db.Query(`SELECT `+partCols+` FROM parts WHERE id IN (`+ph+`)`, args...)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	found := map[string]Part{}
 	for rows.Next() {
-		var p Part
-		var conns, fetched string
-		if err := rows.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
-			&p.MemType, &p.MemSpeed, &p.FormFactor, &p.TDPW, &p.PCIeGen, &p.PCIeLanes,
-			&conns, &p.LengthMM, &p.Watts, &p.RawSpecs, &p.SourceURL, &fetched); err != nil {
+		p, err := scanPart(rows)
+		if err != nil {
 			return nil, err
 		}
-		json.Unmarshal([]byte(conns), &p.PowerConnectors)
-		p.FetchedAt, _ = time.Parse(time.RFC3339, fetched)
 		found[p.ID] = p
 	}
 	// Preserve request order; error on any missing id so callers see the gap.
@@ -109,24 +131,17 @@ func (s *Store) getParts(ids []string) ([]Part, error) {
 }
 
 func (s *Store) partsByCategory(cat string) ([]Part, error) {
-	rows, err := s.db.Query(`SELECT id,category,vendor,model,socket,mem_type,mem_speed,
-  form_factor,tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,raw_specs,
-  source_url,fetched_at FROM parts WHERE category=?`, cat)
+	rows, err := s.db.Query(`SELECT `+partCols+` FROM parts WHERE category=?`, cat)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Part
 	for rows.Next() {
-		var p Part
-		var conns, fetched string
-		if err := rows.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
-			&p.MemType, &p.MemSpeed, &p.FormFactor, &p.TDPW, &p.PCIeGen, &p.PCIeLanes,
-			&conns, &p.LengthMM, &p.Watts, &p.RawSpecs, &p.SourceURL, &fetched); err != nil {
+		p, err := scanPart(rows)
+		if err != nil {
 			return nil, err
 		}
-		json.Unmarshal([]byte(conns), &p.PowerConnectors)
-		p.FetchedAt, _ = time.Parse(time.RFC3339, fetched)
 		out = append(out, p)
 	}
 	return out, nil
