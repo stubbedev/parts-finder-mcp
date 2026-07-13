@@ -67,7 +67,9 @@ gpu.length_mm <= case.max_gpu_mm
   (DDG + readability + SQLite) → `check_compat` + `compose_spec` over seeded
   rules. Self-test: known-good + known-bad build, assert violations fire.
 - **M2:** `find_deals`, `find_substitute`, PDF parsing.
-- **M3 (only if hit):** SearXNG, chromedp, more rule coverage.
+- **M3 — done:** SearXNG fallback (`SEARXNG_URL`), lightpanda headless render
+  (`LIGHTPANDA_URL`, opt-in via `fetch_content(render=true)`), 2 more compat
+  rules (form-factor fit, GPU power connectors).
 
 ## Open risks
 

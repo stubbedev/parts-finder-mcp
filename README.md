@@ -17,12 +17,19 @@ claude mcp add parts-finder -- /abs/path/to/parts-finder
 
 DB path defaults to `~/.parts-finder.db`; override with `PARTS_DB`.
 
+Optional env:
+- `SEARXNG_URL` — base URL of a SearXNG instance; used as fallback when
+  DuckDuckGo returns nothing (rate-limited).
+- `LIGHTPANDA_URL` — CDP endpoint of a running
+  [lightpanda](https://github.com/lightpanda-io/browser) (`http://127.0.0.1:9222`
+  or a `ws://` URL); enables `fetch_content(render=true)` for JS-heavy pages.
+
 ## M1 tools
 
 | Tool | Does |
 |------|------|
 | `search_parts(query, category?, limit?)` | keyless DuckDuckGo search → result links |
-| `fetch_content(url)` | fetch + readability → text (cached) |
+| `fetch_content(url, render?)` | fetch + readability → text (cached); PDF-aware; `render=true` uses lightpanda |
 | `save_part(Part)` | persist a structured part; derives id from vendor/model if omitted |
 | `get_part(id)` | load a stored part |
 | `check_compat(part_ids[])` | run compat rules → violations |
@@ -44,4 +51,6 @@ surface as gaps, never as false incompatibilities.
 go test ./...
 ```
 
-M3 (SearXNG fallback, lightpanda headless, wider rule coverage) is not built yet.
+Compat rules: cpu/mobo socket, ram/mobo mem type, PSU headroom (×1.3), GPU
+length vs case, motherboard form factor vs case, GPU power connectors vs PSU.
+Unknown attributes are always treated as gaps, never violations.

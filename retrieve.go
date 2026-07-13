@@ -3,10 +3,12 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 
@@ -39,12 +41,23 @@ type SearchHit struct {
 	Snippet string `json:"snippet,omitempty"`
 }
 
-// search queries the keyless DuckDuckGo HTML endpoint and parses result links.
-// ponytail: SearXNG is the drop-in upgrade if DDG rate-limits — swap this func.
+// search queries the keyless DuckDuckGo HTML endpoint. If DDG errors or returns
+// nothing (rate-limited) and SEARXNG_URL is set, it falls back to SearXNG's
+// JSON API — the drop-in upgrade for when DDG throttles.
 func search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 10
 	}
+	hits, err := searchDDG(ctx, query, limit)
+	if (err != nil || len(hits) == 0) && os.Getenv("SEARXNG_URL") != "" {
+		if sx, sxErr := searchSearXNG(ctx, query, limit); sxErr == nil && len(sx) > 0 {
+			return sx, nil
+		}
+	}
+	return hits, err
+}
+
+func searchDDG(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	u := "https://html.duckduckgo.com/html/?q=" + url.QueryEscape(query)
 	resp, err := get(ctx, u)
 	if err != nil {
@@ -73,6 +86,40 @@ func search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 		})
 		return len(hits) < limit
 	})
+	return hits, nil
+}
+
+// searchSearXNG queries a self-hosted SearXNG instance's JSON API.
+// SEARXNG_URL is the base URL, e.g. http://localhost:8888.
+func searchSearXNG(ctx context.Context, query string, limit int) ([]SearchHit, error) {
+	base := strings.TrimRight(os.Getenv("SEARXNG_URL"), "/")
+	u := base + "/search?format=json&q=" + url.QueryEscape(query)
+	resp, err := get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("searxng returned %s", resp.Status)
+	}
+	var body struct {
+		Results []struct {
+			Title, URL, Content string
+		} `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return nil, err
+	}
+	var hits []SearchHit
+	for _, r := range body.Results {
+		if r.URL == "" {
+			continue
+		}
+		hits = append(hits, SearchHit{Title: r.Title, URL: r.URL, Snippet: r.Content})
+		if len(hits) >= limit {
+			break
+		}
+	}
 	return hits, nil
 }
 

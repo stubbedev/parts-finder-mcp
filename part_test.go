@@ -7,11 +7,11 @@ import "testing"
 func TestCompat(t *testing.T) {
 	good := []Part{
 		{ID: "cpu1", Category: "cpu", Socket: "SP5", TDPW: 300},
-		{ID: "mb1", Category: "motherboard", Socket: "SP5", MemType: "DDR5"},
+		{ID: "mb1", Category: "motherboard", Socket: "SP5", MemType: "DDR5", FormFactor: "ATX"},
 		{ID: "ram1", Category: "ram", MemType: "DDR5"},
-		{ID: "psu1", Category: "psu", Watts: 800},
-		{ID: "case1", Category: "case", LengthMM: 400},
-		{ID: "gpu1", Category: "gpu", LengthMM: 300, TDPW: 250},
+		{ID: "psu1", Category: "psu", Watts: 800, PowerConnectors: []string{"24-pin", "8-pin", "8-pin"}},
+		{ID: "case1", Category: "case", LengthMM: 400, FormFactor: "E-ATX"},
+		{ID: "gpu1", Category: "gpu", LengthMM: 300, TDPW: 250, PowerConnectors: []string{"8-pin"}},
 	}
 	if vs := checkCompat(good); len(vs) != 0 {
 		t.Fatalf("good build should be compatible, got: %+v", vs)
@@ -19,17 +19,17 @@ func TestCompat(t *testing.T) {
 
 	bad := []Part{
 		{ID: "cpu1", Category: "cpu", Socket: "LGA4677", TDPW: 350},
-		{ID: "mb1", Category: "motherboard", Socket: "SP5", MemType: "DDR5"},
+		{ID: "mb1", Category: "motherboard", Socket: "SP5", MemType: "DDR5", FormFactor: "E-ATX"},
 		{ID: "ram1", Category: "ram", MemType: "DDR4"},
-		{ID: "psu1", Category: "psu", Watts: 300},
-		{ID: "case1", Category: "case", LengthMM: 250},
-		{ID: "gpu1", Category: "gpu", LengthMM: 320, TDPW: 250},
+		{ID: "psu1", Category: "psu", Watts: 300, PowerConnectors: []string{"24-pin"}},
+		{ID: "case1", Category: "case", LengthMM: 250, FormFactor: "Micro-ATX"},
+		{ID: "gpu1", Category: "gpu", LengthMM: 320, TDPW: 250, PowerConnectors: []string{"12VHPWR"}},
 	}
 	got := map[string]bool{}
 	for _, v := range checkCompat(bad) {
 		got[v.Rule] = true
 	}
-	for _, want := range []string{"cpu_socket", "ram_mem_type", "psu_headroom", "gpu_length"} {
+	for _, want := range []string{"cpu_socket", "ram_mem_type", "psu_headroom", "gpu_length", "form_factor_fit", "power_connector"} {
 		if !got[want] {
 			t.Errorf("bad build should fire rule %q, violations: %+v", want, checkCompat(bad))
 		}

@@ -2,6 +2,8 @@ package main
 
 import (
 	"fmt"
+	"regexp"
+	"strings"
 	"time"
 )
 
@@ -110,6 +112,65 @@ var rules = []rule{
 		}
 		return vs
 	},
+	// Motherboard form factor must fit the case. A case's form factor is the
+	// largest board it accepts (an ATX case also fits mATX/mITX).
+	func(c map[string][]Part) []Violation {
+		mb, ok1 := first(c["motherboard"])
+		cs, ok2 := first(c["case"])
+		if !ok1 || !ok2 {
+			return nil
+		}
+		mbSize, ok3 := formFactorSize[normFF(mb.FormFactor)]
+		csSize, ok4 := formFactorSize[normFF(cs.FormFactor)]
+		if !ok3 || !ok4 {
+			return nil // unknown or unrecognized form factor => gap, not violation
+		}
+		if mbSize > csSize {
+			return []Violation{{"form_factor_fit", []string{mb.ID, cs.ID},
+				fmt.Sprintf("motherboard %s (%s) too large for case %s (%s)",
+					mb.ID, mb.FormFactor, cs.ID, cs.FormFactor)}}
+		}
+		return nil
+	},
+	// PSU must provide every power connector each GPU requires (by type).
+	func(c map[string][]Part) []Violation {
+		psu, ok := first(c["psu"])
+		if !ok || len(psu.PowerConnectors) == 0 {
+			return nil
+		}
+		have := map[string]bool{}
+		for _, pc := range psu.PowerConnectors {
+			have[normFF(pc)] = true
+		}
+		var vs []Violation
+		for _, gpu := range c["gpu"] {
+			for _, need := range gpu.PowerConnectors {
+				if !have[normFF(need)] {
+					vs = append(vs, Violation{"power_connector", []string{gpu.ID, psu.ID},
+						fmt.Sprintf("GPU %s needs %s connector, PSU %s doesn't provide it", gpu.ID, need, psu.ID)})
+				}
+			}
+		}
+		return vs
+	},
+}
+
+// formFactorSize ranks board/case sizes; a case fits any board of equal or
+// smaller size. ponytail: covers the common server/desktop set; add entries
+// when a new form factor shows up.
+var formFactorSize = map[string]int{
+	"miniitx": 1,
+	"microatx": 2, "matx": 2, "uatx": 2,
+	"atx":   3,
+	"eatx":  4,
+	"ssiceb": 4,
+	"ssieeb": 5, "eeb": 5,
+}
+
+var ffStrip = regexp.MustCompile(`[^a-z0-9]+`)
+
+func normFF(s string) string {
+	return ffStrip.ReplaceAllString(strings.ToLower(s), "")
 }
 
 func groupByCategory(parts []Part) map[string][]Part {

@@ -48,7 +48,8 @@ type searchOut struct {
 }
 
 type fetchIn struct {
-	URL string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
+	URL    string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
+	Render bool   `json:"render,omitempty" jsonschema:"render with headless browser (lightpanda) for JS-heavy pages; requires LIGHTPANDA_URL"`
 }
 type fetchOut struct {
 	Title  string `json:"title"`
@@ -118,7 +119,11 @@ func registerTools(s *mcp.Server) {
 		if title, text, ok := store.getCached(in.URL); ok {
 			return nil, fetchOut{Title: title, Text: text, Cached: true}, nil
 		}
-		title, text, err := fetchContent(ctx, in.URL)
+		fetch := fetchContent
+		if in.Render {
+			fetch = fetchRendered
+		}
+		title, text, err := fetch(ctx, in.URL)
 		if err != nil {
 			return nil, fetchOut{}, err
 		}
