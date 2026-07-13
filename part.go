@@ -13,20 +13,20 @@ import (
 // Zero-valued attributes mean "unknown" — rules treat unknowns as gaps, never
 // as violations, so missing scrape data can't produce a false incompatibility.
 type Part struct {
-	ID              string    `json:"id,omitempty"` // omitempty so save_part can derive it; always set on output
-	Category        string    `json:"category"`     // cpu, motherboard, ram, psu, gpu, case, storage, ...
-	Vendor          string    `json:"vendor,omitempty"`
-	Model           string    `json:"model,omitempty"`
-	Socket          string    `json:"socket,omitempty"`     // cpu, motherboard
-	MemType         string    `json:"mem_type,omitempty"`   // DDR4, DDR5 — ram, motherboard
-	MemSpeed        int       `json:"mem_speed,omitempty"`  // MT/s
-	FormFactor      string    `json:"form_factor,omitempty"`// ATX, EATX, ... — motherboard, case
-	TDPW            int       `json:"tdp_w,omitempty"`      // watts drawn
-	PCIeGen         int       `json:"pcie_gen,omitempty"`
-	PCIeLanes       int       `json:"pcie_lanes,omitempty"`
-	PowerConnectors []string  `json:"power_connectors,omitempty"`
-	LengthMM        int       `json:"length_mm,omitempty"` // gpu = card length; case = max gpu clearance
-	Watts           int       `json:"watts,omitempty"`     // psu rated output
+	ID              string   `json:"id,omitempty"` // omitempty so save_part can derive it; always set on output
+	Category        string   `json:"category"`     // cpu, motherboard, ram, psu, gpu, case, storage, ...
+	Vendor          string   `json:"vendor,omitempty"`
+	Model           string   `json:"model,omitempty"`
+	Socket          string   `json:"socket,omitempty"`      // cpu, motherboard
+	MemType         string   `json:"mem_type,omitempty"`    // DDR4, DDR5 — ram, motherboard
+	MemSpeed        int      `json:"mem_speed,omitempty"`   // MT/s
+	FormFactor      string   `json:"form_factor,omitempty"` // ATX, EATX, ... — motherboard, case
+	TDPW            int      `json:"tdp_w,omitempty"`       // watts drawn
+	PCIeGen         int      `json:"pcie_gen,omitempty"`
+	PCIeLanes       int      `json:"pcie_lanes,omitempty"`
+	PowerConnectors []string `json:"power_connectors,omitempty"`
+	LengthMM        int      `json:"length_mm,omitempty"` // gpu = card length; case = max gpu clearance
+	Watts           int      `json:"watts,omitempty"`     // psu rated output
 
 	// Generic resource accounting — covers every part type without a rule per
 	// pair. A part PROVIDES resources (motherboard: "dimm:ddr5":12,
@@ -248,10 +248,10 @@ func pcieWidth(tok string) int {
 // smaller size. ponytail: covers the common server/desktop set; add entries
 // when a new form factor shows up.
 var formFactorSize = map[string]int{
-	"miniitx": 1,
+	"miniitx":  1,
 	"microatx": 2, "matx": 2, "uatx": 2,
-	"atx":   3,
-	"eatx":  4,
+	"atx":    3,
+	"eatx":   4,
 	"ssiceb": 4,
 	"ssieeb": 5, "eeb": 5,
 }

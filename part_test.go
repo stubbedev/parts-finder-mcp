@@ -117,13 +117,13 @@ func TestMatchWhere(t *testing.T) {
 		{gpu, Where{"cuda_compute", "gte", 8.9}, true},
 		{gpu, Where{"cuda_compute", "gt", 9.0}, false},
 		{gpu, Where{"vram_gb", "gte", 16}, true},
-		{gpu, Where{"tdp_w", "lte", 150.0}, true},          // scalar field via same path
+		{gpu, Where{"tdp_w", "lte", 150.0}, true},             // scalar field via same path
 		{gpu, Where{"interface", "contains", "pcie 4"}, true}, // case-folded contains
-		{gpu, Where{"l3_cache_mb", "gte", 1}, false},       // absent attr never matches
+		{gpu, Where{"l3_cache_mb", "gte", 1}, false},          // absent attr never matches
 		{cpu, Where{"l3_cache_mb", "gte", 256.0}, true},
 		{cpu, Where{"l3_cache_mb", "exists", nil}, true},
 		{gpu, Where{"l3_cache_mb", "exists", nil}, false},
-		{cpu, Where{"cores", "eq", "32"}, true},            // string "32" vs number coerces numeric
+		{cpu, Where{"cores", "eq", "32"}, true}, // string "32" vs number coerces numeric
 	}
 	for _, c := range cases {
 		if got := matchWhere(c.p, c.w); got != c.want {
@@ -157,8 +157,8 @@ func TestAttrsRoundTrip(t *testing.T) {
 // Unknown attributes must be gaps, never violations.
 func TestUnknownNoFalseViolation(t *testing.T) {
 	parts := []Part{
-		{ID: "cpu1", Category: "cpu"},         // no socket/TDP
-		{ID: "mb1", Category: "motherboard"},  // no socket/memtype
+		{ID: "cpu1", Category: "cpu"},        // no socket/TDP
+		{ID: "mb1", Category: "motherboard"}, // no socket/memtype
 		{ID: "ram1", Category: "ram"},
 		{ID: "psu1", Category: "psu"},
 	}

@@ -9,9 +9,9 @@ import (
 func TestListingsSortAndStale(t *testing.T) {
 	now := time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
 	ls := []Listing{
-		{ID: "a", Price: 100, Shipping: 20, SeenAt: now},                    // total 120, fresh
-		{ID: "b", Price: 90, Shipping: 10, SeenAt: now.AddDate(0, 0, -30)},  // total 100, stale
-		{ID: "c", Price: 100, Shipping: 0, SeenAt: now},                     // total 100, fresh
+		{ID: "a", Price: 100, Shipping: 20, SeenAt: now},                   // total 120, fresh
+		{ID: "b", Price: 90, Shipping: 10, SeenAt: now.AddDate(0, 0, -30)}, // total 100, stale
+		{ID: "c", Price: 100, Shipping: 0, SeenAt: now},                    // total 100, fresh
 	}
 	markStale(ls, now)
 	sortListings(ls)
@@ -70,12 +70,12 @@ func TestShipsTo(t *testing.T) {
 		country string
 		want    bool
 	}{
-		{nil, "DK", true},                    // unknown => don't exclude
-		{[]string{"DK"}, "DK", true},         // exact
-		{[]string{"EU"}, "DK", true},         // EU member
-		{[]string{"EU"}, "US", false},        // non-member
-		{[]string{"WORLD"}, "DK", true},      // worldwide
-		{[]string{"US", "CA"}, "DK", false},  // not listed
+		{nil, "DK", true},                   // unknown => don't exclude
+		{[]string{"DK"}, "DK", true},        // exact
+		{[]string{"EU"}, "DK", true},        // EU member
+		{[]string{"EU"}, "US", false},       // non-member
+		{[]string{"WORLD"}, "DK", true},     // worldwide
+		{[]string{"US", "CA"}, "DK", false}, // not listed
 	}
 	for _, c := range cases {
 		if got := shipsTo(c.tokens, c.country); got != c.want {
@@ -89,10 +89,10 @@ func TestRankHits(t *testing.T) {
 	// A vendor learned from stored listings (no hardcoded list).
 	known := map[string]bool{"komplett.dk": true}
 	hits := []SearchHit{
-		{URL: "https://shop.jp/x"},          // foreign ccTLD => demote
-		{URL: "https://www.newegg.com/y"},   // generic .com => neutral
-		{URL: "https://proshop.dk/z"},       // local ccTLD => boost
-		{URL: "https://server-parts.eu/w"},  // .eu + DK is EU => boost
+		{URL: "https://shop.jp/x"},         // foreign ccTLD => demote
+		{URL: "https://www.newegg.com/y"},  // generic .com => neutral
+		{URL: "https://proshop.dk/z"},      // local ccTLD => boost
+		{URL: "https://server-parts.eu/w"}, // .eu + DK is EU => boost
 	}
 	rankHits(hits, dk, known)
 	top := map[string]bool{hostOf(hits[0].URL): true, hostOf(hits[1].URL): true}
@@ -118,11 +118,11 @@ func TestSubstituteMatch(t *testing.T) {
 		cand Part
 		want bool
 	}{
-		{Part{ID: "cpu2", Category: "cpu", Socket: "SP5"}, true},        // same slot
-		{Part{ID: "cpu3", Category: "cpu", Socket: "LGA4677"}, false},   // wrong socket
-		{Part{ID: "cpu4", Category: "cpu"}, true},                       // unknown socket => allowed
-		{Part{ID: "gpu1", Category: "gpu", Socket: "SP5"}, false},       // wrong category
-		{Part{ID: "cpu1", Category: "cpu", Socket: "SP5"}, false},       // itself
+		{Part{ID: "cpu2", Category: "cpu", Socket: "SP5"}, true},      // same slot
+		{Part{ID: "cpu3", Category: "cpu", Socket: "LGA4677"}, false}, // wrong socket
+		{Part{ID: "cpu4", Category: "cpu"}, true},                     // unknown socket => allowed
+		{Part{ID: "gpu1", Category: "gpu", Socket: "SP5"}, false},     // wrong category
+		{Part{ID: "cpu1", Category: "cpu", Socket: "SP5"}, false},     // itself
 	}
 	for _, c := range cases {
 		if got := substituteMatch(orig, c.cand); got != c.want {

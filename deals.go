@@ -13,7 +13,7 @@ import (
 type Listing struct {
 	ID        string    `json:"id,omitempty"` // derived from part+vendor+condition if omitted
 	PartID    string    `json:"part_id"`
-	Vendor    string    `json:"vendor,omitempty"`   // seller, e.g. "ebay:seller123", "lenovo"
+	Vendor    string    `json:"vendor,omitempty"` // seller, e.g. "ebay:seller123", "lenovo"
 	Price     float64   `json:"price"`
 	Shipping  float64   `json:"shipping,omitempty"`
 	Currency  string    `json:"currency,omitempty"`  // ISO code of Price/Shipping
@@ -25,8 +25,8 @@ type Listing struct {
 	// Derived on read, not stored. Deals are never dropped for these — they
 	// are flagged and sorted below usable ones, so nothing is hidden.
 	Stale        bool    `json:"stale,omitempty"`
-	Dead         bool    `json:"dead,omitempty"`        // URL no longer reachable (live-check)
-	Unshippable  bool    `json:"unshippable,omitempty"` // doesn't ship to the region
+	Dead         bool    `json:"dead,omitempty"`          // URL no longer reachable (live-check)
+	Unshippable  bool    `json:"unshippable,omitempty"`   // doesn't ship to the region
 	DisplayTotal float64 `json:"display_total,omitempty"` // total converted to display currency
 	DisplayCurr  string  `json:"display_currency,omitempty"`
 }

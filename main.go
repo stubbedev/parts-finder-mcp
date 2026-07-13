@@ -88,18 +88,18 @@ type compareIn struct {
 	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for totals; defaults to region currency"`
 }
 type specOption struct {
-	ID            string      `json:"id"`
-	Name          string      `json:"name,omitempty"`
-	Compatible    bool        `json:"compatible"`
-	Violations    []Violation `json:"violations,omitempty"`
-	Gaps          []string    `json:"gaps,omitempty"`
-	Needs         []Need      `json:"needs,omitempty"`
-	TotalTDPW     int         `json:"total_tdp_w"`
-	TotalBest     float64     `json:"total_best"` // sum of best usable listings, converted
-	TotalCovers   int         `json:"total_covers"`
-	PartCount     int         `json:"part_count"`
-	BuyLinks      []string    `json:"buy_links,omitempty"` // best usable URL per covered part
-	UncoveredIDs  []string    `json:"uncovered_ids,omitempty"`
+	ID           string      `json:"id"`
+	Name         string      `json:"name,omitempty"`
+	Compatible   bool        `json:"compatible"`
+	Violations   []Violation `json:"violations,omitempty"`
+	Gaps         []string    `json:"gaps,omitempty"`
+	Needs        []Need      `json:"needs,omitempty"`
+	TotalTDPW    int         `json:"total_tdp_w"`
+	TotalBest    float64     `json:"total_best"` // sum of best usable listings, converted
+	TotalCovers  int         `json:"total_covers"`
+	PartCount    int         `json:"part_count"`
+	BuyLinks     []string    `json:"buy_links,omitempty"` // best usable URL per covered part
+	UncoveredIDs []string    `json:"uncovered_ids,omitempty"`
 }
 type compareOut struct {
 	Region        Region       `json:"region"`
@@ -133,10 +133,10 @@ type dealsOut struct {
 }
 
 type substituteIn struct {
-	PartID          string  `json:"part_id"`
-	Budget          float64 `json:"budget,omitempty" jsonschema:"max total price in the comparison currency; 0 = no cap"`
-	Currency        string  `json:"currency,omitempty" jsonschema:"currency to compare budget/prices in; defaults to region currency. Listings in other currencies are converted (indicative ECB rates)."`
-	Country         string  `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
+	PartID   string  `json:"part_id"`
+	Budget   float64 `json:"budget,omitempty" jsonschema:"max total price in the comparison currency; 0 = no cap"`
+	Currency string  `json:"currency,omitempty" jsonschema:"currency to compare budget/prices in; defaults to region currency. Listings in other currencies are converted (indicative ECB rates)."`
+	Country  string  `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
 }
 type substituteOut struct {
 	Substitutes []Substitute `json:"substitutes"`
@@ -162,7 +162,7 @@ type shopOut struct {
 	Gaps          []string    `json:"gaps,omitempty"`
 	Needs         []Need      `json:"needs,omitempty"` // resource shortages to also shop for (cables, adapters, ...)
 	Items         []shopItem  `json:"items"`
-	TotalBest     float64     `json:"total_best"`               // sum of best totals, converted
+	TotalBest     float64     `json:"total_best"` // sum of best totals, converted
 	TotalCurrency string      `json:"total_currency,omitempty"`
 	TotalCovers   int         `json:"total_covers"` // how many parts the total includes
 }
@@ -409,8 +409,8 @@ func registerTools(s *mcp.Server) {
 			return nil, dealsOut{}, err
 		}
 		markStale(listings, time.Now())
-		liveCheckAll(ctx, listings)               // probe URLs so gone deals get FLAGGED
-		markShippable(listings, region.Country)   // flag, never drop — no deal is hidden
+		liveCheckAll(ctx, listings)             // probe URLs so gone deals get FLAGGED
+		markShippable(listings, region.Country) // flag, never drop — no deal is hidden
 		display := in.DisplayCurrency
 		if display == "" {
 			display = region.Currency

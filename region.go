@@ -14,9 +14,9 @@ import (
 // pick a default display currency. Detected once from the caller's IP (or env
 // override) and cached for the process lifetime.
 type Region struct {
-	Country  string `json:"country"`   // ISO-3166 alpha-2, e.g. "DK"
-	Currency string `json:"currency"`  // ISO-4217, e.g. "DKK"
-	DDG      string `json:"ddg_region"`// DuckDuckGo kl param, e.g. "dk-da"
+	Country  string `json:"country"`    // ISO-3166 alpha-2, e.g. "DK"
+	Currency string `json:"currency"`   // ISO-4217, e.g. "DKK"
+	DDG      string `json:"ddg_region"` // DuckDuckGo kl param, e.g. "dk-da"
 }
 
 var (
