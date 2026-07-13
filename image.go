@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"image"
+	"image/color"
 	_ "image/gif" // register GIF decoder
 	"image/jpeg"
 	"image/png"
@@ -51,13 +52,23 @@ func init() {
 	image.RegisterFormat("webp", "RIFF????WEBPVP", webp.Decode, webp.DecodeConfig)
 }
 
-// optimizeImage downscales, optionally desaturates, and re-encodes as JPEG.
-// Grayscale is the default: for reading model numbers, socket markings,
-// dimensions and datasheet text, colour carries no signal and roughly halves
-// the bytes. Pass keepColor=true for the rare case colour matters (connector
-// colour-coding, cable ID). Best-effort: on any failure the input passes
-// through unchanged.
-func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
+// Image optimization modes, cheapest-bytes first for their content:
+//
+//	"text"  — reading glyphs off an image (spec sheets, labels, scans):
+//	          grayscale → Otsu threshold → 1-bit black/white PNG. Text needs
+//	          no gray or colour to stay legible, and a bilevel PNG is a
+//	          fraction of a grayscale JPEG. This is the fewest-bytes path.
+//	"auto"  — grayscale, pick the smaller of PNG/JPEG (default).
+//	"color" — keep colour, pick the smaller of PNG/JPEG (photos, colour-coding).
+const (
+	modeText  = "text"
+	modeAuto  = "auto"
+	modeColor = "color"
+)
+
+// optimizeImage downscales to the vision caps and re-encodes as few bytes as
+// the mode allows. Best-effort: on any failure the input passes through.
+func optimizeImage(data []byte, mime, mode string) ([]byte, string) {
 	img, _, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
 		return data, mime // can't decode (svg, exotic) — pass through
@@ -65,41 +76,102 @@ func optimizeImage(data []byte, mime string, keepColor bool) ([]byte, string) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	scale := fitScale(w, h)
-
-	nw, nh := int(float64(w)*scale), int(float64(h)*scale)
-	if nw < 1 {
-		nw = 1
-	}
-	if nh < 1 {
-		nh = 1
-	}
+	nw, nh := max(1, int(float64(w)*scale)), max(1, int(float64(h)*scale))
 
 	var dst draw.Image
-	if keepColor {
+	if mode == modeColor {
 		dst = image.NewRGBA(image.Rect(0, 0, nw, nh))
 	} else {
-		dst = image.NewGray(image.Rect(0, 0, nw, nh)) // grayscale = smaller, no lost signal
+		dst = image.NewGray(image.Rect(0, 0, nw, nh)) // no colour signal for our reads
 	}
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
 
-	// Encode both ways and keep whichever is smaller. JPEG wins on photos;
-	// PNG (lossless, DEFLATE) wins on text/diagrams/screenshots AND avoids the
-	// ringing artifacts JPEG smears around sharp glyph edges — smaller AND
-	// crisper for the exact content we read specs from.
-	best, bestMIME := encodeJPEG(dst), "image/jpeg"
-	if p := encodePNG(dst); p != nil && len(p) < len(best) {
+	// Text mode: binarize to 1-bit and PNG it — the fewest bytes for legible
+	// text. Guard against a pathological case (e.g. a full-tone photo mislabeled
+	// text) by still comparing against the grayscale encoders and keeping the
+	// smallest.
+	var best []byte
+	var bestMIME string
+	if mode == modeText {
+		if bw := encodePNG(binarize(dst)); bw != nil {
+			best, bestMIME = bw, "image/png"
+		}
+	}
+	if j := encodeJPEG(dst); j != nil && (best == nil || len(j) < len(best)) {
+		best, bestMIME = j, "image/jpeg"
+	}
+	if p := encodePNG(dst); p != nil && (best == nil || len(p) < len(best)) {
 		best, bestMIME = p, "image/png"
 	}
 	if best == nil {
 		return data, mime
 	}
-	// If the source was already smaller than anything we can produce (and we
-	// didn't need to resize/desaturate), keep it.
-	if scale == 1 && keepColor && len(data) <= len(best) &&
+	if scale == 1 && mode == modeColor && len(data) <= len(best) &&
 		(mime == "image/jpeg" || mime == "image/png") {
-		return data, mime
+		return data, mime // source already smaller — keep it
 	}
 	return best, bestMIME
+}
+
+// binarize converts an image to 1-bit black/white using an Otsu threshold —
+// the classic document-scan compression: legible text, minimal bytes.
+func binarize(src image.Image) image.Image {
+	b := src.Bounds()
+	g, ok := src.(*image.Gray)
+	if !ok {
+		g = image.NewGray(b)
+		draw.Draw(g, b, src, b.Min, draw.Src)
+	}
+	t := otsu(g.Pix)
+	pal := image.NewPaletted(b, color.Palette{color.Gray{Y: 0}, color.Gray{Y: 255}})
+	for y := b.Min.Y; y < b.Max.Y; y++ {
+		for x := b.Min.X; x < b.Max.X; x++ {
+			idx := uint8(0)
+			if g.GrayAt(x, y).Y >= t {
+				idx = 1
+			}
+			pal.SetColorIndex(x, y, idx)
+		}
+	}
+	return pal
+}
+
+// otsu finds the grayscale threshold maximizing inter-class variance.
+func otsu(pix []uint8) uint8 {
+	var hist [256]int
+	for _, p := range pix {
+		hist[p]++
+	}
+	total := len(pix)
+	if total == 0 {
+		return 128
+	}
+	var sum float64
+	for i := 0; i < 256; i++ {
+		sum += float64(i) * float64(hist[i])
+	}
+	var sumB, wB float64
+	var maxVar float64
+	threshold := 128
+	for i := 0; i < 256; i++ {
+		wB += float64(hist[i])
+		if wB == 0 {
+			continue
+		}
+		wF := float64(total) - wB
+		if wF == 0 {
+			break
+		}
+		sumB += float64(i) * float64(hist[i])
+		mB := sumB / wB
+		mF := (sum - sumB) / wF
+		between := wB * wF * (mB - mF) * (mB - mF)
+		if between > maxVar {
+			maxVar = between
+			threshold = i
+		}
+	}
+	return uint8(threshold)
 }
 
 func encodeJPEG(img image.Image) []byte {

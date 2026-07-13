@@ -93,7 +93,8 @@ type savePartOut struct {
 
 type imageIn struct {
 	URL   string `json:"url" jsonschema:"image URL to fetch for visual reading"`
-	Color bool   `json:"color,omitempty" jsonschema:"keep colour (default: grayscale — colour rarely matters for reading specs and doubles the size). Set true only when colour is the signal, e.g. connector colour-coding"`
+	Text  bool   `json:"text,omitempty" jsonschema:"the image is mostly text/a document (spec sheet, label, screenshot, scan): binarize to 1-bit black-and-white for the FEWEST bytes while staying perfectly legible. Use this whenever you're reading text off the image"`
+	Color bool   `json:"color,omitempty" jsonschema:"keep colour (default is grayscale). Use only when colour is the signal, e.g. connector colour-coding. Ignored if text=true"`
 }
 type imageMeta struct {
 	URL   string `json:"url"`
@@ -363,9 +364,16 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "fetch_image",
-		Description: "Download an image (product photo, spec-sheet diagram, label, dimension drawing) and return it for VISUAL reading. Use when specs live in a picture, not text — read model numbers, socket markings, dimensions, connector layouts straight off the image. Also the fallback when a listing's only detail is photos.",
+		Description: "Download an image and return it for VISUAL reading — read model numbers, socket markings, dimensions, connector layouts straight off a picture; also the fallback when a listing's only detail is photos. Set text=true when the image is mostly text/a document (label, spec sheet, screenshot, scan) to send the fewest possible bytes at full legibility. Images are auto-downscaled to vision-optimal size.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in imageIn) (*mcp.CallToolResult, imageMeta, error) {
-		data, mime, err := fetchImage(ctx, in.URL, in.Color)
+		mode := modeAuto
+		switch {
+		case in.Text:
+			mode = modeText
+		case in.Color:
+			mode = modeColor
+		}
+		data, mime, err := fetchImage(ctx, in.URL, mode)
 		if err != nil {
 			return nil, imageMeta{}, err
 		}

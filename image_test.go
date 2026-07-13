@@ -29,9 +29,17 @@ func TestEncoderSelection(t *testing.T) {
 	}
 	var docBuf bytes.Buffer
 	jpeg.Encode(&docBuf, doc, &jpeg.Options{Quality: 82})
-	_, mime := optimizeImage(docBuf.Bytes(), "image/jpeg", false)
+	autoBytes, mime := optimizeImage(docBuf.Bytes(), "image/jpeg", modeAuto)
 	if mime != "image/png" {
-		t.Errorf("text page should encode as PNG (smaller+lossless), got %s", mime)
+		t.Errorf("text page (auto) should encode as PNG (smaller+lossless), got %s", mime)
+	}
+	// text mode must be no bigger than auto — binarization is the fewest bytes.
+	textBytes, tmime := optimizeImage(docBuf.Bytes(), "image/jpeg", modeText)
+	if tmime != "image/png" {
+		t.Errorf("text mode should be PNG, got %s", tmime)
+	}
+	if len(textBytes) > len(autoBytes) {
+		t.Errorf("text mode (%d B) should be <= auto (%d B)", len(textBytes), len(autoBytes))
 	}
 
 	// Photo-like: full-frame random noise — JPEG must win.
@@ -43,7 +51,7 @@ func TestEncoderSelection(t *testing.T) {
 	}
 	var pBuf bytes.Buffer
 	jpeg.Encode(&pBuf, photo, &jpeg.Options{Quality: 90})
-	_, mime = optimizeImage(pBuf.Bytes(), "image/jpeg", true)
+	_, mime = optimizeImage(pBuf.Bytes(), "image/jpeg", modeColor)
 	if mime != "image/jpeg" {
 		t.Errorf("noisy photo should encode as JPEG, got %s", mime)
 	}
