@@ -146,7 +146,35 @@ func liveCheckAll(ctx context.Context, ls []Listing) {
 	wg.Wait()
 }
 
+// aliveCache: don't re-probe the same URL on every shop_spec/compare_specs
+// call. 10 min TTL keeps "fresh as fuck" while not hammering shops.
+var (
+	aliveMu    sync.Mutex
+	aliveCache = map[string]aliveEntry{}
+)
+
+type aliveEntry struct {
+	alive bool
+	at    time.Time
+}
+
+const aliveTTL = 10 * time.Minute
+
 func urlAlive(ctx context.Context, u string) bool {
+	aliveMu.Lock()
+	if e, ok := aliveCache[u]; ok && time.Since(e.at) < aliveTTL {
+		aliveMu.Unlock()
+		return e.alive
+	}
+	aliveMu.Unlock()
+	alive := probeURL(ctx, u)
+	aliveMu.Lock()
+	aliveCache[u] = aliveEntry{alive: alive, at: time.Now()}
+	aliveMu.Unlock()
+	return alive
+}
+
+func probeURL(ctx context.Context, u string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	// Try HEAD first; some servers reject it, so fall back to GET.

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/PuerkitoBio/goquery"
@@ -49,15 +50,45 @@ func search(ctx context.Context, query string, limit int) ([]SearchHit, error) {
 	return searchRegion(ctx, query, limit, detectRegion(ctx))
 }
 
+// searchCache: repeat queries within a session (deep_specs angles, shop_spec
+// re-runs) hit DDG once. 15 min TTL — fresh enough for shopping, kind enough
+// to not get throttled.
+var (
+	searchMu    sync.Mutex
+	searchCache = map[string]searchEntry{}
+)
+
+type searchEntry struct {
+	hits []SearchHit
+	at   time.Time
+}
+
+const searchTTL = 15 * time.Minute
+
 func searchRegion(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
 	if limit <= 0 {
 		limit = 10
 	}
+	key := fmt.Sprintf("%s|%d|%s", query, limit, r.DDG)
+	searchMu.Lock()
+	if e, ok := searchCache[key]; ok && time.Since(e.at) < searchTTL {
+		searchMu.Unlock()
+		hits := append([]SearchHit(nil), e.hits...) // callers may reorder
+		known, _ := store.knownVendors(r.Country)
+		rankHits(hits, r, known)
+		return hits, nil
+	}
+	searchMu.Unlock()
 	hits, err := searchDDG(ctx, query, limit, r)
 	if (err != nil || len(hits) == 0) && os.Getenv("SEARXNG_URL") != "" {
 		if sx, sxErr := searchSearXNG(ctx, query, limit, r); sxErr == nil && len(sx) > 0 {
 			hits, err = sx, nil
 		}
+	}
+	if err == nil && len(hits) > 0 {
+		searchMu.Lock()
+		searchCache[key] = searchEntry{hits: append([]SearchHit(nil), hits...), at: time.Now()}
+		searchMu.Unlock()
 	}
 	known, _ := store.knownVendors(r.Country) // learned vendor preference; nil on error is fine
 	rankHits(hits, r, known)
