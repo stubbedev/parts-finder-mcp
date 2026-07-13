@@ -73,6 +73,30 @@ func TestPriceHistory(t *testing.T) {
 	}
 }
 
+// Compat rules persist and round-trip (the overlay source).
+func TestRulesRoundTrip(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := CompatRule{Name: "x", Kind: "match", CatA: "a", AttrA: "p",
+		CatB: "b", AttrB: "q", Mode: "eq", Note: "why", SourceURL: "https://x"}
+	if err := st.saveRule(in); err != nil {
+		t.Fatal(err)
+	}
+	in.Disabled = true
+	if err := st.saveRule(in); err != nil { // upsert
+		t.Fatal(err)
+	}
+	rs, err := st.loadRules()
+	if err != nil || len(rs) != 1 {
+		t.Fatalf("want 1 rule, got %v (%v)", rs, err)
+	}
+	if !rs[0].Disabled || rs[0].SourceURL != "https://x" || rs[0].Mode != "eq" {
+		t.Errorf("round-trip lost fields: %+v", rs[0])
+	}
+}
+
 // VAT/stock/qty listing fields round-trip through SQLite (nullable columns).
 func TestListingFieldsRoundTrip(t *testing.T) {
 	st, err := openStore(":memory:")

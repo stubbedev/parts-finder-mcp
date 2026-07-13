@@ -34,6 +34,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("open store %s: %v", dbPath, err)
 	}
+	// Apply persisted rule additions/overrides/disables on top of builtins.
+	if rs, err := store.loadRules(); err == nil {
+		setRuleOverlay(rs)
+	}
 
 	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: version}, nil)
 	// A panic in any tool handler would otherwise crash the whole server — the
@@ -177,6 +181,11 @@ type dealsOut struct {
 type historyIn struct {
 	PartID string `json:"part_id"`
 }
+type rulesOut struct {
+	Rules           []CompatRule        `json:"rules"`
+	AttrsByCategory map[string][]string `json:"attrs_by_category"`      // extraction checklist per category
+	KnownTokens     []string            `json:"known_tokens,omitempty"` // resource-token vocabulary already in the store
+}
 type historyOut struct {
 	Observations []PriceObs `json:"observations"` // oldest first
 }
@@ -290,11 +299,16 @@ const (
 )
 
 // emptyFields lists the Part attributes that are still unknown — the deep-drill
-// checklist. Category-blind on purpose: the client knows which of these apply.
+// checklist. Two sources: the base scalar fields, plus every attribute the
+// ACTIVE compat rules read for this part's category. Rule-driven means adding
+// a rule automatically starts asking for its data — no description to
+// maintain when coverage grows.
 func emptyFields(p Part) []string {
 	var f []string
+	seen := map[string]bool{}
 	add := func(name string, empty bool) {
-		if empty {
+		if empty && !seen[name] {
+			seen[name] = true
 			f = append(f, name)
 		}
 	}
@@ -310,6 +324,10 @@ func emptyFields(p Part) []string {
 	add("watts", p.Watts == 0)
 	add("provides", len(p.Provides) == 0)
 	add("requires", len(p.Requires) == 0)
+	for _, attr := range ruleAttrsFor(p.Category) {
+		_, known := flattenStr(p, attr)
+		add(attr, !known)
+	}
 	return f
 }
 
@@ -450,7 +468,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_part",
-		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. For full build validation across ANY part type, fill provides/requires with resource tokens ('kind:variant' -> count): motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3,\"m2:2280\":2}; RAM stick requires {\"dimm:ddr5\":1}; HBA requires {\"pcie:x8\":1}; case provides {\"bay:3.5\":8}; drive requires {\"bay:3.5\":1}. Rack-scale uses the same tokens: rack provides {\"u:rack\":42}, PDU provides {\"outlet:c13\":24} and requires {\"u:rack\":1}, 2U chassis requires {\"u:rack\":2,\"outlet:c13\":2}, switch provides {\"port:sfp28\":48}, NIC requires {\"port:sfp28\":2}. The engine checks sum(requires) <= sum(provides) per token; wider pcie slots satisfy narrower cards, and sas ports satisfy sata drives (controller provides {\"port:sas\":8}, sata drive requires {\"port:sata\":1}). Attr conventions the compat engine also checks when present: mem_module (RDIMM/UDIMM/LRDIMM — on ram AND motherboard; mismatch won't boot), mem_type on cpu too (DDR4/DDR5 controller), capacity_gb per RAM stick vs motherboard mem_max_gb / dimm_max_gb, cooler height_mm + sockets (list) vs case cooler_max_mm + board socket, psu length_mm vs case psu_max_mm.",
+		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. Before extracting, call list_rules once: its attrs_by_category is the checklist of attributes the compat engine reads per category, and known_tokens is the resource-token vocabulary already in use — the rules are the source of truth, not this description. For build validation across ANY part type (from DIMM slots to rack units), fill provides/requires with 'kind:variant' -> count resource tokens (a motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3}, a RAM stick requires {\"dimm:ddr5\":1}; the same pattern covers bays, ports, PSU cables, rack u:, PDU outlets, switch ports). The engine checks sum(requires) <= sum(provides) per token, with width/superset flexibility (x16 slots take x8 cards, sas ports take sata drives). If a datasheet or vendor QVL reveals a constraint the rules miss, add it with save_rule.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, p Part) (*mcp.CallToolResult, savePartOut, error) {
 		if p.Category == "" {
 			return nil, savePartOut{}, fmt.Errorf("category is required")
@@ -505,7 +523,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compose_spec",
-		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' to inline a saved build (repeat for quantity) — a rack is 12x 'spec:node' plus switches/PDUs. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
+		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' to inline a saved build (repeat for quantity) — a rack is 12x 'spec:node' plus switches/PDUs. The rules applied are data: list_rules shows them, save_rule extends them. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, Spec, error) {
 		partIDs, _, err := store.expandSpecIDs(in.PartIDs, nil)
 		if err != nil {
@@ -579,6 +597,66 @@ func registerTools(s *mcp.Server) {
 			}
 		}
 		return nil, out, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "list_rules",
+		Description: "The compat engine's SOURCE OF TRUTH: every active rule (builtin + store-added), the attributes each category must have extracted for the rules to bite (attrs_by_category — use this as the save_part extraction checklist), and the resource-token vocabulary already in use in the store (reuse these token names for consistency). Rules compare values scraped live from the web, so NEW hardware needs no rule changes — new rules are only for new KINDS of constraint.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, rulesOut, error) {
+		out := rulesOut{Rules: currentRules(), AttrsByCategory: map[string][]string{}}
+		cats := map[string]bool{}
+		for _, r := range out.Rules {
+			cats[r.CatA] = true
+			cats[r.CatB] = true
+		}
+		for c := range cats {
+			if c == "" {
+				continue
+			}
+			if attrs := ruleAttrsFor(c); len(attrs) > 0 {
+				out.AttrsByCategory[c] = attrs
+			}
+		}
+		out.KnownTokens, _ = store.knownTokens() // best-effort vocabulary
+		return nil, out, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        "save_rule",
+		Description: "Add, override (same name), or disable (disabled=true) a compatibility rule — rules are data, not code. Use when a datasheet, manual, or vendor QVL/support page reveals a constraint the engine misses: kind=match for must-be-equal attributes (mode 'in' for X-in-list like cooler sockets), kind=capacity for numeric limits (mode sum = all instances together, each = per instance), kind=superset when one resource token satisfies another (attr_a=wider satisfies attr_b=narrower, like port:sas -> port:sata). Cite source_url. deep_specs automatically starts requesting the rule's attributes for affected categories.",
+	}, func(_ context.Context, _ *mcp.CallToolRequest, r CompatRule) (*mcp.CallToolResult, savePartOut, error) {
+		if r.Name == "" {
+			return nil, savePartOut{}, fmt.Errorf("name is required")
+		}
+		switch r.Kind {
+		case "match":
+			if r.Mode == "" {
+				r.Mode = "eq"
+			}
+			if (r.Mode != "eq" && r.Mode != "in") || r.CatA == "" || r.AttrA == "" || r.CatB == "" || r.AttrB == "" {
+				return nil, savePartOut{}, fmt.Errorf("match rule needs cat_a/attr_a/cat_b/attr_b and mode eq|in")
+			}
+		case "capacity":
+			if (r.Mode != "sum" && r.Mode != "each") || r.CatA == "" || r.AttrA == "" || r.CatB == "" || r.AttrB == "" {
+				return nil, savePartOut{}, fmt.Errorf("capacity rule needs cat_a/attr_a (limit), cat_b/attr_b (usage) and mode sum|each")
+			}
+		case "superset":
+			if r.AttrA == "" || r.AttrB == "" {
+				return nil, savePartOut{}, fmt.Errorf("superset rule needs attr_a (wider token) and attr_b (narrower token)")
+			}
+		default:
+			if !r.Disabled {
+				return nil, savePartOut{}, fmt.Errorf("kind must be match, capacity, or superset")
+			}
+			// Disabling an existing (e.g. builtin) rule: kind may be omitted.
+		}
+		if err := store.saveRule(r); err != nil {
+			return nil, savePartOut{}, err
+		}
+		if rs, err := store.loadRules(); err == nil {
+			setRuleOverlay(rs) // rules apply immediately, not on next restart
+		}
+		return nil, savePartOut{ID: r.Name}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -853,7 +931,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "deep_specs",
-		Description: "Deep-drill a part's specifications: multi-angle web search (spec page, datasheet PDF, manual), fetch the top sources (tables preserved), and report which Part fields are still empty. Use the returned source texts to fill EVERY attribute + provides/requires, then save_part. Re-run with extra queries if fields stay empty.",
+		Description: "Deep-drill a part's specifications: multi-angle web search (spec page, datasheet PDF, manual; motherboards also get a CPU-support/QVL angle — the vendor's own compatibility list is the authoritative source), fetch the top sources (tables preserved), and report which fields are still empty. empty_fields is generated from the ACTIVE compat rules, so it always asks for exactly what the engine can check. Use the returned source texts to fill EVERY listed attribute + provides/requires, then save_part. If a source states a constraint the rules can't express, save_rule it. Re-run with extra queries if fields stay empty.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in deepIn) (*mcp.CallToolResult, deepOut, error) {
 		parts, err := store.getParts([]string{in.PartID})
 		if err != nil {
@@ -870,6 +948,11 @@ func registerTools(s *mcp.Server) {
 				name + " specifications",
 				name + " datasheet pdf",
 				name + " " + p.Category + " manual",
+			}
+			// A board's own CPU-support/QVL page is the authoritative compat
+			// source — no API for this exists; the vendor page IS the API.
+			if p.Category == "motherboard" {
+				queries = append([]string{name + " cpu support list qvl"}, queries...)
 			}
 		}
 		region := detectRegion(ctx)

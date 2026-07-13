@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -67,92 +68,196 @@ func first(ps []Part) (Part, bool) {
 	return ps[0], true
 }
 
-// matchRules: attribute pairs that must be EQUAL between two categories when
-// BOTH sides declare them (unknown = gap, never a violation). Data, not code —
-// extend coverage by adding a row. Values are read through flatten (scalar
-// fields and free-form attrs alike) and compared normalized ("DDR-5"=="ddr5").
-// mode "eq" is exact equality; "in" means A's value must appear among B's
-// comma/space-separated tokens (e.g. a cooler's supported-sockets list).
-var matchRules = []struct {
-	catA, attrA, catB, attrB, ruleName, mode string
-}{
-	{"cpu", "socket", "motherboard", "socket", "cpu_socket", "eq"},
-	{"ram", "mem_type", "motherboard", "mem_type", "ram_mem_type", "eq"},
-	{"cpu", "mem_type", "motherboard", "mem_type", "cpu_mem_type", "eq"},
+// CompatRule is one data-driven compatibility predicate. Rules are DATA, not
+// code: the builtin set below seeds coverage, and the store can add, override
+// (same name), or disable any rule via save_rule — e.g. after a datasheet or
+// vendor QVL page reveals a constraint the engine lacks. Kinds:
+//
+//	match    — attr_a on cat_a must equal (mode "eq") or appear among the
+//	           comma/space-separated tokens of (mode "in") attr_b on cat_b
+//	capacity — attr_b usage on cat_b must fit the attr_a limit on cat_a;
+//	           mode "sum" checks all instances together (memory capacity),
+//	           mode "each" checks every instance alone (physical clearance)
+//	superset — resource token attr_a satisfies requests for token attr_b
+//	           (standards facts: "port:sas" satisfies "port:sata")
+//
+// Attributes resolve through flatten — scalar Part fields and free-form attrs
+// alike. Unknown values on either side = gap territory, never a violation.
+type CompatRule struct {
+	Name      string `json:"name" jsonschema:"unique rule id; reusing a builtin name overrides it"`
+	Kind      string `json:"kind" jsonschema:"match, capacity, or superset"`
+	CatA      string `json:"cat_a,omitempty" jsonschema:"category holding attr_a (the limit holder for capacity rules)"`
+	AttrA     string `json:"attr_a,omitempty" jsonschema:"attribute on cat_a; for superset rules the WIDER resource token"`
+	CatB      string `json:"cat_b,omitempty" jsonschema:"category holding attr_b (the consumer for capacity rules)"`
+	AttrB     string `json:"attr_b,omitempty" jsonschema:"attribute on cat_b; for superset rules the NARROWER resource token"`
+	Mode      string `json:"mode,omitempty" jsonschema:"match: eq (default) or in; capacity: sum or each"`
+	Note      string `json:"note,omitempty" jsonschema:"why this rule exists — cite what the source says"`
+	SourceURL string `json:"source_url,omitempty" jsonschema:"page that documents the constraint (datasheet, QVL, manual)"`
+	Disabled  bool   `json:"disabled,omitempty" jsonschema:"true switches the rule off (works on builtins too)"`
+	Builtin   bool   `json:"builtin,omitempty"` // seeded rule (output only)
+}
+
+// builtinRules seeds the engine. Everything here is a STANDARDS fact (socket
+// equality, DDR generations, size ladders, SAS⊃SATA) — stable across hardware
+// releases, since rules compare values scraped live from the web. Per-model
+// quirks belong in store rules with a source_url, not here.
+var builtinRules = []CompatRule{
+	{Name: "cpu_socket", Kind: "match", CatA: "cpu", AttrA: "socket", CatB: "motherboard", AttrB: "socket", Mode: "eq"},
+	{Name: "ram_mem_type", Kind: "match", CatA: "ram", AttrA: "mem_type", CatB: "motherboard", AttrB: "mem_type", Mode: "eq"},
+	{Name: "cpu_mem_type", Kind: "match", CatA: "cpu", AttrA: "mem_type", CatB: "motherboard", AttrB: "mem_type", Mode: "eq"},
 	// RDIMM/UDIMM/LRDIMM: registered DIMMs on an unbuffered board (or vice
 	// versa) simply won't boot — the classic used-server-RAM trap.
-	{"ram", "mem_module", "motherboard", "mem_module", "ram_module_type", "eq"},
-	{"motherboard", "socket", "cooler", "sockets", "cooler_socket", "in"},
+	{Name: "ram_module_type", Kind: "match", CatA: "ram", AttrA: "mem_module", CatB: "motherboard", AttrB: "mem_module", Mode: "eq"},
+	{Name: "cooler_socket", Kind: "match", CatA: "motherboard", AttrA: "socket", CatB: "cooler", AttrB: "sockets", Mode: "in"},
+	{Name: "mem_capacity", Kind: "capacity", CatA: "motherboard", AttrA: "mem_max_gb", CatB: "ram", AttrB: "capacity_gb", Mode: "sum"},
+	{Name: "dimm_capacity", Kind: "capacity", CatA: "motherboard", AttrA: "dimm_max_gb", CatB: "ram", AttrB: "capacity_gb", Mode: "each"},
+	{Name: "gpu_length", Kind: "capacity", CatA: "case", AttrA: "length_mm", CatB: "gpu", AttrB: "length_mm", Mode: "each"},
+	{Name: "cooler_height", Kind: "capacity", CatA: "case", AttrA: "cooler_max_mm", CatB: "cooler", AttrB: "height_mm", Mode: "each"},
+	{Name: "psu_length", Kind: "capacity", CatA: "case", AttrA: "psu_max_mm", CatB: "psu", AttrB: "length_mm", Mode: "each"},
+	// NOT bay:2.5 <- bay:3.5: that needs an adapter tray — hiding it would
+	// silently swallow a real purchase; let it surface as a need instead.
+	{Name: "sas_satisfies_sata", Kind: "superset", AttrA: "port:sas", AttrB: "port:sata"},
 }
 
-// capacityRules: numeric limits one category imposes on another, as data.
-// mode "sum": usage across ALL instances must fit the limit (memory capacity);
-// mode "each": every instance alone must fit (physical clearance). Unknown on
-// either side = no check (gap territory), never a violation.
-var capacityRules = []struct {
-	limCat, limAttr, useCat, useAttr, ruleName, mode string
-}{
-	{"motherboard", "mem_max_gb", "ram", "capacity_gb", "mem_capacity", "sum"},
-	{"motherboard", "dimm_max_gb", "ram", "capacity_gb", "dimm_capacity", "each"},
-	{"case", "length_mm", "gpu", "length_mm", "gpu_length", "each"},
-	{"case", "cooler_max_mm", "cooler", "height_mm", "cooler_height", "each"},
-	{"case", "psu_max_mm", "psu", "length_mm", "psu_length", "each"},
+// ruleOverlay holds store-persisted rules (added, overridden, or disabled),
+// keyed by name. Guarded because tool handlers run concurrently.
+var (
+	rulesMu     sync.RWMutex
+	ruleOverlay = map[string]CompatRule{}
+)
+
+func setRuleOverlay(rs []CompatRule) {
+	m := make(map[string]CompatRule, len(rs))
+	for _, r := range rs {
+		m[r.Name] = r
+	}
+	rulesMu.Lock()
+	ruleOverlay = m
+	rulesMu.Unlock()
 }
 
-// attrRuleViolations evaluates the two data tables above over a build.
-func attrRuleViolations(byCat map[string][]Part) []Violation {
-	var vs []Violation
-	for _, r := range matchRules {
-		for _, a := range byCat[r.catA] {
-			av, aok := flattenStr(a, r.attrA)
-			if !aok {
+// currentRules is the effective rule set: builtins, overridden by any store
+// rule with the same name, plus store-only rules; disabled rules dropped.
+func currentRules() []CompatRule {
+	rulesMu.RLock()
+	defer rulesMu.RUnlock()
+	var out []CompatRule
+	seen := map[string]bool{}
+	for _, b := range builtinRules {
+		b.Builtin = true
+		seen[b.Name] = true
+		if o, ok := ruleOverlay[b.Name]; ok {
+			if o.Disabled {
 				continue
 			}
-			for _, b := range byCat[r.catB] {
-				bv, bok := flattenStr(b, r.attrB)
-				if !bok {
-					continue
-				}
-				ok := normFF(av) == normFF(bv)
-				if r.mode == "in" {
-					ok = tokensContain(bv, av)
-				}
-				if !ok {
-					vs = append(vs, Violation{r.ruleName, []string{a.ID, b.ID},
-						fmt.Sprintf("%s %s=%q incompatible with %s %s=%q", a.ID, r.attrA, av, b.ID, r.attrB, bv)})
-				}
-			}
+			o.Builtin = true // overridden builtin keeps the badge
+			out = append(out, o)
+			continue
+		}
+		out = append(out, b)
+	}
+	for name, o := range ruleOverlay {
+		if !seen[name] && !o.Disabled {
+			out = append(out, o)
 		}
 	}
-	for _, r := range capacityRules {
-		lim, ok := first(byCat[r.limCat])
-		if !ok {
-			continue
+	return out
+}
+
+// currentSupersets derives the token-satisfaction map from superset rules.
+func currentSupersets() map[string][]string {
+	m := map[string][]string{}
+	for _, r := range currentRules() {
+		if r.Kind == "superset" && r.AttrA != "" && r.AttrB != "" {
+			m[strings.ToLower(r.AttrB)] = append(m[strings.ToLower(r.AttrB)], strings.ToLower(r.AttrA))
 		}
-		limV, lok := flattenNum(lim, r.limAttr)
-		if !lok {
-			continue
-		}
-		var sum float64
-		var users []string
-		for _, u := range byCat[r.useCat] {
-			uv, uok := flattenNum(u, r.useAttr)
-			if !uok {
+	}
+	return m
+}
+
+// attrRuleViolations evaluates every match/capacity rule over a build.
+func attrRuleViolations(byCat map[string][]Part) []Violation {
+	var vs []Violation
+	for _, r := range currentRules() {
+		switch r.Kind {
+		case "match":
+			for _, a := range byCat[r.CatA] {
+				av, aok := flattenStr(a, r.AttrA)
+				if !aok {
+					continue
+				}
+				for _, b := range byCat[r.CatB] {
+					bv, bok := flattenStr(b, r.AttrB)
+					if !bok {
+						continue
+					}
+					ok := normFF(av) == normFF(bv)
+					if r.Mode == "in" {
+						ok = tokensContain(bv, av)
+					}
+					if !ok {
+						vs = append(vs, Violation{r.Name, []string{a.ID, b.ID},
+							fmt.Sprintf("%s %s=%q incompatible with %s %s=%q", a.ID, r.AttrA, av, b.ID, r.AttrB, bv)})
+					}
+				}
+			}
+		case "capacity":
+			lim, ok := first(byCat[r.CatA])
+			if !ok {
 				continue
 			}
-			if r.mode == "each" && uv > limV {
-				vs = append(vs, Violation{r.ruleName, []string{u.ID, lim.ID},
-					fmt.Sprintf("%s %s=%g exceeds %s %s=%g", u.ID, r.useAttr, uv, lim.ID, r.limAttr, limV)})
+			limV, lok := flattenNum(lim, r.AttrA)
+			if !lok {
+				continue
 			}
-			sum += uv
-			users = append(users, u.ID)
-		}
-		if r.mode == "sum" && sum > limV {
-			vs = append(vs, Violation{r.ruleName, append(users, lim.ID),
-				fmt.Sprintf("total %s %g exceeds %s %s=%g", r.useAttr, sum, lim.ID, r.limAttr, limV)})
+			var sum float64
+			var users []string
+			for _, u := range byCat[r.CatB] {
+				uv, uok := flattenNum(u, r.AttrB)
+				if !uok {
+					continue
+				}
+				if r.Mode == "each" && uv > limV {
+					vs = append(vs, Violation{r.Name, []string{u.ID, lim.ID},
+						fmt.Sprintf("%s %s=%g exceeds %s %s=%g", u.ID, r.AttrB, uv, lim.ID, r.AttrA, limV)})
+				}
+				sum += uv
+				users = append(users, u.ID)
+			}
+			if r.Mode == "sum" && sum > limV {
+				vs = append(vs, Violation{r.Name, append(users, lim.ID),
+					fmt.Sprintf("total %s %g exceeds %s %s=%g", r.AttrB, sum, lim.ID, r.AttrA, limV)})
+			}
 		}
 	}
 	return vs
+}
+
+// ruleAttrsFor lists the attributes the active rules read for a category —
+// the extraction checklist deep_specs surfaces. Adding a rule automatically
+// starts asking for its attributes; no tool description to maintain.
+func ruleAttrsFor(category string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(a string) {
+		if a != "" && !seen[a] {
+			seen[a] = true
+			out = append(out, a)
+		}
+	}
+	for _, r := range currentRules() {
+		if r.Kind == "superset" {
+			continue
+		}
+		if r.CatA == category {
+			add(r.AttrA)
+		}
+		if r.CatB == category {
+			add(r.AttrB)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // flattenStr reads a part attribute as a non-empty string ("" = unknown).
@@ -283,6 +388,7 @@ func resourceViolations(parts []Part) []Violation {
 // short — the structured shopping list for the small stuff (extra cables,
 // adapters, rails). Also returns which part IDs touch each token.
 func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
+	supersets := currentSupersets()
 	provides := map[string]int{}
 	requires := map[string]int{}
 	users := map[string][]string{} // token -> part IDs involved (for the report)
@@ -321,8 +427,9 @@ func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
 			}
 		}
 		// Superset tokens: fill remaining deficit from tokens that satisfy
-		// this one by standard (SAS ports run SATA drives).
-		for _, super := range tokenSupersets[tok] {
+		// this one by standard (SAS ports run SATA drives). Derived from
+		// superset rules, so the store can teach new equivalences.
+		for _, super := range supersets[tok] {
 			if deficit == 0 {
 				break
 			}
@@ -337,15 +444,6 @@ func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
 		}
 	}
 	return deficits, users
-}
-
-// tokenSupersets maps a resource token to tokens that satisfy it by protocol
-// standard — spec facts, not vendor preference. A SATA drive plugs into a SAS
-// port/backplane; never the reverse.
-var tokenSupersets = map[string][]string{
-	// NOT bay:2.5 <- bay:3.5: that needs an adapter tray — hiding it would
-	// silently swallow a real purchase; let it surface as a need instead.
-	"port:sata": {"port:sas"},
 }
 
 // pcieWidth parses "pcie:x8" -> 8; 0 for non-pcie tokens.

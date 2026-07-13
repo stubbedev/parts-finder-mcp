@@ -194,6 +194,80 @@ func TestExtendedCombos(t *testing.T) {
 	}
 }
 
+// Rules are data: the store overlay can disable a builtin, override it, and
+// add new rules (including supersets) that apply immediately.
+func TestRulesOverlay(t *testing.T) {
+	defer setRuleOverlay(nil) // never leak overlay into other tests
+
+	cpu := Part{ID: "cpu", Category: "cpu", Socket: "SP5"}
+	mb := Part{ID: "mb", Category: "motherboard", Socket: "LGA4677"}
+	fire := func(rule string) bool {
+		for _, v := range checkCompat([]Part{cpu, mb}) {
+			if v.Rule == rule {
+				return true
+			}
+		}
+		return false
+	}
+	if !fire("cpu_socket") {
+		t.Fatal("builtin must fire before overlay")
+	}
+	// Disable the builtin.
+	setRuleOverlay([]CompatRule{{Name: "cpu_socket", Disabled: true}})
+	if fire("cpu_socket") {
+		t.Errorf("disabled builtin must not fire")
+	}
+	// Store-added rule: psu efficiency must match case airflow class (nonsense
+	// pair, but proves arbitrary attrs work).
+	setRuleOverlay([]CompatRule{{
+		Name: "custom_pair", Kind: "match",
+		CatA: "cpu", AttrA: "socket", CatB: "motherboard", AttrB: "socket", Mode: "eq",
+	}})
+	if !fire("custom_pair") {
+		t.Errorf("store-added rule must fire")
+	}
+	// Store-added superset: nvme port satisfies sata request.
+	setRuleOverlay([]CompatRule{{Name: "u2_sata", Kind: "superset", AttrA: "port:u.2", AttrB: "port:sata"}})
+	ctl := Part{ID: "bp", Category: "backplane", Provides: map[string]int{"port:u.2": 4}}
+	ssd := Part{ID: "ssd", Category: "storage", Requires: map[string]int{"port:sata": 1}}
+	if vs := resourceViolations([]Part{ctl, ssd}); len(vs) != 0 {
+		t.Errorf("store-taught superset must satisfy, got %+v", vs)
+	}
+}
+
+// The deep-drill checklist is generated from the active rules: adding a rule
+// starts asking for its attributes; no hand-maintained list.
+func TestEmptyFieldsRuleDriven(t *testing.T) {
+	defer setRuleOverlay(nil)
+	ram := Part{ID: "r", Category: "ram", MemType: "DDR5"}
+	has := func(fields []string, want string) bool {
+		for _, f := range fields {
+			if f == want {
+				return true
+			}
+		}
+		return false
+	}
+	f := emptyFields(ram)
+	if !has(f, "mem_module") || !has(f, "capacity_gb") {
+		t.Fatalf("builtin rule attrs must be requested for ram, got %v", f)
+	}
+	// New rule on a new category => its attr shows up in that category's list.
+	setRuleOverlay([]CompatRule{{
+		Name: "nic_port_speed", Kind: "match",
+		CatA: "nic", AttrA: "port_speed", CatB: "switch", AttrB: "port_speed", Mode: "eq",
+	}})
+	nic := Part{ID: "n", Category: "nic"}
+	if f := emptyFields(nic); !has(f, "port_speed") {
+		t.Errorf("rule-added attr must appear in checklist, got %v", f)
+	}
+	// A filled attr disappears from the checklist.
+	ram.Attrs = map[string]any{"mem_module": "RDIMM"}
+	if f := emptyFields(ram); has(f, "mem_module") {
+		t.Errorf("known attr must not be listed, got %v", f)
+	}
+}
+
 // Dual-PSU: capacity is the SUM of PSU outputs; losing N+1 (largest PSU alone
 // can't carry the load) is a gap, not a violation.
 func TestMultiPSU(t *testing.T) {

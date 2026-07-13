@@ -72,6 +72,8 @@ filter.
 | `fetch_image(url)` | download + downscale an image (jpeg/png/gif/webp/bmp/tiff) → vision block for reading specs/labels/diagrams off pictures |
 | `export_spec(spec_ids[], path?, append?)` | polished .xlsx: per-spec sheet (parts, live prices, buy links, owned-vs-buy totals) + Compare sheet; `append` edits an existing workbook in place; prompts for a save location when `path` is omitted |
 | `save_part(Part)` | persist a part: scalars + provides/requires + free-form `attrs` |
+| `list_rules()` | compat source of truth: active rules, per-category attr checklist, learned token vocabulary |
+| `save_rule(Rule)` | add/override/disable a compat rule at runtime (match / capacity / superset), cite `source_url` |
 | `query_parts(ids? \| category?, where[]?)` | query parts by any attribute: `cuda_compute >= 8.9`, `l3_cache_mb >= 256`; ops eq/ne/gt/gte/lt/lte/contains/exists |
 | `compose_spec(part_ids[])` | build report: compat over known data, loud gaps, needs, total TDP |
 | `save_spec(id, name?, part_ids[])` / `load_spec(id?)` | persist/recall builds; `load_spec` without id lists all |
@@ -96,18 +98,30 @@ surface as gaps, never as false incompatibilities.
 go test ./...
 ```
 
-Compat rules are data tables, not per-pair code. Match rules (must be equal
-when both sides declare): cpu/mobo socket, ram/mobo + cpu/mobo memory gen,
-ram/mobo module type (RDIMM/UDIMM/LRDIMM — the used-server-RAM boot killer),
-cooler supported-sockets list vs board. Capacity rules (numeric limits):
-total/per-DIMM memory capacity vs board max, GPU length / cooler height / PSU
-length vs case clearances. Bespoke rules: PSU headroom (×1.3, summed across
-PSUs — dual-PSU servers count both; losing N+1 redundancy is a gap),
-motherboard form factor vs case, GPU power connectors vs PSU. RAM faster than
-the board's max flags a downclock gap (paid-for headroom, not a failure).
-Port tokens know protocol supersets: SAS ports satisfy SATA drives, never the
-reverse. Unknown attributes are always treated as gaps, never violations.
-Extending coverage = adding a table row.
+Compat rules are **data, not code** — and not tool-description prose either.
+`list_rules` is the source of truth: every active rule, the per-category
+attribute checklist the client should extract (`attrs_by_category`), and the
+resource-token vocabulary already in the store. `save_rule` adds, overrides,
+or disables rules at runtime — when a datasheet/manual/QVL page reveals a
+constraint the engine misses, the client records it (with `source_url`) and
+it applies immediately; `deep_specs`' `empty_fields` is generated from the
+active rules, so new rules automatically start requesting their data. No
+description maintenance when coverage grows.
+
+Rule kinds: `match` (attributes must be equal — or appear in a token list,
+e.g. cooler supported sockets), `capacity` (numeric limits, summed or
+per-instance), `superset` (one resource token satisfies another). Builtin
+seeds are standards facts only — socket equality, DDR generations,
+RDIMM/UDIMM module type, size clearances, SAS⊃SATA — which don't churn with
+hardware releases: rules compare values scraped live, so a brand-new socket
+needs zero changes. Bespoke rules stay in code where data can't express them:
+PSU headroom (×1.3, summed across PSUs; losing N+1 is a gap), form factor
+ladder, GPU power connectors, RAM downclock gap. There is no public
+compatibility API (PCPartPicker: closed; TechPowerUp: commercial license);
+the authoritative free source is each vendor's QVL/support page, which
+`deep_specs` now searches for motherboards ("cpu support list qvl") through
+the normal fetch pipeline. Unknown attributes are always gaps, never
+violations.
 
 Business-buyer pricing: listings carry a VAT basis (`vat_included` +
 `vat_rate`) — consumer shops list incl VAT, B2B resellers ex VAT, and comparing

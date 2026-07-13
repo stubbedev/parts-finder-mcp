@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +36,10 @@ CREATE TABLE IF NOT EXISTS content_cache (
 CREATE TABLE IF NOT EXISTS listings (
   id TEXT PRIMARY KEY, part_id TEXT, vendor TEXT, price REAL, shipping REAL,
   currency TEXT, condition TEXT, url TEXT, ships_to TEXT, seen_at TEXT
+);
+CREATE TABLE IF NOT EXISTS compat_rules (
+  name TEXT PRIMARY KEY, kind TEXT, cat_a TEXT, attr_a TEXT, cat_b TEXT,
+  attr_b TEXT, mode TEXT, note TEXT, source_url TEXT, disabled INT
 );
 CREATE TABLE IF NOT EXISTS listing_history (
   listing_id TEXT, part_id TEXT, vendor TEXT, price REAL, shipping REAL,
@@ -416,6 +421,73 @@ func (s *Store) expand(ids []string, visiting map[string]bool) (parts, owned []s
 		owned = append(owned, soo...)
 	}
 	return parts, owned, nil
+}
+
+// saveRule upserts a store compat rule (added, overridden, or disabled).
+func (s *Store) saveRule(r CompatRule) error {
+	_, err := s.db.Exec(`INSERT INTO compat_rules
+  (name,kind,cat_a,attr_a,cat_b,attr_b,mode,note,source_url,disabled)
+  VALUES (?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,cat_a=excluded.cat_a,
+  attr_a=excluded.attr_a,cat_b=excluded.cat_b,attr_b=excluded.attr_b,
+  mode=excluded.mode,note=excluded.note,source_url=excluded.source_url,
+  disabled=excluded.disabled`,
+		r.Name, r.Kind, r.CatA, r.AttrA, r.CatB, r.AttrB, r.Mode, r.Note,
+		r.SourceURL, boolInt(r.Disabled))
+	return err
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func (s *Store) loadRules() ([]CompatRule, error) {
+	rows, err := s.db.Query(`SELECT name,kind,cat_a,attr_a,cat_b,attr_b,mode,
+  note,source_url,disabled FROM compat_rules`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CompatRule
+	for rows.Next() {
+		var r CompatRule
+		var dis int
+		if err := rows.Scan(&r.Name, &r.Kind, &r.CatA, &r.AttrA, &r.CatB,
+			&r.AttrB, &r.Mode, &r.Note, &r.SourceURL, &dis); err != nil {
+			return nil, err
+		}
+		r.Disabled = dis == 1
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+// knownTokens returns every provides/requires resource token in the store —
+// the LEARNED vocabulary, so new parts reuse token names consistently instead
+// of relying on examples in a tool description.
+func (s *Store) knownTokens() ([]string, error) {
+	parts, err := s.partsByCategory("")
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, p := range parts {
+		for tok := range p.Provides {
+			seen[strings.ToLower(strings.TrimSpace(tok))] = true
+		}
+		for tok := range p.Requires {
+			seen[strings.ToLower(strings.TrimSpace(tok))] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for tok := range seen {
+		out = append(out, tok)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // cacheRec is a persisted fetch with its HTTP validators and age.
