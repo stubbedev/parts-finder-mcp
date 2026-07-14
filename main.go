@@ -86,14 +86,51 @@ type fetchIn struct {
 	URL    string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
 	Kind   string `json:"kind,omitempty" jsonschema:"cache freshness bucket: spec (datasheets ~30d), listing (prices ~1h), page (default ~1d)"`
 	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed lightpanda). Bot-blocked sites (403/429) escalate to this automatically"`
+	Offset int    `json:"offset,omitempty" jsonschema:"character offset into the extracted text — big documents are paginated; pass the previous call's next_offset to continue (served from cache, no re-download)"`
 }
 type fetchOut struct {
-	Title    string `json:"title"`
-	Text     string `json:"text"`
-	Cached   bool   `json:"cached"`
-	Rendered bool   `json:"rendered,omitempty"`
-	Images   int    `json:"images,omitempty"` // scanned-PDF page images returned as vision blocks
+	Title      string `json:"title"`
+	Text       string `json:"text"`
+	Cached     bool   `json:"cached"`
+	Rendered   bool   `json:"rendered,omitempty"`
+	Images     int    `json:"images,omitempty"`      // scanned-PDF page images returned as vision blocks
+	TotalChars int    `json:"total_chars"`           // full extracted-text length
+	NextOffset int    `json:"next_offset,omitempty"` // more text remains: re-call with offset=this
 }
+
+// maxFetchChars caps the text returned per fetch_content call. Clients hard-cap
+// tool-result tokens (Claude Code: 25k), and the SDK serializes structured
+// output twice on the wire (StructuredContent + TextContent JSON), so one
+// unbounded QuickSpecs PDF blows the limit. 30k chars ≈ 9k tokens ≈ 18k doubled
+// — safe margin. Full text stays cached; offset pages through it.
+const maxFetchChars = 30_000
+
+// pageText returns one page of s from byte offset off (aligned to a rune
+// boundary), the total length, and the next offset (0 = nothing left). Pages
+// prefer to break on a newline so tables aren't split mid-row.
+func pageText(s string, off int) (page string, total, next int) {
+	total = len(s)
+	off = max(off, 0)
+	for off < total && isUTF8Cont(s[off]) {
+		off++
+	}
+	if off >= total {
+		return "", total, 0
+	}
+	end := off + maxFetchChars
+	if end >= total {
+		return s[off:], total, 0
+	}
+	for end > off && isUTF8Cont(s[end]) {
+		end--
+	}
+	if i := strings.LastIndexByte(s[off:end], '\n'); i > maxFetchChars-2000 {
+		end = off + i + 1
+	}
+	return s[off:end], total, end
+}
+
+func isUTF8Cont(b byte) bool { return b&0xC0 == 0x80 }
 
 type savePartOut struct {
 	ID string `json:"id"`
@@ -430,18 +467,29 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "fetch_content",
-		Description: "Fetch a URL and return readable text (HTML tables + PDFs preserved), smartly cached. Bot-blocked sites auto-escalate to a headless browser. `kind` tunes cache freshness: \"spec\" (datasheets, ~30d), \"listing\" (prices, ~1h), or \"page\" (default, ~1d); stale entries are cheaply revalidated. Use this to read spec/listing pages, then save_part / save_listing.",
+		Description: "Fetch a URL and return readable text (HTML tables + PDFs preserved), smartly cached. Bot-blocked sites auto-escalate to a headless browser. `kind` tunes cache freshness: \"spec\" (datasheets, ~30d), \"listing\" (prices, ~1h), or \"page\" (default, ~1d); stale entries are cheaply revalidated. Big documents are PAGINATED: when next_offset is set, more text remains — re-call with offset=next_offset (served from cache) until you've seen what you need. Use this to read spec/listing pages, then save_part / save_listing.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in fetchIn) (*mcp.CallToolResult, fetchOut, error) {
 		f, cached, err := fetchCached(ctx, in.URL, in.Kind, in.Render)
 		if err != nil {
 			return nil, fetchOut{}, err
 		}
-		out := fetchOut{Title: f.Title, Text: f.Text, Cached: cached, Rendered: f.Rendered, Images: len(f.Images)}
+		text, total, next := pageText(f.Text, in.Offset)
+		if in.Offset > 0 && text == "" {
+			return nil, fetchOut{}, fmt.Errorf("offset %d is past the end of the extracted text (%d chars)", in.Offset, total)
+		}
+		if next > 0 {
+			text += fmt.Sprintf("\n\n…[document continues: showing chars %d–%d of %d — re-call fetch_content with offset=%d for the next page]", in.Offset, next, total, next)
+		}
+		out := fetchOut{Title: f.Title, Text: text, Cached: cached, Rendered: f.Rendered, Images: len(f.Images), TotalChars: total, NextOffset: next}
 		// Scanned PDF: no text layer, so return the page images as vision
 		// blocks for the model to OCR directly.
 		if len(f.Images) > 0 {
+			note := fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning %d page image(s); read the specs visually.", len(f.Images))
+			if f.ImageTotal > len(f.Images) {
+				note = fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning the %d largest of %d page images; the rest were dropped to fit — if a needed page is missing, find the document elsewhere or ask for it.", len(f.Images), f.ImageTotal)
+			}
 			res := &mcp.CallToolResult{Content: []mcp.Content{
-				&mcp.TextContent{Text: fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning %d page image(s); read the specs visually.", len(f.Images))},
+				&mcp.TextContent{Text: note},
 			}}
 			for _, img := range f.Images {
 				res.Content = append(res.Content, &mcp.ImageContent{Data: img.Data, MIMEType: img.MIME})

@@ -31,11 +31,14 @@ func TestPDFPageImages(t *testing.T) {
 		t.Fatalf("build image pdf: %v", err)
 	}
 
-	imgs := pdfPageImages(pdf.Bytes(), 5)
+	imgs, total := pdfPageImages(pdf.Bytes(), 5)
 	if len(imgs) == 0 {
 		t.Fatal("expected at least one page image from a scanned PDF")
 	}
 	if len(imgs[0].Data) == 0 {
 		t.Error("extracted image has no bytes")
+	}
+	if total < len(imgs) {
+		t.Errorf("total %d < returned %d", total, len(imgs))
 	}
 }

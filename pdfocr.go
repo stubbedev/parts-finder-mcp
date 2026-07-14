@@ -27,14 +27,15 @@ const (
 
 // pdfPageImages pulls embedded images out of a PDF (pure Go, no external
 // binaries) so a scanned datasheet with no text layer can still be read by
-// vision. Returns the largest `max` images, optimized. Best-effort: any error
-// yields nil and the caller keeps whatever text it had.
-func pdfPageImages(data []byte, max int) []DocImage {
+// vision. Returns the largest `max` images, optimized, plus the total number
+// of candidate page images so dropped pages are never silent. Best-effort:
+// any error yields nil and the caller keeps whatever text it had.
+func pdfPageImages(data []byte, max int) ([]DocImage, int) {
 	conf := model.NewDefaultConfiguration()
 	conf.ValidationMode = model.ValidationRelaxed
 	pages, err := api.ExtractImagesRaw(bytes.NewReader(data), nil, conf)
 	if err != nil {
-		return nil
+		return nil, 0
 	}
 	type cand struct {
 		data []byte
@@ -64,7 +65,7 @@ func pdfPageImages(data []byte, max int) []DocImage {
 		d, m := optimizeImage(c.data, c.mime, modeText, 0) // scanned datasheets are text — binarize for fewest bytes
 		out = append(out, DocImage{Data: d, MIME: m})
 	}
-	return out
+	return out, len(cands)
 }
 
 func pdfImageMIME(fileType string) string {

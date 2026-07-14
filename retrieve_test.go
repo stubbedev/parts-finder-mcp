@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,5 +64,47 @@ func TestDDGAnomalyDetection(t *testing.T) {
 	}
 	if isDDGAnomaly([]byte(`<html><body>plain results</body></html>`)) {
 		t.Errorf("normal page must not be flagged")
+	}
+}
+
+func TestPageText(t *testing.T) {
+	// Small text: one page, no next.
+	if p, total, next := pageText("hello", 0); p != "hello" || total != 5 || next != 0 {
+		t.Errorf("small: %q %d %d", p, total, next)
+	}
+	// Big text pages through completely with no loss and rune-safe cuts.
+	line := strings.Repeat("æøå spec row | 128 GB | DDR5 ", 40) + "\n"
+	big := strings.Repeat(line, 100)
+	var got strings.Builder
+	off, pages := 0, 0
+	for {
+		p, total, next := pageText(big, off)
+		if total != len(big) {
+			t.Fatalf("total %d != %d", total, len(big))
+		}
+		if next > 0 {
+			if len(p) > maxFetchChars {
+				t.Fatalf("page %d chars > cap", len(p))
+			}
+			if !strings.HasSuffix(p, "\n") {
+				t.Fatalf("mid-doc page must cut on newline")
+			}
+		}
+		got.WriteString(p)
+		pages++
+		if next == 0 {
+			break
+		}
+		off = next
+	}
+	if got.String() != big {
+		t.Fatalf("pages don't reassemble the document")
+	}
+	if pages < 2 {
+		t.Fatalf("big doc must paginate, got %d page(s)", pages)
+	}
+	// Past-the-end offset: empty page, total still reported.
+	if p, total, next := pageText("abc", 99); p != "" || total != 3 || next != 0 {
+		t.Errorf("past-end: %q %d %d", p, total, next)
 	}
 }

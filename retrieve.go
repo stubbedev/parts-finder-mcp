@@ -561,6 +561,7 @@ type Fetched struct {
 	LastModified string
 	Rendered     bool
 	Images       []DocImage // scanned-PDF page images for visual OCR (not cached)
+	ImageTotal   int        // page images found in the document (>len(Images) = some dropped)
 }
 
 func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
@@ -613,8 +614,8 @@ func extractResponse(resp *http.Response, rawURL string) (Fetched, error) {
 		// Scanned/image-only PDF (no usable text layer): fall back to page
 		// images so vision can OCR the datasheet.
 		if len(strings.Fields(x)) < scannedWordThreshold || len(strings.TrimSpace(x)) < scannedTextThreshold {
-			if imgs := pdfPageImages(raw, 5); len(imgs) > 0 {
-				f.Images = imgs
+			if imgs, total := pdfPageImages(raw, 5); len(imgs) > 0 {
+				f.Images, f.ImageTotal = imgs, total
 			}
 		}
 		return f, nil
