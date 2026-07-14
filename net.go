@@ -224,9 +224,16 @@ func gateFor(host string) *hostGate {
 	return g
 }
 
+// gateMaxWait bounds how long one request queues behind others for the same
+// host. A pile-up past this is pathological (dozens of callers on one host);
+// failing loudly beats an invisible multi-minute queue.
+const gateMaxWait = 20 * time.Second
+
 func (g *hostGate) acquire(ctx context.Context) error {
 	select {
 	case g.sem <- struct{}{}:
+	case <-time.After(gateMaxWait):
+		return fmt.Errorf("host gate: still queued after %s — too many concurrent requests to this host", gateMaxWait)
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -234,6 +241,11 @@ func (g *hostGate) acquire(ctx context.Context) error {
 	wait := time.Until(g.last.Add(perHostMinInterval))
 	if wait > 0 {
 		wait += time.Duration(rand.Int64N(int64(250 * time.Millisecond))) // jitter
+	}
+	if wait > gateMaxWait {
+		g.mu.Unlock()
+		<-g.sem
+		return fmt.Errorf("host gate: politeness queue for this host is %s deep — retry later", wait.Round(time.Second))
 	}
 	g.last = time.Now().Add(maxDur(0, wait))
 	g.mu.Unlock()
@@ -259,13 +271,28 @@ func maxDur(a, b time.Duration) time.Duration {
 
 const maxAttempts = 4
 
+// retryBudget caps the TOTAL time doRequest spends on retries, backoff sleeps,
+// and gate waits for one URL. Without it, 4 attempts x (header wait +
+// Retry-After sleeps) legally accumulates to minutes — the classic "fetch
+// hang" that looks like a dead server to the client. The budget bounds the
+// retry loop only, never an in-flight body read.
+const retryBudget = 45 * time.Second
+
 // doRequest performs a throttled, fingerprinted, retrying GET. extra headers
 // (e.g. Referer, Accept overrides) win over the defaults. The returned
 // response's Body is open — caller closes it.
 func doRequest(ctx context.Context, method, rawURL string, extra map[string]string) (*http.Response, error) {
+	return doRequestN(ctx, method, rawURL, extra, maxAttempts)
+}
+
+// doRequestN is doRequest with an explicit attempt cap — attempts=1 makes a
+// single-shot probe that can't accumulate backoff sleeps.
+func doRequestN(ctx context.Context, method, rawURL string, extra map[string]string, attempts int) (*http.Response, error) {
 	refreshFingerprints() // once per process, before the first fingerprinted request
+	start := time.Now()
+	overBudget := func() bool { return time.Since(start) > retryBudget }
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for attempt := 0; attempt < attempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
 		if err != nil {
 			return nil, err
@@ -283,15 +310,15 @@ func doRequest(ctx context.Context, method, rawURL string, extra map[string]stri
 		g.release()
 		if err != nil {
 			lastErr = err
-			if attempt == maxAttempts-1 { // out of attempts — don't sleep for nothing
-				return nil, err
+			if attempt == attempts-1 || overBudget() {
+				return nil, fmt.Errorf("%w (gave up after %s)", err, time.Since(start).Round(time.Second))
 			}
 			if !sleepBackoff(ctx, attempt, 0) {
 				return nil, err
 			}
 			continue
 		}
-		if isRetryable(resp.StatusCode) && attempt < maxAttempts-1 {
+		if isRetryable(resp.StatusCode) && attempt < attempts-1 && !overBudget() {
 			ra := retryAfter(resp)
 			drainClose(resp.Body) // drained body returns the connection to the pool — reconnecting mid-throttle is a bot tell
 			if !sleepBackoff(ctx, attempt, ra) {

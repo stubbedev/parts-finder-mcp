@@ -50,7 +50,9 @@ func newHTTPClient() *http.Client {
 // working http:// page).
 func get(ctx context.Context, u string) (*http.Response, error) {
 	if strings.HasPrefix(u, "http://") {
-		if resp, err := doRequest(ctx, http.MethodGet, "https://"+strings.TrimPrefix(u, "http://"), nil); err == nil {
+		// The upgrade is a PROBE: one attempt, no retry accumulation — a host
+		// with no TLS must not burn the retry budget before the http fallback.
+		if resp, err := doRequestN(ctx, http.MethodGet, "https://"+strings.TrimPrefix(u, "http://"), nil, 1); err == nil {
 			if resp.StatusCode < 400 {
 				return resp, nil
 			}
@@ -278,8 +280,12 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 }
 
 // fetchSearchPage GETs a search-results URL and returns the body, translating
-// throttle statuses and challenge pages into errRateLimited.
+// throttle statuses and challenge pages into errRateLimited. Each engine gets
+// a short budget: search is the front door, and a slow engine must cost
+// seconds before the chain moves on — not the whole request's patience.
 func fetchSearchPage(ctx context.Context, u, engineLabel string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
 	resp, err := get(ctx, u)
 	if err != nil {
 		return nil, err
