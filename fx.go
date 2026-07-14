@@ -56,6 +56,9 @@ func ratesFor(ctx context.Context, base string) (map[string]float64, error) {
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, err
 	}
+	if body.Rates == nil { // 200 with no rates (unknown base) — nil-map write would panic
+		return nil, fmt.Errorf("frankfurter returned no rates for %s", base)
+	}
 	body.Rates[base] = 1 // base->base
 	fxMu.Lock()
 	fxCache[base] = rateSet{rates: body.Rates, fetched: time.Now()}

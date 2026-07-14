@@ -68,14 +68,15 @@ func fitScale(w, h, maxEdge int, maxPixels float64) float64 {
 }
 
 // capsFor picks the pixel caps for a mode, honouring an explicit long-edge
-// override (0 = mode default). A smaller override also tightens the area cap so
-// the model can shrink a sparse label hard, or loosen it for a dense table.
+// override in BOTH directions (0 = mode default): shrink hard for a sparse
+// label, or raise past the mode default for a dense table — the tool schema
+// promises both, so the override always wins over the default caps.
 func capsFor(mode string, override int) (edge int, pixels float64) {
 	edge, pixels = maxImageEdge, maxImagePixels
 	if mode == modeText {
 		edge, pixels = maxTextEdge, maxTextPixels
 	}
-	if override > 0 && override < edge {
+	if override > 0 {
 		edge = override
 		pixels = float64(edge) * float64(edge) // allow up to a square at that edge
 	}

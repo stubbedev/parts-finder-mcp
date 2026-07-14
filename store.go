@@ -88,7 +88,7 @@ ON CONFLICT(id) DO UPDATE SET category=excluded.category,vendor=excluded.vendor,
 		p.ID, p.Category, p.Vendor, p.Model, p.Socket, p.MemType, p.MemSpeed,
 		p.FormFactor, p.TDPW, p.PCIeGen, p.PCIeLanes, string(conns), p.LengthMM,
 		p.Watts, string(prov), string(req), string(attrs), p.RawSpecs, p.SourceURL,
-		p.FetchedAt.Format(time.RFC3339))
+		utcRFC3339(p.FetchedAt))
 	return err
 }
 
@@ -206,7 +206,7 @@ ON CONFLICT(id) DO UPDATE SET part_id=excluded.part_id,vendor=excluded.vendor,
   vat_rate=excluded.vat_rate,qty_available=excluded.qty_available,
   in_stock=excluded.in_stock,lead_days=excluded.lead_days`,
 		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency, l.Condition,
-		l.URL, string(ships), l.SeenAt.Format(time.RFC3339),
+		l.URL, string(ships), utcRFC3339(l.SeenAt),
 		nullBool(l.VATIncluded), l.VATRate, l.QtyAvailable, nullBool(l.InStock), l.LeadDays)
 	if err != nil {
 		return err
@@ -230,8 +230,13 @@ func (s *Store) recordHistory(l Listing) {
   (listing_id,part_id,vendor,price,shipping,currency,seen_at)
   VALUES (?,?,?,?,?,?,?)`,
 		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency,
-		l.SeenAt.Format(time.RFC3339))
+		utcRFC3339(l.SeenAt))
 }
+
+// utcRFC3339 renders a timestamp for storage. Always UTC: timestamps are
+// compared and ORDERed as strings, and mixed zone offsets ("Z" vs "+02:00")
+// break lexicographic time order.
+func utcRFC3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
 
 // PriceObs is one historical price observation for a listing.
 type PriceObs struct {
@@ -327,7 +332,7 @@ func (s *Store) saveSpec(id, name string, partIDs, ownedIDs []string) error {
 	_, err := s.db.Exec(`INSERT INTO specs (id,name,part_ids,owned_ids,created_at) VALUES (?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET name=excluded.name,part_ids=excluded.part_ids,
   owned_ids=excluded.owned_ids`,
-		id, name, string(ids), string(owned), time.Now().Format(time.RFC3339))
+		id, name, string(ids), string(owned), utcRFC3339(time.Now()))
 	return err
 }
 
@@ -518,12 +523,12 @@ func (s *Store) putCache(url, title, content, etag, lastMod, kind string) {
 ON CONFLICT(url) DO UPDATE SET title=excluded.title,content=excluded.content,
   etag=excluded.etag,last_modified=excluded.last_modified,kind=excluded.kind,
   fetched_at=excluded.fetched_at`,
-		url, title, content, etag, lastMod, kind, time.Now().Format(time.RFC3339))
+		url, title, content, etag, lastMod, kind, utcRFC3339(time.Now()))
 }
 
 // touchCache bumps fetched_at after a 304 — the content is still current, so
 // reset its TTL without re-storing the body.
 func (s *Store) touchCache(url string) {
 	s.db.Exec(`UPDATE content_cache SET fetched_at=? WHERE url=?`,
-		time.Now().Format(time.RFC3339), url)
+		utcRFC3339(time.Now()), url)
 }

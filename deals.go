@@ -131,7 +131,10 @@ func cheapestConverted(ctx context.Context, ls []Listing, currency string) (List
 	found := false
 	for _, l := range ls {
 		t := l.total()
-		if currency != "" && l.Currency != "" && l.Currency != currency {
+		if currency != "" && l.Currency != currency {
+			if l.Currency == "" {
+				continue // unknown currency can't be ranked against converted totals
+			}
 			c, err := convert(ctx, t, l.Currency, currency)
 			if err != nil {
 				continue // can't compare -> skip

@@ -612,7 +612,7 @@ func extractResponse(resp *http.Response, rawURL string) (Fetched, error) {
 		f.Title, f.Text = t, x
 		// Scanned/image-only PDF (no usable text layer): fall back to page
 		// images so vision can OCR the datasheet.
-		if len(strings.Fields(x)) < scannedTextThreshold/6 || len(strings.TrimSpace(x)) < scannedTextThreshold {
+		if len(strings.Fields(x)) < scannedWordThreshold || len(strings.TrimSpace(x)) < scannedTextThreshold {
 			if imgs := pdfPageImages(raw, 5); len(imgs) > 0 {
 				f.Images = imgs
 			}

@@ -26,7 +26,11 @@ func main() {
 	}
 	dbPath := os.Getenv("PARTS_DB")
 	if dbPath == "" {
-		home, _ := os.UserHomeDir()
+		home, err := os.UserHomeDir()
+		if err != nil {
+			// Silent fallback would scatter per-cwd databases.
+			log.Fatalf("cannot resolve home dir for the default db path (set PARTS_DB): %v", err)
+		}
 		dbPath = filepath.Join(home, ".parts-finder.db")
 	}
 	var err error
@@ -396,11 +400,14 @@ func exVATContribution(l Listing, display string) (float64, bool) {
 }
 
 // regionFor resolves the effective region for a call: an explicit country
-// override, else the detected region.
+// override (currency and search locale re-derived to match — a US override
+// must not keep pricing in the detected region's DKK), else the detected
+// region. display_currency remains the per-call currency override.
 func regionFor(ctx context.Context, country string) Region {
 	if country != "" {
 		r := detectRegion(ctx)
 		r.Country = strings.ToUpper(country)
+		r.Currency = currencyOf(r.Country)
 		r.DDG = ddgRegion(r.Country)
 		return r
 	}

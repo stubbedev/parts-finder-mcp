@@ -20,32 +20,37 @@ type Region struct {
 }
 
 var (
-	regionOnce sync.Once
-	regionVal  Region
+	regionMu  sync.Mutex
+	regionVal Region
+	regionSet bool
 )
 
-// detectRegion resolves the region once. Env REGION_COUNTRY / REGION_CURRENCY
-// override IP detection; if both detection and env are absent it returns an
-// empty Region (no bias, USD display fallback handled by callers).
+// detectRegion resolves the region. Env REGION_COUNTRY / REGION_CURRENCY
+// override IP detection; missing currency is derived from the country. Only a
+// SUCCESSFUL detection is cached — a failed IP lookup (offline start, short
+// first-call deadline) is retried on the next call instead of locking an
+// empty region in for the process lifetime. An empty Region means no bias and
+// a USD display fallback; it's visible in every tool's region output.
 func detectRegion(ctx context.Context) Region {
-	regionOnce.Do(func() {
-		regionVal = Region{
-			Country:  strings.ToUpper(os.Getenv("REGION_COUNTRY")),
-			Currency: strings.ToUpper(os.Getenv("REGION_CURRENCY")),
-		}
-		if regionVal.Country == "" || regionVal.Currency == "" {
-			if ipr := lookupIP(ctx); ipr.Country != "" {
-				if regionVal.Country == "" {
-					regionVal.Country = ipr.Country
-				}
-				if regionVal.Currency == "" {
-					regionVal.Currency = ipr.Currency
-				}
-			}
-		}
-		regionVal.DDG = ddgRegion(regionVal.Country)
-	})
-	return regionVal
+	regionMu.Lock()
+	defer regionMu.Unlock()
+	if regionSet {
+		return regionVal
+	}
+	r := Region{
+		Country:  strings.ToUpper(os.Getenv("REGION_COUNTRY")),
+		Currency: strings.ToUpper(os.Getenv("REGION_CURRENCY")),
+	}
+	if r.Country == "" {
+		r.Country = lookupIP(ctx).Country
+	}
+	if r.Currency == "" && r.Country != "" {
+		r.Currency = currencyOf(r.Country)
+	}
+	r.DDG = ddgRegion(r.Country)
+	regionVal = r
+	regionSet = r.Country != ""
+	return r
 }
 
 // lookupIP asks a keyless https geo-IP service for the caller's country;
@@ -83,7 +88,10 @@ var countryCurrency = map[string]string{
 	"GB": "GBP", "PL": "PLN", "CZ": "CZK", "HU": "HUF", "RO": "RON",
 	"BG": "BGN", "US": "USD", "CA": "CAD", "AU": "AUD", "NZ": "NZD",
 	"JP": "JPY", "CN": "CNY", "KR": "KRW", "IN": "INR", "BR": "BRL",
-	"MX": "MXN", "SG": "SGD", "HK": "HKD", "TW": "TWD", "TR": "TRY",
+	"MX": "MXN", "SG": "SGD", "HK": "HKD", "TR": "TRY",
+	// TW deliberately absent: frankfurter (ECB reference rates) carries no
+	// TWD, so a TWD default would make every conversion fail. TW falls back
+	// to USD; override with REGION_CURRENCY if you accept unconvertible totals.
 }
 
 func currencyOf(country string) string {

@@ -16,9 +16,14 @@ type DocImage struct {
 	MIME string
 }
 
-// scannedTextThreshold: below this many non-space chars, a PDF is treated as
-// image-only (scanned) and we fall back to page-image extraction for OCR.
-const scannedTextThreshold = 120
+// A PDF below EITHER threshold is treated as image-only (scanned) and falls
+// back to page-image extraction for OCR: fewer non-space chars than
+// scannedTextThreshold, or fewer words than scannedWordThreshold (catches
+// extractors that emit a few long junk strings).
+const (
+	scannedTextThreshold = 120
+	scannedWordThreshold = 20
+)
 
 // pdfPageImages pulls embedded images out of a PDF (pure Go, no external
 // binaries) so a scanned datasheet with no text layer can still be read by
