@@ -15,7 +15,7 @@ func TestListingsSortAndStale(t *testing.T) {
 		{ID: "b", Price: 90, Shipping: fptr(10), SeenAt: now.AddDate(0, 0, -30)}, // total 100, stale
 		{ID: "c", Price: 100, Shipping: fptr(0), SeenAt: now},                    // total 100, fresh
 	}
-	markStale(ls, now)
+	markStale(ls, now, 0)
 	sortListings(ls)
 	// cheapest total first; tie (100) broken by freshness => c before b
 	if ls[0].ID != "c" || ls[1].ID != "b" || ls[2].ID != "a" {

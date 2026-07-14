@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -15,7 +17,7 @@ type Listing struct {
 	ID        string    `json:"id,omitempty"` // derived from part+vendor+condition+url if omitted
 	PartID    string    `json:"part_id"`
 	Vendor    string    `json:"vendor,omitempty"` // seller, e.g. "ebay:seller123", "lenovo"
-	Price     float64   `json:"price"`
+	Price     float64   `json:"price" jsonschema:"PER-UNIT price as listed. A lot/bundle price recorded as one unit poisons every ranking — divide it out and set qty_available. Skip teaser 'from X' prices entirely"`
 	Shipping  *float64  `json:"shipping,omitempty" jsonschema:"shipping cost in the listing currency; 0 = FREE shipping, omit = unknown (flagged, so record 0 explicitly when the page says free)"`
 	Currency  string    `json:"currency" jsonschema:"ISO code of price/shipping — required; a price without its currency cannot be compared"`
 	Condition string    `json:"condition,omitempty"` // new, used, refurbished
@@ -36,6 +38,7 @@ type Listing struct {
 
 	// Derived on read, not stored. Deals are never dropped for these — they
 	// are flagged and sorted below usable ones, so nothing is hidden.
+	AgeDays         int     `json:"age_days,omitempty"` // days since the price was seen — judge freshness yourself, don't wait for the stale flag
 	Stale           bool    `json:"stale,omitempty"`
 	Dead            bool    `json:"dead,omitempty"`             // URL no longer reachable (live-check)
 	Unshippable     bool    `json:"unshippable,omitempty"`      // doesn't ship to the region
@@ -103,14 +106,24 @@ func (l Listing) comparisonTotal() float64 {
 	return l.effectiveTotal()
 }
 
-// stalenessDays: a listing older than this is flagged stale.
-// ponytail: fixed 14d threshold; make it a tool arg if it ever needs tuning.
+// stalenessDays: a listing older than this is flagged stale. The default —
+// hardware prices move faster than 14d, so every listing also carries AgeDays
+// and the caller can tighten via the max_age_days tool arg.
 const stalenessDays = 14
 
-func markStale(ls []Listing, now time.Time) {
-	cut := now.AddDate(0, 0, -stalenessDays)
+// markStale flags listings older than maxDays (<=0 = the 14d default) and
+// stamps every listing's age — a 13-day-old price must not read as current
+// just because it hasn't crossed the flag threshold.
+func markStale(ls []Listing, now time.Time, maxDays int) {
+	if maxDays <= 0 {
+		maxDays = stalenessDays
+	}
+	cut := now.AddDate(0, 0, -maxDays)
 	for i := range ls {
 		ls[i].Stale = ls[i].SeenAt.Before(cut)
+		if !ls[i].SeenAt.IsZero() {
+			ls[i].AgeDays = int(now.Sub(ls[i].SeenAt).Hours() / 24)
+		}
 	}
 }
 
@@ -165,6 +178,40 @@ func cheapestConverted(ctx context.Context, ls []Listing, currency string) (List
 type Substitute struct {
 	Part    Part    `json:"part"`
 	Listing Listing `json:"listing"`
+	// Cautions are pairwise differences vs the original that a same-category
+	// match can't clear on its own — extra resource demands, bigger physical
+	// footprint, higher draw. Flags, never filters: whether the build absorbs
+	// them is checked for real when spec_id is passed.
+	Cautions []string `json:"cautions,omitempty"`
+	// SpecViolations: with spec_id, the violations this candidate INTRODUCES
+	// when swapped into that build (empty = verified drop-in).
+	SpecViolations []Violation `json:"spec_violations,omitempty"`
+}
+
+// substituteCautions compares a candidate against the original on the axes a
+// category+attribute match can't see: resource demands (an extra power cable
+// the build may not have spare), physical size, and draw. Unknowns stay
+// silent — same convention as the rules.
+func substituteCautions(orig, cand Part) []string {
+	var out []string
+	for tok, n := range cand.Requires {
+		if n > orig.Requires[tok] {
+			out = append(out, fmt.Sprintf("requires %d x %q vs original's %d — the build needs that spare", n, tok, orig.Requires[tok]))
+		}
+	}
+	for tok, n := range orig.Provides {
+		if have := cand.Provides[tok]; have < n {
+			out = append(out, fmt.Sprintf("provides only %d x %q vs original's %d — something downstream may lose its slot/port", have, tok, n))
+		}
+	}
+	if orig.LengthMM > 0 && cand.LengthMM > orig.LengthMM {
+		out = append(out, fmt.Sprintf("longer than the original (%dmm vs %dmm) — clearance verified for the original may not hold", cand.LengthMM, orig.LengthMM))
+	}
+	if orig.TDPW > 0 && cand.TDPW > orig.TDPW {
+		out = append(out, fmt.Sprintf("draws %dW more than the original — recheck PSU headroom", cand.TDPW-orig.TDPW))
+	}
+	sort.Strings(out) // map iteration order must not shuffle the report
+	return out
 }
 
 // annotateDisplay fills DisplayTotal/DisplayExVAT/DisplayCurr by converting
@@ -271,18 +318,31 @@ func urlAlive(ctx context.Context, u string) bool {
 }
 
 // probeURL decides listing liveness. Principle: a deal is only dead on
-// PROOF — 404/410 from a GET, or total network failure. Bot walls answer
-// probes with 403/429/500 (eBay does all three depending on method); treating
-// those as dead would hide every marketplace deal.
+// PROOF — 404/410 from a GET, a redirect that lands on the site root (the
+// standard "listing ended" soft-404: deep item path in, homepage out), or
+// total network failure. Bot walls answer probes with 403/429/500 (eBay does
+// all three depending on method); treating those as dead would hide every
+// marketplace deal.
 func probeURL(ctx context.Context, u string) bool {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	origPath := "/"
+	if pu, err := url.Parse(u); err == nil && pu.Path != "" {
+		origPath = pu.Path
+	}
 	for _, method := range []string{http.MethodHead, http.MethodGet} {
 		resp, err := doRequest(ctx, method, u, nil)
 		if err != nil {
 			continue // try GET; both failing = network-dead below
 		}
 		resp.Body.Close()
+		// Redirect chains are followed by the client; a deep listing URL that
+		// lands on "/" is the marketplace saying "this listing is gone" with a
+		// 200. Challenge pages keep a path, so bot walls don't trip this.
+		if resp.Request != nil && resp.Request.URL != nil &&
+			len(origPath) > 1 && (resp.Request.URL.Path == "/" || resp.Request.URL.Path == "") {
+			return false
+		}
 		ok := resp.StatusCode >= 200 && resp.StatusCode < 400
 		if method == http.MethodHead && !ok {
 			continue // HEAD is unreliable (bot walls 500/403 it) — GET decides
@@ -304,6 +364,47 @@ func probeURL(ctx context.Context, u string) bool {
 		return true
 	}
 	return false // network-level failure on both methods
+}
+
+// priceOutlierFactor: a new price this many times above/below the part's
+// median recorded price smells like a unit error, not a deal.
+const priceOutlierFactor = 8
+
+// priceSanityWarning cross-checks a new listing price against the part's
+// recorded history (converted to the listing's currency, best-effort). Returns
+// a warning string for order-of-magnitude outliers — the caller saves anyway;
+// this is a "check your extraction" nudge, not a gate.
+func priceSanityWarning(ctx context.Context, l Listing) string {
+	obs, err := store.priceHistory(l.PartID)
+	if err != nil || len(obs) == 0 {
+		return ""
+	}
+	var prices []float64
+	for _, o := range obs {
+		p := o.Price
+		if o.Currency != "" && !strings.EqualFold(o.Currency, l.Currency) {
+			c, _, cerr := convert(ctx, p, o.Currency, l.Currency)
+			if cerr != nil {
+				continue
+			}
+			p = c
+		}
+		if p > 0 {
+			prices = append(prices, p)
+		}
+	}
+	if len(prices) == 0 {
+		return ""
+	}
+	sort.Float64s(prices)
+	median := prices[len(prices)/2]
+	switch {
+	case l.Price > median*priceOutlierFactor:
+		return fmt.Sprintf("price %.2f %s is >%dx the part's median recorded price (%.2f) — check for a lot/bundle price recorded as one unit or a decimal-separator misread", l.Price, l.Currency, priceOutlierFactor, median)
+	case l.Price < median/priceOutlierFactor:
+		return fmt.Sprintf("price %.2f %s is <1/%d of the part's median recorded price (%.2f) — check for a teaser/'from' price, a part-only accessory, or a decimal-separator misread", l.Price, l.Currency, priceOutlierFactor, median)
+	}
+	return ""
 }
 
 // substituteMatch reports whether candidate can drop into the same build slot as

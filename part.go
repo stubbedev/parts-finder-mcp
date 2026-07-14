@@ -118,6 +118,18 @@ var builtinRules = []CompatRule{
 	// NOT bay:2.5 <- bay:3.5: that needs an adapter tray — hiding it would
 	// silently swallow a real purchase; let it surface as a need instead.
 	{Name: "sas_satisfies_sata", Kind: "superset", AttrA: "port:sas", AttrB: "port:sata"},
+	// Rack-level physics. CatB "*" = every mounted part (any category except
+	// the limit holder): U-height and weight are properties of whatever goes
+	// in the cabinet, not of one category. Sub-builds bubble these sums up
+	// (composeTree), so a rack of 12x 'spec:node' checks against the cabinet.
+	{Name: "rack_u", Kind: "capacity", CatA: "rack", AttrA: "u_capacity", CatB: "*", AttrB: "height_u", Mode: "sum",
+		Note: "summed U-height of mounted gear must fit the cabinet's usable units"},
+	{Name: "rack_weight", Kind: "capacity", CatA: "rack", AttrA: "weight_capacity_kg", CatB: "*", AttrB: "weight_kg", Mode: "sum",
+		Note: "summed weight of mounted gear must stay under the rack's static load rating"},
+	// PDU feed vs draw: tdp_w is the draw signal every part already carries
+	// (nodes bubble their total). Trip-limit sizing, same basis as psu_headroom.
+	{Name: "pdu_power", Kind: "capacity", CatA: "pdu", AttrA: "power_capacity_w", CatB: "*", AttrB: "tdp_w", Mode: "sum",
+		Note: "summed TDP of powered gear must stay under the PDU's rated feed (e.g. 16A/230V ≈ 3680W)"},
 }
 
 // ruleOverlay holds store-persisted rules (added, overridden, or disabled),
@@ -276,7 +288,7 @@ func attrRuleViolations(byCat map[string][]Part) []Violation {
 			}
 			var sum float64
 			var users []string
-			for _, u := range byCat[r.CatB] {
+			for _, u := range consumersFor(byCat, r) {
 				uv, uok := flattenNum(u, r.AttrB)
 				if !uok {
 					continue
@@ -295,6 +307,28 @@ func attrRuleViolations(byCat map[string][]Part) []Violation {
 		}
 	}
 	return vs
+}
+
+// consumersFor resolves a capacity rule's consumer side. CatB "*" means every
+// part regardless of category — rack/PDU limits apply to whatever is mounted,
+// not one category — except the limit holders themselves (a rack doesn't
+// consume its own units). Deterministic order: category, then position.
+func consumersFor(byCat map[string][]Part, r CompatRule) []Part {
+	if r.CatB != "*" {
+		return byCat[r.CatB]
+	}
+	cats := make([]string, 0, len(byCat))
+	for c := range byCat {
+		if c != r.CatA {
+			cats = append(cats, c)
+		}
+	}
+	sort.Strings(cats)
+	var out []Part
+	for _, c := range cats {
+		out = append(out, byCat[c]...)
+	}
+	return out
 }
 
 // ruleAttrsFor lists the attributes the active rules read for a category —
@@ -322,6 +356,89 @@ func ruleAttrsFor(category string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// ruleGaps is the flip side of unknowns-never-violate: for every active rule
+// whose counterpart side IS present in the build, report the parts whose
+// missing attribute keeps the rule from biting. Rule-driven — seeding or
+// saving a new rule automatically starts flagging the data it needs; there is
+// no gap checklist to maintain by hand. Wildcard-consumer rules (CatB "*")
+// flag once when the limit is present but nothing declares the usage attr,
+// instead of spamming every part in the build.
+func ruleGaps(byCat map[string][]Part) []string {
+	var gaps []string
+	seen := map[string]bool{} // part+attr — one gap even when several rules read it
+	flag := func(id, attr, rule string) {
+		if k := id + "|" + attr; !seen[k] {
+			seen[k] = true
+			gaps = append(gaps, fmt.Sprintf("%s: %s unknown — rule %s unverified (run deep_specs)", id, attr, rule))
+		}
+	}
+	real := func(ps []Part) []Part { // synthetic sub-build aggregates aren't hardware
+		var out []Part
+		for _, p := range ps {
+			if p.Category != subSpecCategory {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	for _, r := range currentRules() {
+		switch r.Kind {
+		case "match":
+			as, bs := real(byCat[r.CatA]), real(byCat[r.CatB])
+			if len(as) == 0 || len(bs) == 0 {
+				continue
+			}
+			for _, p := range as {
+				if _, ok := flattenStr(p, r.AttrA); !ok {
+					flag(p.ID, r.AttrA, r.Name)
+				}
+			}
+			for _, p := range bs {
+				if _, ok := flattenStr(p, r.AttrB); !ok {
+					flag(p.ID, r.AttrB, r.Name)
+				}
+			}
+		case "capacity":
+			lims := real(byCat[r.CatA])
+			if len(lims) == 0 {
+				continue
+			}
+			limKnown := 0
+			for _, p := range lims {
+				if _, ok := flattenNum(p, r.AttrA); ok {
+					limKnown++
+				} else {
+					flag(p.ID, r.AttrA, r.Name)
+				}
+			}
+			if limKnown == 0 {
+				continue // limit itself unknown — already flagged above
+			}
+			cons := consumersFor(byCat, r) // includes synthetic aggregates: bubbled sums count
+			if r.CatB == "*" {
+				known := 0
+				for _, p := range cons {
+					if _, ok := flattenNum(p, r.AttrB); ok {
+						known++
+					}
+				}
+				if known == 0 && len(cons) > 0 {
+					gaps = append(gaps, fmt.Sprintf(
+						"rule %s: %s present but nothing declares %s — limit unchecked (run deep_specs on the mounted parts)",
+						r.Name, r.CatA, r.AttrB))
+				}
+				continue
+			}
+			for _, p := range real(cons) {
+				if _, ok := flattenNum(p, r.AttrB); !ok {
+					flag(p.ID, r.AttrB, r.Name)
+				}
+			}
+		}
+	}
+	return gaps
 }
 
 // flattenStr reads a part attribute as a non-empty string ("" = unknown).
@@ -733,6 +850,7 @@ type Spec struct {
 	Gaps            []string    `json:"gaps"`                             // data-quality problems: unverified/stale/unknown attributes
 	MissingForBuild []string    `json:"missing_for_full_build,omitempty"` // core categories absent — informational; a partial/upgrade spec may omit these on purpose
 	Partial         bool        `json:"partial,omitempty"`                // not a complete bootable build (missing core categories)
+	AggregateOnly   bool        `json:"aggregate_only,omitempty"`         // flat multi-node list: rules ran pooled, NOT per node — compatible=true is weaker than a nested-spec compose
 	Needs           []Need      `json:"needs,omitempty"`                  // resource shortages to shop for
 	Owned           []string    `json:"owned,omitempty"`                  // part ids already owned (not purchased)
 	TotalTDPW       int         `json:"total_tdp_w"`
@@ -779,6 +897,22 @@ const subSpecCategory = "subspec"
 // ponytail: fixed 30d; make it a tool arg if it ever needs tuning.
 const partDataMaxAge = 30 * 24 * time.Hour
 
+// drawCatsFn returns the categories LEARNED to carry tdp_w (any stored part of
+// the category declares it) — in those, a missing tdp_w means unknown draw,
+// not zero, and PSU/PDU sizing is understated. Data-driven counterpart to a
+// hardcoded "these parts draw power" list; cpu/gpu stay as the seed baseline.
+// Swapped in at startup (store-backed); the default keeps composeSpec pure for
+// tests.
+var drawCatsFn = func() map[string]bool { return nil }
+
+func drawCategories() map[string]bool {
+	m := map[string]bool{"cpu": true, "gpu": true}
+	for c := range drawCatsFn() {
+		m[c] = true
+	}
+	return m
+}
+
 func composeSpec(parts []Part) Spec {
 	byCat := groupByCategory(parts)
 	vs := checkCompat(parts)
@@ -796,16 +930,23 @@ func composeSpec(parts []Part) Spec {
 	// Rules then check in aggregate (matches accept any counterpart, capacity
 	// limits pool across nodes), which can miss a per-node overload — say so
 	// loudly instead of hiding behind a green checkmark.
+	aggregateOnly := false
 	if n := len(byCat["motherboard"]); n > 1 {
+		aggregateOnly = true
 		gaps = append(gaps, fmt.Sprintf(
-			"multi-node build (%d motherboards): compatibility checked in aggregate — verify one node alone with compose_spec on its sub-spec", n))
+			"multi-node build (%d motherboards): compatibility checked in aggregate — a per-node overload can hide in pooled limits; save each node as its own spec and compose 'spec:<node>' refs instead", n))
 	}
-	// Flag parts whose category has no wattage — undercuts PSU sizing.
+	// Flag parts whose category is known to draw power but carry no wattage —
+	// undercuts PSU/PDU sizing. Categories are learned from the store (see
+	// drawCategories), so coverage grows with the data, not with this code.
+	draw := drawCategories()
 	for _, p := range parts {
-		if (p.Category == "cpu" || p.Category == "gpu") && p.TDPW == 0 {
+		if draw[p.Category] && p.TDPW == 0 {
 			gaps = append(gaps, "unknown TDP for "+p.ID)
 		}
 	}
+	// Every active rule reports the data it's missing — see ruleGaps.
+	gaps = append(gaps, ruleGaps(byCat)...)
 	// RAM faster than the board's max isn't a failure — it downclocks — but
 	// it IS paid-for headroom you don't get. Surface it; don't violate.
 	if mb, ok := first(byCat["motherboard"]); ok && mb.MemSpeed > 0 {
@@ -866,6 +1007,7 @@ func composeSpec(parts []Part) Spec {
 		Gaps:            gaps,
 		MissingForBuild: missing,
 		Partial:         len(missing) > 0,
+		AggregateOnly:   aggregateOnly,
 		Needs:           needs,
 		TotalTDPW:       totalTDP(byCat),
 	}

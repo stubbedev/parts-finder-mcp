@@ -143,6 +143,9 @@ func fetchImage(ctx context.Context, rawURL, mode string, maxEdge int) (data []b
 	if !strings.HasPrefix(mime, "image/") {
 		return nil, "", fmt.Errorf("fetch image %s: not an image (%s)", rawURL, mime)
 	}
+	if err := checkRaster(data, mime); err != nil {
+		return nil, "", fmt.Errorf("fetch image %s: %w", rawURL, err) // SVG/XML: fail loudly, vision may silently not read it
+	}
 	data, mime = optimizeImage(data, mime, mode, maxEdge) // shrink before it hits context
 	return data, mime, nil
 }
@@ -224,30 +227,89 @@ func startCooldown(name string) {
 	fmt.Fprintf(os.Stderr, "parts-finder: search engine %s rate-limited, cooling down %s\n", name, engineCooldownFor)
 }
 
-// searchChain runs the engines in order: first one to yield hits wins.
-// Rate-limits start a cooldown and move on. Distinguishes "every engine
-// failed" (error — the caller must know search is blind) from "engines
-// answered but the query has no results" (legit empty).
+// engineProvider buckets engines that share a backend/throttle regime — a
+// fan-out wave never hits the same provider twice in parallel (hammering both
+// DDG endpoints at once would just buy a double cooldown).
+var engineProvider = map[string]string{"ddg-html": "ddg", "ddg-lite": "ddg"}
+
+// fanoutWidth: engines queried in parallel per wave. Breadth is the whole
+// point for price discovery — one engine's view of the web misses local
+// vendors another indexes — but every extra engine is rate-limit exposure.
+const fanoutWidth = 3
+
+// searchChain fans out to up to fanoutWidth healthy engines (distinct
+// providers) in PARALLEL, merges their hits (deduped by URL), and only falls
+// through to the remaining engines when a whole wave comes back empty.
+// Rate-limits start a cooldown. Distinguishes "every engine failed" (error —
+// the caller must know search is blind) from "engines answered but the query
+// has no results" (legit empty).
 func searchChain(ctx context.Context, engines []searchEngine, query string, limit int, r Region) ([]SearchHit, error) {
 	var errs []string
 	answered := false
-	for _, e := range engines {
-		if coolingDown(e.name) {
-			errs = append(errs, e.name+": cooling down")
-			continue
+	remaining := engines
+	for len(remaining) > 0 {
+		var wave, rest []searchEngine
+		used := map[string]bool{}
+		for _, e := range remaining {
+			if coolingDown(e.name) {
+				errs = append(errs, e.name+": cooling down")
+				continue
+			}
+			prov := engineProvider[e.name]
+			if prov == "" {
+				prov = e.name
+			}
+			if len(wave) < fanoutWidth && !used[prov] {
+				wave = append(wave, e)
+				used[prov] = true
+			} else {
+				rest = append(rest, e)
+			}
 		}
-		hits, err := e.fn(ctx, query, limit, r)
-		switch {
-		case errors.Is(err, errRateLimited):
-			startCooldown(e.name)
-			errs = append(errs, e.name+": rate limited")
-		case err != nil:
-			errs = append(errs, e.name+": "+err.Error())
-		case len(hits) > 0:
-			return hits, nil
-		default:
-			answered = true // engine worked, query just has no hits here
-			errs = append(errs, e.name+": 0 results")
+		remaining = rest
+		if len(wave) == 0 {
+			break
+		}
+		type engineRes struct {
+			name string
+			hits []SearchHit
+			err  error
+		}
+		results := make([]engineRes, len(wave))
+		var wg sync.WaitGroup
+		for i, e := range wave {
+			wg.Add(1)
+			go func(i int, e searchEngine) {
+				defer wg.Done()
+				hits, err := e.fn(ctx, query, limit, r)
+				results[i] = engineRes{e.name, hits, err}
+			}(i, e)
+		}
+		wg.Wait()
+		var merged []SearchHit
+		seen := map[string]bool{}
+		for _, res := range results {
+			switch {
+			case errors.Is(res.err, errRateLimited):
+				startCooldown(res.name)
+				errs = append(errs, res.name+": rate limited")
+			case res.err != nil:
+				errs = append(errs, res.name+": "+res.err.Error())
+			default:
+				answered = true
+				if len(res.hits) == 0 {
+					errs = append(errs, res.name+": 0 results")
+				}
+				for _, h := range res.hits {
+					if !seen[h.URL] {
+						seen[h.URL] = true
+						merged = append(merged, h)
+					}
+				}
+			}
+		}
+		if len(merged) > 0 {
+			return merged, nil
 		}
 	}
 	if answered {
@@ -290,7 +352,7 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 		hits := append([]SearchHit(nil), e.hits...) // callers may reorder
 		known, _ := store.knownVendors(r.Country)
 		rankHits(hits, r, known)
-		return hits, nil
+		return capHits(hits, limit), nil
 	}
 	searchMu.Unlock()
 	hits, err := searchChain(ctx, searchEngines(), query, limit, r)
@@ -301,7 +363,17 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 	}
 	known, _ := store.knownVendors(r.Country) // learned vendor preference; nil on error is fine
 	rankHits(hits, r, known)
-	return hits, err
+	return capHits(hits, limit), err
+}
+
+// capHits truncates AFTER ranking: the fan-out merge can hold several engines'
+// results, and the cut must drop the region-worst tail, not whichever engine
+// happened to answer last.
+func capHits(hits []SearchHit, limit int) []SearchHit {
+	if limit > 0 && len(hits) > limit {
+		return hits[:limit]
+	}
+	return hits
 }
 
 // fetchSearchPage GETs a search-results URL and returns the body, translating
@@ -309,9 +381,21 @@ func searchRegion(ctx context.Context, query string, limit int, r Region) ([]Sea
 // a short budget: search is the front door, and a slow engine must cost
 // seconds before the chain moves on — not the whole request's patience.
 func fetchSearchPage(ctx context.Context, u, engineLabel string) ([]byte, error) {
+	return fetchSearchPageHdr(ctx, u, engineLabel, nil)
+}
+
+// fetchSearchPageHdr is fetchSearchPage with extra request headers — for
+// engines whose only region signal is a header (Ecosia: Accept-Language).
+func fetchSearchPageHdr(ctx context.Context, u, engineLabel string, extra map[string]string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	resp, err := get(ctx, u)
+	var resp *http.Response
+	var err error
+	if len(extra) > 0 {
+		resp, err = doRequest(ctx, http.MethodGet, u, extra)
+	} else {
+		resp, err = get(ctx, u)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -465,9 +549,16 @@ func searchBrave(ctx context.Context, query string, limit int, r Region) ([]Sear
 // searchEcosia scrapes ecosia.org, whose organic results come from
 // Bing/Google — big-index coverage without Bing's degraded bot page.
 // Selectors pin the stable data-test-id attributes, not styling classes.
-func searchEcosia(ctx context.Context, query string, limit int, _ Region) ([]SearchHit, error) {
+// Region: Ecosia exposes no URL param; its Bing backend keys the market off
+// Accept-Language, so that header is the region signal here.
+func searchEcosia(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
 	u := "https://www.ecosia.org/search?q=" + url.QueryEscape(query)
-	body, err := fetchSearchPage(ctx, u, "ecosia")
+	var extra map[string]string
+	if lang := ddgLangCode(r.DDG); lang != "" && r.Country != "" {
+		extra = map[string]string{"Accept-Language": fmt.Sprintf("%s-%s,%s;q=0.8,en;q=0.5",
+			lang, strings.ToUpper(r.Country), lang)}
+	}
+	body, err := fetchSearchPageHdr(ctx, u, "ecosia", extra)
 	if err != nil {
 		return nil, err
 	}
@@ -502,11 +593,20 @@ func searchEcosia(ctx context.Context, query string, limit int, _ Region) ([]Sea
 // match div.algo, and any aclick URL that still leaks through is dropped — so
 // sponsored junk never reads as an organic result (the reason bare Bing was
 // rejected). Organic links are wrapped in a /RU=<encoded>/RK= redirect that
-// decodeYahooLink unwraps. Region: Yahoo has no clean kl-style param; rankHits
-// re-biases by region afterward, so the query stays plain.
-// ponytail: no region param — the post-rank handles locale bias.
-func searchYahoo(ctx context.Context, query string, limit int, _ Region) ([]SearchHit, error) {
-	u := "https://search.yahoo.com/search?p=" + url.QueryEscape(query)
+// decodeYahooLink unwraps. Region: Yahoo has no query param, but it DOES run
+// country frontends (dk.search.yahoo.com etc.) that serve locally-biased
+// results — reranking alone can't add local vendors an engine never returned,
+// so the subdomain is the coverage lever. An unknown subdomain just errors
+// and the chain moves on.
+func searchYahoo(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
+	host := "search.yahoo.com"
+	if c := strings.ToLower(r.Country); c != "" && c != "us" {
+		if c == "gb" {
+			c = "uk" // Yahoo's one frontend code that isn't the ISO country
+		}
+		host = c + "." + host
+	}
+	u := "https://" + host + "/search?p=" + url.QueryEscape(query)
 	body, err := fetchSearchPage(ctx, u, "yahoo")
 	if err != nil {
 		return nil, err
@@ -679,7 +779,7 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 	if render {
 		var t, x string
 		t, x, err = fetchRendered(ctx, rawURL)
-		f = Fetched{Title: t, Text: x, Rendered: true}
+		f = Fetched{Title: t, Text: collapseWS(x), Rendered: true}
 	} else {
 		f, err = fetchContent(ctx, rawURL)
 	}
@@ -690,14 +790,17 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 		return Fetched{}, false, err
 	}
 	f.FetchedAt = time.Now()
+	f.ConsentWall = isConsentWall(f.Text)
 	// Don't cache scanned-PDF image results (the cache only holds text — a hit
 	// would return empty text with no images), and don't cache near-empty
 	// text: a JS-shell SPA would poison the cache for the whole TTL and block
-	// a later render=true from ever seeing fresh content.
+	// a later render=true from ever seeing fresh content. Consent interstitials
+	// are the same trap with more words — a cached cookie banner would read as
+	// "the page says nothing about price" for a whole TTL.
 	// Don't cache a TRUNCATED extraction either: the cache carries no truncated
 	// flag, so a re-serve within the TTL (up to 30d for specs) would return the
 	// cut prefix as if it were the whole document — a silent half-a-spec-sheet.
-	if len(f.Images) == 0 && !f.Truncated && len(strings.TrimSpace(f.Text)) >= minCacheChars {
+	if len(f.Images) == 0 && !f.Truncated && !f.ConsentWall && len(strings.TrimSpace(f.Text)) >= minCacheChars {
 		store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
 	}
 	return f, false, nil
@@ -726,6 +829,7 @@ type Fetched struct {
 	Stale        bool       // served from cache PAST its TTL because the live fetch failed
 	StaleReason  string     // why the live fetch failed when Stale
 	Truncated    bool       // the source exceeded the size cap — text is a PREFIX, not the whole document
+	ConsentWall  bool       // the text looks like a cookie-consent interstitial, NOT the page content
 }
 
 func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
@@ -747,7 +851,7 @@ func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
 			return Fetched{}, fmt.Errorf("fetch %s: %s — PDF host blocks plain HTTP even with browser headers; find a mirror of the datasheet", rawURL, resp.Status)
 		}
 		if t, x, rerr := fetchRendered(ctx, rawURL); rerr == nil {
-			return Fetched{Title: t, Text: x, Rendered: true}, nil
+			return Fetched{Title: t, Text: collapseWS(x), Rendered: true}, nil
 		} else {
 			return Fetched{}, fmt.Errorf("fetch %s: %s — site blocks plain HTTP and the render fallback failed (%v); extract what you can from the search snippet", rawURL, resp.Status, rerr)
 		}
@@ -755,7 +859,23 @@ func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
 	if resp.StatusCode != http.StatusOK {
 		return Fetched{}, fmt.Errorf("fetch %s: %s", rawURL, resp.Status)
 	}
-	return extractResponse(resp, rawURL)
+	f, err := extractResponse(resp, rawURL)
+	if err != nil {
+		return f, err
+	}
+	// A 200 that extracts to almost nothing is usually a JS shell — the caller
+	// used to have to notice the thin-text note and retry with render=true by
+	// hand. Escalate automatically; keep the plain result if rendering fails
+	// or comes back no better (the handler still flags thin text).
+	if len(f.Images) == 0 && !f.Truncated && !isPDFURL(rawURL) &&
+		len(strings.TrimSpace(f.Text)) < minCacheChars {
+		if t, x, rerr := fetchRendered(ctx, rawURL); rerr == nil {
+			if x = collapseWS(x); len(strings.TrimSpace(x)) > len(strings.TrimSpace(f.Text)) {
+				return Fetched{Title: t, Text: x, Rendered: true}, nil
+			}
+		}
+	}
+	return f, nil
 }
 
 func isPDFURL(u string) bool { return strings.HasSuffix(strings.ToLower(u), ".pdf") }
@@ -852,7 +972,62 @@ func extractHTML(buf []byte, rawURL, contentType string) (title, text string, er
 	if tables := extractTables(bytes.NewReader(buf)); tables != "" {
 		text += "\n\n## Tables\n\n" + tables
 	}
-	return art.Title, text, nil
+	return art.Title, collapseWS(text), nil
+}
+
+// collapseWS squeezes the whitespace readability leaves behind — runs of
+// spaces/tabs to one space, 3+ newlines to a blank line, no trailing spaces.
+// Extracted shop pages are mostly indentation (a 200KB page was ~7 pagination
+// round-trips of padding); collapsing before caching cuts that to real text.
+func collapseWS(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	nl, sp := 0, false
+	for _, r := range s {
+		switch r {
+		case '\n', '\r':
+			nl++
+			sp = false
+		case ' ', '\t', '\u00a0':
+			sp = true
+		default:
+			if nl > 0 {
+				if b.Len() > 0 {
+					b.WriteByte('\n')
+					if nl > 1 {
+						b.WriteByte('\n')
+					}
+				}
+				nl = 0
+			} else if sp && b.Len() > 0 {
+				b.WriteByte(' ')
+			}
+			sp = false
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// isConsentWall recognizes a cookie-consent interstitial standing in for page
+// content: short text where consent vocabulary dominates. "cookie" is spelled
+// the same across EU languages, which keeps this one check multilingual.
+// Only ever advisory — callers flag, never drop.
+func isConsentWall(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if len(t) == 0 || len(t) > 2000 {
+		return false // real content is longer; emptiness is a different problem
+	}
+	if !strings.Contains(t, "cookie") {
+		return false
+	}
+	hits := 0
+	for _, marker := range []string{"consent", "accept", "akzeptieren", "accepter", "zustimm", "samtykke", "privacy", "datenschutz", "personal data", "personenbezogen", "partner"} {
+		if strings.Contains(t, marker) {
+			hits++
+		}
+	}
+	return hits >= 2
 }
 
 // extractTables renders every <table> on the page as a markdown table so

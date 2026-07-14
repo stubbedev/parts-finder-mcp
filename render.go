@@ -338,6 +338,18 @@ func fetchRendered(ctx context.Context, rawURL string) (title, text string, err 
 	); err != nil {
 		return "", "", fmt.Errorf("render %s: %w", rawURL, err)
 	}
+	// Slow hydrators: if the DOM is still growing, the 2s snapshot is a partial
+	// page that would read as ground truth. One bounded re-snapshot when the
+	// first looks unsettled — grew or thin — costs 2s only on those pages.
+	if len(html) < 4096 {
+		var html2 string
+		if err := chromedp.Run(tabCtx,
+			chromedp.Sleep(2*time.Second),
+			chromedp.OuterHTML("html", &html2),
+		); err == nil && len(html2) > len(html) {
+			html = html2
+		}
+	}
 	// Same extraction as the plain fetcher (readability + table preservation):
 	// rendering is an implementation detail, never a downgrade.
 	return extractHTML([]byte(html), rawURL, "")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"image"
 	"image/color"
 	_ "image/gif" // register GIF decoder
@@ -33,14 +34,16 @@ import (
 // bytes), so we downscale before sending. The defaults are conservative,
 // general-purpose values — NOT tied to one model. Different harnesses/models
 // tile differently (e.g. some at 512px, some ~1.5k), so every cap is
-// env-overridable and there's a per-call max_edge knob. Text caps smaller than
-// photo: legible 1-bit text survives aggressive downscale where photo detail
-// wouldn't, and it roughly halves the tokens.
+// env-overridable and there's a per-call max_edge knob. Text caps LARGER in
+// area than photo: dense datasheet tables drop below legible around ~1000px
+// long edge and the model starts guessing digits — a wrong voltage costs far
+// more than the extra tokens. Bytes stay cheap because bimodal text goes out
+// as 1-bit PNG anyway.
 var (
 	maxImageEdge   = envInt("PARTS_IMG_MAX_EDGE", 1568)
 	maxImagePixels = float64(envInt("PARTS_IMG_MAX_PIXELS", 1_150_000))
-	maxTextEdge    = envInt("PARTS_IMG_TEXT_EDGE", 1000)
-	maxTextPixels  = float64(envInt("PARTS_IMG_TEXT_PIXELS", 750_000))
+	maxTextEdge    = envInt("PARTS_IMG_TEXT_EDGE", 1600)
+	maxTextPixels  = float64(envInt("PARTS_IMG_TEXT_PIXELS", 2_000_000))
 )
 
 func envInt(key string, def int) int {
@@ -88,12 +91,31 @@ func init() {
 	image.RegisterFormat("webp", "RIFF????WEBPVP", webp.Decode, webp.DecodeConfig)
 }
 
+// checkRaster fails loudly on clearly-non-raster payloads. SVG arrives with an
+// image/* Content-Type so it survives the MIME gate, Go's decoders can't touch
+// it, and vision models may not read it at all — silently. Other undecodable
+// formats still pass through optimizeImage unchanged; this only rejects what
+// is provably vector markup by content sniff (leading "<svg" / "<?xml" after
+// whitespace/BOM) or declared MIME.
+func checkRaster(data []byte, mime string) error {
+	s := bytes.TrimLeft(data, " \t\r\n\xef\xbb\xbf")
+	switch {
+	case mime == "image/svg+xml", bytes.HasPrefix(s, []byte("<svg")):
+		return fmt.Errorf("image is SVG (vector markup), not processed — vision cannot reliably read it, fetch a raster (png/jpeg) rendering instead")
+	case bytes.HasPrefix(s, []byte("<?xml")):
+		return fmt.Errorf("image is XML/vector data, not processed — fetch a raster (png/jpeg) version instead")
+	}
+	return nil
+}
+
 // Image optimization modes, cheapest-bytes first for their content:
 //
 //	"text"  — reading glyphs off an image (spec sheets, labels, scans):
 //	          grayscale → Otsu threshold → 1-bit black/white PNG. Text needs
 //	          no gray or colour to stay legible, and a bilevel PNG is a
 //	          fraction of a grayscale JPEG. This is the fewest-bytes path.
+//	          Only applies when the tonal histogram is genuinely bimodal;
+//	          a photo mislabeled text falls through to the auto path.
 //	"auto"  — grayscale, pick the smaller of PNG/JPEG (default).
 //	"color" — keep colour, pick the smaller of PNG/JPEG (photos, colour-coding).
 const (
@@ -125,14 +147,19 @@ func optimizeImage(data []byte, mime, mode string, maxEdge int) ([]byte, string)
 	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
 
 	// Text mode: binarize to 1-bit and PNG it — the fewest bytes for legible
-	// text. Guard against a pathological case (e.g. a full-tone photo mislabeled
-	// text) by still comparing against the grayscale encoders and keeping the
-	// smallest.
+	// text. Gate on the image itself, not output byte size: a full-tone photo
+	// mislabeled text binarizes into the SMALLEST garbage, so a size race would
+	// pick exactly the pathological case. Only binarize when the grayscale
+	// histogram is strongly bimodal (genuine scanned text / line art);
+	// continuous tone falls through to the normal grayscale encoders.
 	var best []byte
 	var bestMIME string
 	if mode == modeText {
-		if bw := encodePNG(binarize(dst)); bw != nil {
-			best, bestMIME = bw, "image/png"
+		g := dst.(*image.Gray) // non-color modes always render into Gray
+		if _, eta := otsu(g.Pix); eta >= bimodalMin {
+			if bw := encodePNG(binarize(g)); bw != nil {
+				best, bestMIME = bw, "image/png"
+			}
 		}
 	}
 	if j := encodeJPEG(dst); j != nil && (best == nil || len(j) < len(best)) {
@@ -160,7 +187,7 @@ func binarize(src image.Image) image.Image {
 		g = image.NewGray(b)
 		draw.Draw(g, b, src, b.Min, draw.Src)
 	}
-	t := otsu(g.Pix)
+	t, _ := otsu(g.Pix)
 	pal := image.NewPaletted(b, color.Palette{color.Gray{Y: 0}, color.Gray{Y: 255}})
 	for y := b.Min.Y; y < b.Max.Y; y++ {
 		for x := b.Min.X; x < b.Max.X; x++ {
@@ -174,15 +201,25 @@ func binarize(src image.Image) image.Image {
 	return pal
 }
 
-// otsu finds the grayscale threshold maximizing inter-class variance.
-func otsu(pix []uint8) uint8 {
+// bimodalMin gates text-mode binarization on Otsu's effectiveness ratio
+// (between-class variance / total variance at the chosen threshold). Two
+// clean tonal clusters (scanned text, line art) score near 1.0; uniform
+// noise scores ~0.75 and real photos lower still.
+// ponytail: one global threshold, no per-region analysis — lower it if a
+// genuinely dirty scan ever falls back to grayscale.
+const bimodalMin = 0.85
+
+// otsu finds the grayscale threshold maximizing inter-class variance, and
+// returns that maximum as a fraction of total variance (Otsu's effectiveness
+// ratio) — a cheap bimodality score from the same histogram pass.
+func otsu(pix []uint8) (uint8, float64) {
 	var hist [256]int
 	for _, p := range pix {
 		hist[p]++
 	}
 	total := len(pix)
 	if total == 0 {
-		return 128
+		return 128, 0
 	}
 	var sum float64
 	for i := 0; i < 256; i++ {
@@ -209,7 +246,18 @@ func otsu(pix []uint8) uint8 {
 			threshold = i
 		}
 	}
-	return uint8(threshold)
+	// Total variance (×N) for the effectiveness ratio; maxVar above is ×N².
+	mean := sum / float64(total)
+	var totVar float64
+	for i, h := range hist {
+		d := float64(i) - mean
+		totVar += d * d * float64(h)
+	}
+	eta := 0.0
+	if totVar > 0 {
+		eta = maxVar / (float64(total) * totVar)
+	}
+	return uint8(threshold), eta
 }
 
 func encodeJPEG(img image.Image) []byte {

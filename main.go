@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -45,6 +46,8 @@ func main() {
 	if rs, err := store.loadRules(); err == nil {
 		setRuleOverlay(rs)
 	}
+	// Learned draw categories (see drawCategories) come from the store.
+	drawCatsFn = store.tdpCategories
 
 	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: version}, nil)
 	// A panic in any tool handler would otherwise crash the whole server — the
@@ -131,8 +134,9 @@ type fetchOut struct {
 	FetchedAt   string `json:"fetched_at,omitempty"`  // when the content was actually downloaded
 	Stale       bool   `json:"stale,omitempty"`       // live fetch FAILED — this is old cache, treat prices/stock as unverified
 	StaleReason string `json:"stale_reason,omitempty"`
-	Truncated   bool   `json:"truncated,omitempty"` // source exceeded the size cap — text is a prefix, not the whole document
-	Note        string `json:"note,omitempty"`      // degradation hints (thin extraction, etc.)
+	Truncated   bool   `json:"truncated,omitempty"`    // source exceeded the size cap — text is a prefix, not the whole document
+	ConsentWall bool   `json:"consent_wall,omitempty"` // text is a cookie-consent interstitial, not the page content
+	Note        string `json:"note,omitempty"`         // degradation hints (thin extraction, etc.)
 }
 
 // maxFetchChars caps the text returned per fetch_content call. Clients hard-cap
@@ -170,7 +174,8 @@ func pageText(s string, off int) (page string, total, next int) {
 func isUTF8Cont(b byte) bool { return b&0xC0 == 0x80 }
 
 type savePartOut struct {
-	ID string `json:"id"`
+	ID      string `json:"id"`
+	Warning string `json:"warning,omitempty"` // saved, but something looks off — verify before trusting rankings
 }
 
 type imageIn struct {
@@ -196,15 +201,18 @@ type queryIn struct {
 	Limit    int      `json:"limit,omitempty"`
 }
 type queryOut struct {
-	Parts []Part `json:"parts"`
-	Total int    `json:"total"` // matches before the limit — parts may be a subset
+	Parts    []Part   `json:"parts"`
+	Total    int      `json:"total"`               // matches before the limit — parts may be a subset
+	StaleIDs []string `json:"stale_ids,omitempty"` // returned parts with data older than 30d — deep_specs before speccing off them
+	Note     string   `json:"note,omitempty"`      // guidance when the result is empty
 }
 
 type compareIn struct {
 	SpecIDs         []string `json:"spec_ids" jsonschema:"saved specs to compare side by side"`
 	Country         string   `json:"country,omitempty"`
 	DisplayCurrency string   `json:"display_currency,omitempty" jsonschema:"currency for totals; defaults to region currency"`
-	KWHPrice        float64  `json:"kwh_price,omitempty" jsonschema:"electricity price per kWh in the display currency; adds an indicative yearly power cost (24/7 at total TDP) per spec — capex vs opex in one view"`
+	KWHPrice        float64  `json:"kwh_price,omitempty" jsonschema:"electricity price per kWh in the display currency; adds an indicative yearly power cost per spec — capex vs opex in one view"`
+	LoadFactor      float64  `json:"load_factor,omitempty" jsonschema:"average utilization 0-1 applied to total TDP for the power cost. Default 1.0 = 24/7 at peak, a WORST-CASE ceiling — real servers average 0.4-0.7; pass your expected load for a realistic opex figure"`
 }
 type specOption struct {
 	ID              string      `json:"id"`
@@ -243,6 +251,7 @@ type loadSpecIn struct {
 type loadSpecOut struct {
 	Spec  *Spec      `json:"spec,omitempty"`
 	Specs []SpecInfo `json:"specs,omitempty"` // when listing
+	Note  string     `json:"note,omitempty"`  // guidance when nothing is saved yet
 }
 
 type dealsIn struct {
@@ -250,6 +259,7 @@ type dealsIn struct {
 	Search          bool   `json:"search,omitempty" jsonschema:"also run a region-biased web search for buy pages to populate more listings"`
 	Country         string `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2, e.g. DK)"`
 	DisplayCurrency string `json:"display_currency,omitempty" jsonschema:"convert every total into this currency for comparison; defaults to region currency"`
+	MaxAgeDays      int    `json:"max_age_days,omitempty" jsonschema:"flag listings older than this many days as stale (default 14); every listing also carries age_days regardless"`
 }
 type dealsOut struct {
 	Region      Region      `json:"region"`
@@ -276,6 +286,7 @@ type substituteIn struct {
 	Currency string  `json:"currency,omitempty" jsonschema:"currency to compare budget/prices in; defaults to region currency. Listings in other currencies are converted (indicative ECB rates)."`
 	Country  string  `json:"country,omitempty" jsonschema:"override detected region (ISO alpha-2)"`
 	RankBy   string  `json:"rank_by,omitempty" jsonschema:"rank candidates by this numeric attribute DESCENDING instead of cheapest-first — any saved attr, e.g. passmark, cores, perf_per_watt; candidates missing the attr sort last"`
+	SpecID   string  `json:"spec_id,omitempty" jsonschema:"verify each candidate against this saved build: the part is swapped in and the FULL compat engine re-runs — candidates that break the build carry spec_violations (flagged, never hidden)"`
 }
 type substituteOut struct {
 	Substitutes []Substitute `json:"substitutes"`
@@ -445,7 +456,7 @@ func pricePart(ctx context.Context, partID string, region Region, display string
 	if err != nil {
 		return nil, err
 	}
-	markStale(ls, time.Now())
+	markStale(ls, time.Now(), 0)
 	liveCheckAll(ctx, ls)
 	markShippable(ls, region.Country)
 	annotateDisplay(ctx, ls, display)
@@ -475,6 +486,44 @@ func exVATContribution(l Listing, display string) (float64, bool) {
 		return ex, true
 	}
 	return 0, false
+}
+
+// violationsWithSwap recomposes a saved spec with the original part swapped
+// for the candidate and returns the violations involving the candidate — the
+// difference between "same category and socket" and "actually drops into THIS
+// build". Reuses the whole compat engine instead of approximating it.
+func violationsWithSwap(specID, origID, candID string) ([]Violation, error) {
+	_, rawIDs, _, err := store.loadSpec(specID)
+	if err != nil {
+		return nil, err
+	}
+	swapped := make([]string, len(rawIDs))
+	found := false
+	for i, id := range rawIDs {
+		if id == origID {
+			swapped[i] = candID
+			found = true
+		} else {
+			swapped[i] = id
+		}
+	}
+	if !found {
+		return nil, fmt.Errorf("part %s is not a direct member of spec %s — if it lives in a nested sub-spec, run find_substitute against that node spec instead", origID, specID)
+	}
+	spec, err := store.composeIDs(swapped)
+	if err != nil {
+		return nil, err
+	}
+	var out []Violation
+	for _, v := range spec.Violations {
+		for _, p := range v.Parts {
+			if p == candID {
+				out = append(out, v)
+				break
+			}
+		}
+	}
+	return out, nil
 }
 
 // regionFor resolves the effective region for a call: an explicit country
@@ -531,17 +580,23 @@ func registerTools(s *mcp.Server) {
 		}
 		out := fetchOut{Title: f.Title, Text: text, Cached: cached, Rendered: f.Rendered,
 			Images: len(f.Images), TotalBytes: total, NextOffset: next,
-			Stale: f.Stale, StaleReason: f.StaleReason, Truncated: f.Truncated}
+			Stale: f.Stale, StaleReason: f.StaleReason, Truncated: f.Truncated,
+			ConsentWall: f.ConsentWall}
 		if !f.FetchedAt.IsZero() {
 			out.FetchedAt = f.FetchedAt.UTC().Format(time.RFC3339)
 		}
-		if len(f.Images) == 0 && total < minCacheChars {
+		if f.ConsentWall {
+			// The eBay.de failure mode: the renderer returns ONLY the cookie
+			// banner. Without this flag the model reads "the page mentions no
+			// price" as ground truth — the worst kind of silent degradation.
+			out.Note = "extracted text looks like a cookie-consent interstitial, NOT the page content — the real page did not load. Don't treat this as 'the page says nothing': use the search snippet, a different vendor link, or fetch_image on the product photos instead"
+		} else if len(f.Images) == 0 && total < minCacheChars {
 			// A rendered page that's STILL thin must not pass silently — the model
 			// would read near-empty text as "the page says nothing" (ground truth).
 			if f.Rendered {
 				out.Note = "extracted text is very thin even after rendering — the page may hydrate slowly or block headless browsers; content is likely incomplete"
 			} else {
-				out.Note = "extracted text is very thin — likely a JS-rendered page; retry with render=true"
+				out.Note = "extracted text is very thin even though the page returned 200 and auto-render found no more — content is likely incomplete"
 			}
 		}
 		// Scanned PDF: no text layer, so return the page images as vision
@@ -588,7 +643,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_part",
-		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. Before extracting, call list_rules once: its attrs_by_category is the checklist of attributes the compat engine reads per category, and known_tokens is the resource-token vocabulary already in use — the rules are the source of truth, not this description. For build validation across ANY part type (from DIMM slots to rack units), fill provides/requires with 'kind:variant' -> count resource tokens (a motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3}, a RAM stick requires {\"dimm:ddr5\":1}; the same pattern covers bays, ports, PSU cables, rack u:, PDU outlets, switch ports). The engine checks sum(requires) <= sum(provides) per token, with width/superset flexibility (x16 slots take x8 cards, sas ports take sata drives). If a datasheet or vendor QVL reveals a constraint the rules miss, add it with save_rule.",
+		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. Before extracting, call list_rules once: its attrs_by_category is the checklist of attributes the compat engine reads per category (rack-mounted gear: set height_u + weight_kg attrs; racks: u_capacity + weight_capacity_kg; PDUs: power_capacity_w), and known_tokens is the resource-token vocabulary already in use — the rules are the source of truth, not this description. Re-saving an existing id MERGES: unknown/zero fields keep their stored values (a thin save can't erase deep_specs enrichment); known incoming values overwrite. For build validation across ANY part type (from DIMM slots to rack units), fill provides/requires with 'kind:variant' -> count resource tokens (a motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3}, a RAM stick requires {\"dimm:ddr5\":1}; the same pattern covers bays, ports, PSU cables, PDU outlets like {\"outlet:c13\":24}, switch ports). The engine checks sum(requires) <= sum(provides) per token, with width/superset flexibility (x16 slots take x8 cards, sas ports take sata drives). If a datasheet or vendor QVL reveals a constraint the rules miss, add it with save_rule.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, p Part) (*mcp.CallToolResult, savePartOut, error) {
 		p.Category = strings.ToLower(strings.TrimSpace(p.Category)) // "CPU" and "cpu" must be one category — rules and queries compare exact
 		if p.Category == "" {
@@ -654,12 +709,23 @@ func registerTools(s *mcp.Server) {
 		if in.Limit > 0 && len(out) > in.Limit {
 			out = out[:in.Limit]
 		}
-		return nil, queryOut{Parts: out, Total: total}, nil
+		res := queryOut{Parts: out, Total: total}
+		// The freshness guardrail composeSpec applies must also cover the
+		// discovery step — stale data seeding a spec here would bypass it.
+		for _, p := range out {
+			if !p.FetchedAt.IsZero() && time.Since(p.FetchedAt) > partDataMaxAge {
+				res.StaleIDs = append(res.StaleIDs, p.ID)
+			}
+		}
+		if total == 0 {
+			res.Note = "no stored parts match — the store only knows what was saved; use search_parts (live web) + save_part to ingest candidates first"
+		}
+		return nil, res, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compose_spec",
-		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' for a saved build (repeat for quantity) — sub-builds compose HIERARCHICALLY: rules check each node on its own (a rack of 12x 'spec:node' never cross-pairs nodes), child problems surface prefixed with their spec, and a node's unmet needs bubble up for rack-level parts (switches, PDUs, cabinets) to satisfy. The rules applied are data: list_rules shows them, save_rule extends them. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
+		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' for a saved build (repeat for quantity) — sub-builds compose HIERARCHICALLY: rules check each node on its own (a rack of 12x 'spec:node' never cross-pairs nodes), child problems surface prefixed with their spec, and a node's unmet needs bubble up for rack-level parts (switches, PDUs, cabinets) to satisfy. The rules applied are data: list_rules shows them, save_rule extends them. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is. Use THIS while iterating on a build (instant, no network); switch to shop_spec when it's time to buy (same compat + live prices and a purchase plan).",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, Spec, error) {
 		spec, err := store.composeIDs(in.PartIDs)
 		if err != nil {
@@ -670,7 +736,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_spec",
-		Description: "Persist a build (list of part ids) under an id for later recall. Repeat an id for quantity. Ids may be 'spec:<other-id>' to nest a saved build — a rack spec is 12x 'spec:node' + switches + PDU + rails; nested specs expand on load everywhere. List units you ALREADY OWN in owned_ids, REPEATED PER UNIT owned (own 3 of 8 DIMMs = the id 3 times; 'spec:<id>' = own that whole sub-build) — owned units still count for compatibility/TDP but are excluded from the purchase total and never shopped.",
+		Description: "Persist a build (list of part ids) under an id for later recall. Repeat an id for quantity. Ids may be 'spec:<other-id>' to nest a saved build — a rack spec is 12x 'spec:node' + switches + PDU + rails; nested specs expand on load everywhere. List units you ALREADY OWN in owned_ids, REPEATED PER UNIT owned (own 3 of 8 DIMMs = the id 3 times; 'spec:<id>' = own that whole sub-build) — owned units still count for compatibility/TDP but are excluded from the purchase total and never shopped. Specs store part REFERENCES, not snapshots: re-saving a part changes every build containing it — export_spec when you need a frozen, quotable bill of materials.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in saveSpecIn) (*mcp.CallToolResult, savePartOut, error) {
 		if in.ID == "" {
 			return nil, savePartOut{}, fmt.Errorf("id is required")
@@ -684,7 +750,7 @@ func registerTools(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "save_listing",
 		Description: "Record a price observation for a stored part (extracted from a listing/reseller page). Prices are point-in-time; find_deals flags stale ones, and every price change is kept in history (price_history). ALWAYS record vat_included (+vat_rate) when the page states it — consumer shops list incl VAT, B2B resellers ex VAT, and a business buyer compares ex-VAT; omit when unstated (flagged, never guessed). Also record qty_available, in_stock, and lead_days when shown.",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, l Listing) (*mcp.CallToolResult, savePartOut, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, l Listing) (*mcp.CallToolResult, savePartOut, error) {
 		if l.PartID == "" {
 			return nil, savePartOut{}, fmt.Errorf("part_id is required")
 		}
@@ -705,10 +771,16 @@ func registerTools(s *mcp.Server) {
 		if l.SeenAt.IsZero() {
 			l.SeenAt = time.Now()
 		}
+		// Model-extracted prices are the trust boundary for every ranking
+		// downstream; the classic failure modes (lot price as unit, decimal
+		// comma misread, teaser price) are all order-of-magnitude errors.
+		// History is the one cross-check the server can do itself — warn,
+		// don't block: a real fire-sale exists and must stay recordable.
+		warning := priceSanityWarning(ctx, l)
 		if err := store.saveListing(l); err != nil {
 			return nil, savePartOut{}, err
 		}
-		return nil, savePartOut{ID: l.ID}, nil
+		return nil, savePartOut{ID: l.ID, Warning: warning}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -724,7 +796,7 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, dealsOut{}, err
 		}
-		markStale(listings, time.Now())
+		markStale(listings, time.Now(), in.MaxAgeDays)
 		liveCheckAll(ctx, listings)             // probe URLs so gone deals get FLAGGED
 		markShippable(listings, region.Country) // flag, never drop — no deal is hidden
 		display := in.DisplayCurrency
@@ -737,7 +809,9 @@ func registerTools(s *mcp.Server) {
 		if in.Search {
 			if name := strings.TrimSpace(parts[0].Vendor + " " + parts[0].Model); name != "" {
 				var serr error
-				out.Hits, serr = searchRegion(ctx, name+" buy price", 10, region)
+				// The region currency in the query is the one bias that reaches
+				// even locale-blind engines — commerce pages print their currency.
+				out.Hits, serr = searchRegion(ctx, name+" buy price "+region.Currency, 10, region)
 				if serr != nil {
 					out.SearchError = serr.Error() // "search is blind" ≠ "no results"
 				}
@@ -748,7 +822,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "list_rules",
-		Description: "The compat engine's SOURCE OF TRUTH: every active rule (builtin + store-added), the attributes each category must have extracted for the rules to bite (attrs_by_category — use this as the save_part extraction checklist), and the resource-token vocabulary already in use in the store (reuse these token names for consistency). Rules compare values scraped live from the web, so NEW hardware needs no rule changes — new rules are only for new KINDS of constraint.",
+		Description: "The compat engine's SOURCE OF TRUTH: every active rule (builtin + store-added), the attributes each category must have extracted for the rules to bite (attrs_by_category — use this as the save_part extraction checklist; the \"*\" entry lists attrs EVERY rack-mounted part should carry, e.g. height_u/weight_kg), and the resource-token vocabulary already in use in the store (reuse these token names for consistency). Rules compare values scraped live from the web, so NEW hardware needs no rule changes — new rules are only for new KINDS of constraint.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, rulesOut, error) {
 		out := rulesOut{Rules: currentRules(), AttrsByCategory: map[string][]string{}}
 		cats := map[string]bool{}
@@ -785,7 +859,7 @@ func registerTools(s *mcp.Server) {
 			}
 		case "capacity":
 			if (r.Mode != "sum" && r.Mode != "each") || r.CatA == "" || r.AttrA == "" || r.CatB == "" || r.AttrB == "" {
-				return nil, savePartOut{}, fmt.Errorf("capacity rule needs cat_a/attr_a (limit), cat_b/attr_b (usage) and mode sum|each")
+				return nil, savePartOut{}, fmt.Errorf("capacity rule needs cat_a/attr_a (limit), cat_b/attr_b (usage) and mode sum|each; cat_b may be \"*\" (every mounted part, like the rack_u builtin)")
 			}
 		case "superset":
 			if r.AttrA == "" || r.AttrB == "" {
@@ -866,7 +940,15 @@ func registerTools(s *mcp.Server) {
 			if currency != "" {
 				best.DisplayTotal, best.DisplayCurr = total, currency
 			}
-			scoredSubs = append(scoredSubs, scored{Substitute{Part: c, Listing: best}, total})
+			sub := Substitute{Part: c, Listing: best, Cautions: substituteCautions(orig, c)}
+			if in.SpecID != "" {
+				vs, verr := violationsWithSwap(in.SpecID, orig.ID, c.ID)
+				if verr != nil {
+					return nil, substituteOut{}, verr
+				}
+				sub.SpecViolations = vs
+			}
+			scoredSubs = append(scoredSubs, scored{sub, total})
 		}
 		if in.RankBy != "" {
 			// Rank by the attribute descending (perf-style: more is better);
@@ -898,7 +980,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "shop_spec",
-		Description: "One-stop purchase plan for a build: per part, the cheapest usable (live + ships-to-region + in-stock) listing as the buy link, ALL other recorded listings as flagged alternatives (nothing filtered out), converted build totals (gross AND ex-VAT where the basis is known), per-vendor carts for shipping consolidation, resource shortages to also shop for (needs: cables, adapters, bays), and buy-page search hits for parts with no usable listing. Repeat a part id in the spec to buy multiples; supply_short flags a best listing with fewer units than needed. Feed hits to fetch_content + save_listing, then re-run to complete the plan.",
+		Description: "One-stop purchase plan for a build: per part, the cheapest usable (live + ships-to-region + in-stock) listing as the buy link, ALL other recorded listings as flagged alternatives (nothing filtered out), converted build totals (gross AND ex-VAT where the basis is known), per-vendor carts for shipping consolidation, resource shortages to also shop for (needs: cables, adapters, bays), and buy-page search hits for parts with no usable listing. Repeat a part id in the spec to buy multiples; supply_short flags a best listing with fewer units than needed. Feed hits to fetch_content + save_listing, then re-run to complete the plan. This is the BUY step (live probes, slower); while still iterating on the build itself, compose_spec is instant.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in shopIn) (*mcp.CallToolResult, shopOut, error) {
 		partIDs := in.PartIDs
 		ownedIDs := in.OwnedIDs
@@ -996,7 +1078,7 @@ func registerTools(s *mcp.Server) {
 			} else {
 				item.Alternatives = ls // only flagged listings on record — show them all
 				if name := strings.TrimSpace(p.Vendor + " " + p.Model); !in.NoSearch && name != "" {
-					item.SearchHits, _ = searchRegion(ctx, name+" buy price", 5, region) // best-effort
+					item.SearchHits, _ = searchRegion(ctx, name+" buy price "+region.Currency, 5, region) // best-effort
 				}
 			}
 			out.Items = append(out.Items, item)
@@ -1053,7 +1135,11 @@ func registerTools(s *mcp.Server) {
 				TotalTDPW: spec.TotalTDPW, PartCount: len(parts),
 			}
 			if in.KWHPrice > 0 {
-				opt.YearlyPowerCost = in.KWHPrice * float64(spec.TotalTDPW) / 1000 * 24 * 365
+				lf := in.LoadFactor
+				if lf <= 0 || lf > 1 {
+					lf = 1 // unset/garbage → the honest worst-case ceiling
+				}
+				opt.YearlyPowerCost = in.KWHPrice * float64(spec.TotalTDPW) * lf / 1000 * 24 * 365
 			}
 			for _, id := range uniqueInOrder(partIDs) {
 				ownedN := min(ownedQty[id], demand[id])
@@ -1119,38 +1205,80 @@ func registerTools(s *mcp.Server) {
 		}
 		region := detectRegion(ctx)
 		out := deepOut{Part: p, EmptyFields: emptyFields(p)}
-		// Open Icecat first when configured: brand-authorized normalized specs
-		// + vendor PDF links, independent of whatever the web search finds.
-		if src, ok, ierr := icecatSource(ctx, p); ok {
-			out.Sources = append(out.Sources, src)
-		} else if ierr != nil {
-			out.Notes = append(out.Notes, "icecat lookup failed (brand-authorized source skipped): "+ierr.Error())
+		// Icecat and every search angle run CONCURRENTLY — the serial version
+		// paid up to five 20s engine budgets back to back before fetching
+		// anything. Priority is preserved on collection: Icecat first, then
+		// query order (QVL angle leads for motherboards), then hit order.
+		var wg sync.WaitGroup
+		var icecatSrc deepSource
+		var icecatOK bool
+		var icecatErr error
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			icecatSrc, icecatOK, icecatErr = icecatSource(ctx, p)
+		}()
+		hitsByQuery := make([][]SearchHit, len(queries))
+		errByQuery := make([]error, len(queries))
+		for i, q := range queries {
+			wg.Add(1)
+			go func(i int, q string) {
+				defer wg.Done()
+				hitsByQuery[i], errByQuery[i] = searchRegion(ctx, q, 5, region)
+			}(i, q)
+		}
+		wg.Wait()
+		if icecatOK {
+			out.Sources = append(out.Sources, icecatSrc)
+		} else if icecatErr != nil {
+			out.Notes = append(out.Notes, "icecat lookup failed (brand-authorized source skipped): "+icecatErr.Error())
 		}
 		seen := map[string]bool{p.SourceURL: true, "": true}
-		for _, q := range queries {
-			hits, serr := searchRegion(ctx, q, 5, region)
-			if serr != nil {
-				out.Notes = append(out.Notes, fmt.Sprintf("search %q failed: %v", q, serr))
+		var cands []string
+		for i := range queries {
+			if errByQuery[i] != nil {
+				out.Notes = append(out.Notes, fmt.Sprintf("search %q failed: %v", queries[i], errByQuery[i]))
 			}
-			for _, h := range hits {
-				if seen[h.URL] || len(out.Sources) >= maxDeepSources {
-					continue
+			for _, h := range hitsByQuery[i] {
+				if !seen[h.URL] {
+					seen[h.URL] = true
+					cands = append(cands, h.URL)
 				}
-				seen[h.URL] = true
-				f, _, ferr := fetchCached(ctx, h.URL, "spec", false)
-				if ferr != nil {
-					out.Notes = append(out.Notes, fmt.Sprintf("source %s skipped: %v", h.URL, ferr))
-					continue // move on, search gave us more
-				}
-				text := f.Text
-				if len(text) > maxDeepSourceChars {
-					text = text[:maxDeepSourceChars] + "\n…(truncated)"
-				}
-				out.Sources = append(out.Sources, deepSource{URL: h.URL, Title: f.Title, Text: text})
 			}
+		}
+		// Fetch a couple past the target concurrently so one dead source
+		// doesn't cost a serial retry round; keep the first successes in
+		// priority order.
+		need := maxDeepSources - len(out.Sources)
+		if len(cands) > need+2 {
+			cands = cands[:need+2]
+		}
+		fetched := make([]Fetched, len(cands))
+		fetchErr := make([]error, len(cands))
+		for i, u := range cands {
+			wg.Add(1)
+			go func(i int, u string) {
+				defer wg.Done()
+				fetched[i], _, fetchErr[i] = fetchCached(ctx, u, "spec", false)
+			}(i, u)
+		}
+		wg.Wait()
+		for i, u := range cands {
 			if len(out.Sources) >= maxDeepSources {
 				break
 			}
+			if fetchErr[i] != nil {
+				out.Notes = append(out.Notes, fmt.Sprintf("source %s skipped: %v", u, fetchErr[i]))
+				continue
+			}
+			text := fetched[i].Text
+			if len(text) > maxDeepSourceChars {
+				text = text[:maxDeepSourceChars] + "\n…(truncated)"
+				// A truncated QVL/spec table cut mid-list looks complete —
+				// point at the full document instead of letting it.
+				out.Notes = append(out.Notes, fmt.Sprintf("source %s truncated at %d chars — fetch_content it directly (paginated) if a table you need is cut off", u, maxDeepSourceChars))
+			}
+			out.Sources = append(out.Sources, deepSource{URL: u, Title: fetched[i].Title, Text: text})
 		}
 		return nil, out, nil
 	})
@@ -1212,7 +1340,11 @@ func registerTools(s *mcp.Server) {
 			if err != nil {
 				return nil, loadSpecOut{}, err
 			}
-			return nil, loadSpecOut{Specs: specs}, nil
+			out := loadSpecOut{Specs: specs}
+			if len(specs) == 0 {
+				out.Note = "no saved specs yet — compose_spec to validate a build, then save_spec to keep it"
+			}
+			return nil, out, nil
 		}
 		_, rawIDs, rawOwned, err := store.loadSpec(in.ID)
 		if err != nil {

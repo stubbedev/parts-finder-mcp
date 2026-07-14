@@ -111,7 +111,90 @@ func writeCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), storeWriteTimeout)
 }
 
+// mergePart lays incoming non-zero fields over the stored row. A thin re-save
+// (id + category to hang a listing on) must never blank the socket, attrs, or
+// provides/requires that deep_specs spent real fetches filling in — enrichment
+// loss is silent and unrecoverable. Incoming known values still win, so a
+// correction overwrites; only "unknown" defers to what's stored.
+func mergePart(old, in Part) Part {
+	if in.Vendor == "" {
+		in.Vendor = old.Vendor
+	}
+	if in.Model == "" {
+		in.Model = old.Model
+	}
+	if in.Socket == "" {
+		in.Socket = old.Socket
+	}
+	if in.MemType == "" {
+		in.MemType = old.MemType
+	}
+	if in.MemSpeed == 0 {
+		in.MemSpeed = old.MemSpeed
+	}
+	if in.FormFactor == "" {
+		in.FormFactor = old.FormFactor
+	}
+	if in.TDPW == 0 {
+		in.TDPW = old.TDPW
+	}
+	if in.PCIeGen == 0 {
+		in.PCIeGen = old.PCIeGen
+	}
+	if in.PCIeLanes == 0 {
+		in.PCIeLanes = old.PCIeLanes
+	}
+	if len(in.PowerConnectors) == 0 {
+		in.PowerConnectors = old.PowerConnectors
+	}
+	if in.LengthMM == 0 {
+		in.LengthMM = old.LengthMM
+	}
+	if in.Watts == 0 {
+		in.Watts = old.Watts
+	}
+	if in.RawSpecs == "" {
+		in.RawSpecs = old.RawSpecs
+	}
+	if in.SourceURL == "" {
+		in.SourceURL = old.SourceURL
+	}
+	// Maps union per key, incoming wins — new extraction refines, old keys the
+	// new pass didn't look at survive.
+	in.Provides = mergeCounts(old.Provides, in.Provides)
+	in.Requires = mergeCounts(old.Requires, in.Requires)
+	if len(old.Attrs) > 0 {
+		merged := make(map[string]any, len(old.Attrs)+len(in.Attrs))
+		for k, v := range old.Attrs {
+			merged[k] = v
+		}
+		for k, v := range in.Attrs {
+			merged[k] = v
+		}
+		in.Attrs = merged
+	}
+	return in
+}
+
+func mergeCounts(old, in map[string]int) map[string]int {
+	if len(old) == 0 {
+		return in
+	}
+	merged := make(map[string]int, len(old)+len(in))
+	for k, v := range old {
+		merged[k] = v
+	}
+	for k, v := range in {
+		merged[k] = v
+	}
+	return merged
+}
+
 func (s *Store) savePart(p Part) error {
+	// Merge over any existing row so a partial save can't erase enrichment.
+	if olds, err := s.getParts([]string{p.ID}); err == nil && len(olds) == 1 {
+		p = mergePart(olds[0], p)
+	}
 	conns, _ := json.Marshal(p.PowerConnectors)
 	prov, _ := json.Marshal(p.Provides)
 	req, _ := json.Marshal(p.Requires)
@@ -634,8 +717,31 @@ func (s *Store) composeTree(ids []string, visiting map[string]bool) (Spec, error
 		for _, need := range child.Needs {
 			req[need.Resource] = need.Count * n
 		}
+		// Bubble the sums that parent-level capacity rules read (mode "sum"):
+		// a node's U-height and weight live on its chassis, but the rack rule
+		// runs at the parent — the synthetic aggregate must carry them. Rule-
+		// driven, so a saved rule's attribute bubbles without code changes.
+		// tdp_w is excluded: TDPW already carries it (flatten exposes both).
+		attrs := map[string]any{}
+		for _, r := range currentRules() {
+			if r.Kind != "capacity" || r.Mode != "sum" || r.AttrB == "tdp_w" {
+				continue
+			}
+			var sum float64
+			for _, cp := range child.Parts {
+				if v, ok := flattenNum(cp, r.AttrB); ok {
+					sum += v
+				}
+			}
+			if sum > 0 {
+				attrs[r.AttrB] = sum * float64(n)
+			}
+		}
+		if len(attrs) == 0 {
+			attrs = nil
+		}
 		level = append(level, Part{ID: "spec:" + sub, Category: subSpecCategory,
-			TDPW: child.TotalTDPW * n, Requires: req})
+			TDPW: child.TotalTDPW * n, Requires: req, Attrs: attrs})
 		for range n {
 			allParts = append(allParts, child.Parts...)
 		}
@@ -696,6 +802,25 @@ func (s *Store) loadRules() ([]CompatRule, error) {
 		out = append(out, r)
 	}
 	return out, nil
+}
+
+// tdpCategories returns the categories where at least one stored part declares
+// tdp_w — the learned "this kind of part draws power" signal drawCategories
+// builds on. One indexed scan of a small table; no cache needed.
+func (s *Store) tdpCategories() map[string]bool {
+	rows, err := s.db.Query(`SELECT DISTINCT category FROM parts WHERE tdp_w > 0`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var c string
+		if rows.Scan(&c) == nil {
+			out[c] = true
+		}
+	}
+	return out
 }
 
 // knownTokens returns every provides/requires resource token in the store —
