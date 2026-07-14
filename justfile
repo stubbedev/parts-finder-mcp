@@ -175,10 +175,20 @@ _release-checks:
         exit 1
     fi
     just check
-    if [ -n "$(git status --porcelain)" ]; then
+    # Only restage TRACKED files (-u): `add -A` once swept a 34MB stray binary
+    # into a release commit. Formatting can only ever touch tracked files.
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
         echo "Formatting/lint produced changes — staging + committing."
-        git add -A
+        git add -u
         git commit -m "chore: format code for release"
+    fi
+    # Repo hygiene: no tracked file over 1MB — a compiled binary or other
+    # blob in the tree bloats every clone forever.
+    BIG=$(git ls-files -z | xargs -0 -r du -b -- 2>/dev/null | awk '$1 > 1048576 {print $2}') || true
+    if [ -n "$BIG" ]; then
+        echo "Error: tracked files over 1MB — untrack before releasing:" >&2
+        echo "$BIG" >&2
+        exit 1
     fi
 
 _release bump:

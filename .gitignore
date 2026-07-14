@@ -1,2 +1,5 @@
 /parts-finder
+/parts-finder-mcp
+/bin/
 *.db
+*.xlsx
