@@ -97,9 +97,8 @@ Optional env:
 
 Claude Desktop has no `claude mcp add`; edit its config file directly.
 **Settings → Developer → Edit Config** opens `claude_desktop_config.json`
-(macOS: `~/Library/Application Support/Claude/`, Windows:
-`%APPDATA%\Claude\`). Add parts-finder under `mcpServers`, then restart
-Claude Desktop.
+(macOS: `~/Library/Application Support/Claude/`). Add parts-finder under
+`mcpServers`, then restart Claude Desktop.
 
 Docker (same volumes as above; add an `-v "<host>:/exports"` line to `args`
 if you want `export_spec` files on the host):
