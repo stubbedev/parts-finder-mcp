@@ -95,7 +95,17 @@ func fetchPDFBrowserish(ctx context.Context, rawURL string) (title, text string,
 	if resp.StatusCode != http.StatusOK {
 		return "", "", fmt.Errorf("pdf retry got %s", resp.Status)
 	}
-	return extractPDF(io.LimitReader(resp.Body, 64<<20))
+	// A PDF's xref table lives at the end — a cut file is unparseable or, worse,
+	// half-parseable. Refuse a truncated download rather than return partial junk
+	// (matching the primary extractResponse path).
+	raw, truncated, err := readCapped(resp.Body, 64<<20)
+	if err != nil {
+		return "", "", err
+	}
+	if truncated {
+		return "", "", fmt.Errorf("pdf %s exceeds the 64MB cap — find a smaller mirror of the document", rawURL)
+	}
+	return extractPDF(bytes.NewReader(raw))
 }
 
 // fetchImage downloads an image for visual reading (spec-sheet diagrams,
@@ -684,7 +694,10 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 	// would return empty text with no images), and don't cache near-empty
 	// text: a JS-shell SPA would poison the cache for the whole TTL and block
 	// a later render=true from ever seeing fresh content.
-	if len(f.Images) == 0 && len(strings.TrimSpace(f.Text)) >= minCacheChars {
+	// Don't cache a TRUNCATED extraction either: the cache carries no truncated
+	// flag, so a re-serve within the TTL (up to 30d for specs) would return the
+	// cut prefix as if it were the whole document — a silent half-a-spec-sheet.
+	if len(f.Images) == 0 && !f.Truncated && len(strings.TrimSpace(f.Text)) >= minCacheChars {
 		store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
 	}
 	return f, false, nil

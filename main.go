@@ -430,10 +430,11 @@ type convertIn struct {
 	To     string  `json:"to" jsonschema:"ISO currency code"`
 }
 type convertOut struct {
-	Amount    float64 `json:"amount"`
-	From      string  `json:"from"`
-	To        string  `json:"to"`
-	Converted float64 `json:"converted"`
+	Amount     float64 `json:"amount"`
+	From       string  `json:"from"`
+	To         string  `json:"to"`
+	Converted  float64 `json:"converted"`
+	RatesStale string  `json:"rates_stale,omitempty"` // set when the live refresh failed and an aged fallback rate was used (its age)
 }
 
 // pricePart returns a part's listings fully evaluated for buying NOW:
@@ -509,11 +510,17 @@ func registerTools(s *mcp.Server) {
 		Name:        "fetch_content",
 		Description: "Fetch a URL and return readable text (HTML tables + PDFs preserved), smartly cached. Bot-blocked sites auto-escalate to a headless browser. `kind` tunes cache freshness: \"spec\" (datasheets, ~30d), \"listing\" (prices, ~1h), or \"page\" (default, ~1d); stale entries are cheaply revalidated. Big documents are PAGINATED: when next_offset is set, more text remains — re-call with offset=next_offset (served from cache) until you've seen what you need. Use this to read spec/listing pages, then save_part / save_listing.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in fetchIn) (*mcp.CallToolResult, fetchOut, error) {
-		// Offset pages read the CACHED text — re-rendering per page would
-		// hydrate different text and silently skip/duplicate rows.
+		// Offset pages MUST read the same cached text page 1 came from. If the
+		// cache entry expired (listing TTL is 1h) or was never stored, fetchCached
+		// re-downloads live — differently extracted text against which the old byte
+		// offset skips/duplicates rows. Require a cache hit for offset>0 and tell
+		// the caller to restart pagination rather than serve a silent mismatch.
 		f, cached, err := fetchCached(ctx, in.URL, in.Kind, in.Render && in.Offset == 0)
 		if err != nil {
 			return nil, fetchOut{}, err
+		}
+		if in.Offset > 0 && !cached {
+			return nil, fetchOut{}, fmt.Errorf("the cached copy of %s expired between pages — re-call with offset=0 to re-paginate (byte offsets from the old copy no longer line up)", in.URL)
 		}
 		text, total, next := pageText(f.Text, in.Offset)
 		if in.Offset > 0 && text == "" {
@@ -528,8 +535,14 @@ func registerTools(s *mcp.Server) {
 		if !f.FetchedAt.IsZero() {
 			out.FetchedAt = f.FetchedAt.UTC().Format(time.RFC3339)
 		}
-		if len(f.Images) == 0 && !f.Rendered && total < minCacheChars {
-			out.Note = "extracted text is very thin — likely a JS-rendered page; retry with render=true"
+		if len(f.Images) == 0 && total < minCacheChars {
+			// A rendered page that's STILL thin must not pass silently — the model
+			// would read near-empty text as "the page says nothing" (ground truth).
+			if f.Rendered {
+				out.Note = "extracted text is very thin even after rendering — the page may hydrate slowly or block headless browsers; content is likely incomplete"
+			} else {
+				out.Note = "extracted text is very thin — likely a JS-rendered page; retry with render=true"
+			}
 		}
 		// Scanned PDF: no text layer, so return the page images as vision
 		// blocks for the model to OCR directly.
@@ -586,6 +599,19 @@ func registerTools(s *mcp.Server) {
 		}
 		if p.ID == "" {
 			return nil, savePartOut{}, fmt.Errorf("cannot derive id: provide id or vendor/model")
+		}
+		// A negative provides/requires count is always an extraction error, and a
+		// negative REQUIRES silently cancels real demand — the build then reports
+		// no shortage for a slot it actually overflows. Reject at the door.
+		for tok, n := range p.Provides {
+			if n < 0 {
+				return nil, savePartOut{}, fmt.Errorf("provides[%q]=%d: resource counts can't be negative", tok, n)
+			}
+		}
+		for tok, n := range p.Requires {
+			if n < 0 {
+				return nil, savePartOut{}, fmt.Errorf("requires[%q]=%d: resource counts can't be negative", tok, n)
+			}
 		}
 		if p.FetchedAt.IsZero() {
 			p.FetchedAt = time.Now()
@@ -774,9 +800,14 @@ func registerTools(s *mcp.Server) {
 		if err := store.saveRule(r); err != nil {
 			return nil, savePartOut{}, err
 		}
-		if rs, err := store.loadRules(); err == nil {
-			setRuleOverlay(rs) // rules apply immediately, not on next restart
+		// Reload the overlay so the rule bites immediately. If reload fails the
+		// rule is persisted but INACTIVE — say so rather than return a bare
+		// success that hides a compat engine still running on the old rule set.
+		rs, err := store.loadRules()
+		if err != nil {
+			return nil, savePartOut{}, fmt.Errorf("rule saved but overlay reload failed (%w) — restart the server to apply it", err)
 		}
+		setRuleOverlay(rs)
 		return nil, savePartOut{ID: r.Name}, nil
 	})
 
@@ -1161,11 +1192,15 @@ func registerTools(s *mcp.Server) {
 		Name:        "convert_currency",
 		Description: "Convert an amount between currencies using indicative ECB reference rates (frankfurter.app). For guiding figures, not accounting.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in convertIn) (*mcp.CallToolResult, convertOut, error) {
-		v, err := convert(ctx, in.Amount, in.From, in.To)
+		v, staleAge, err := convert(ctx, in.Amount, in.From, in.To)
 		if err != nil {
 			return nil, convertOut{}, err
 		}
-		return nil, convertOut{Amount: in.Amount, From: strings.ToUpper(in.From), To: strings.ToUpper(in.To), Converted: v}, nil
+		out := convertOut{Amount: in.Amount, From: strings.ToUpper(in.From), To: strings.ToUpper(in.To), Converted: v}
+		if staleAge > 0 {
+			out.RatesStale = staleAge.Round(time.Hour).String()
+		}
+		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{

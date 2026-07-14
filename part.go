@@ -330,7 +330,17 @@ func flattenStr(p Part, attr string) (string, bool) {
 	if !ok || v == nil {
 		return "", false
 	}
-	s := strings.TrimSpace(fmt.Sprint(v))
+	// JSON numbers decode as float64, and fmt.Sprint renders values >=1e6 in
+	// scientific notation ("4.71e+12") — which silently corrupts a 13-digit
+	// GTIN/EAN used for EXACT Icecat lookups (a mangled code just 4xx's and
+	// looks like a catalog miss). Format numbers in plain decimal instead.
+	var raw string
+	if f, isFloat := v.(float64); isFloat {
+		raw = strconv.FormatFloat(f, 'f', -1, 64)
+	} else {
+		raw = fmt.Sprint(v)
+	}
+	s := strings.TrimSpace(raw)
 	if s == "" || s == "0" {
 		return "", false
 	}

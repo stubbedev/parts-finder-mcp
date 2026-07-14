@@ -30,28 +30,40 @@ var (
 
 const fxTTL = 24 * time.Hour
 
-func ratesFor(ctx context.Context, base string) (map[string]float64, error) {
+// maxFXStale caps how old a fallback rate may be. Within this window an expired
+// rate still ranks deals fine (ECB reference rates drift slowly); PAST it, a
+// refresh failure must ERROR rather than silently convert on a weeks-old rate —
+// bounded drift, never accounting-wrong figures with no signal.
+const maxFXStale = 7 * 24 * time.Hour
+
+// ratesFor returns the rate table for base plus staleAge: 0 when fresh, or the
+// age of the served-stale fallback set (caller decides whether to surface it).
+func ratesFor(ctx context.Context, base string) (rates map[string]float64, staleAge time.Duration, err error) {
 	base = strings.ToUpper(base)
 	fxMu.Lock()
 	rs, ok := fxCache[base]
 	fxMu.Unlock()
 	if ok && time.Since(rs.fetched) < fxTTL {
-		return rs.rates, nil
+		return rs.rates, 0, nil
 	}
-	// On any fetch failure below, an EXPIRED cached set still beats no rates:
-	// hours-stale reference rates rank deals fine; a conversion failure would
-	// silently drop listings out of cross-currency comparison instead.
-	staleOr := func(err error) (map[string]float64, error) {
+	// On any fetch failure below, an EXPIRED-BUT-RECENT cached set still beats no
+	// rates: a conversion failure would silently drop listings out of
+	// cross-currency comparison. But refuse a set older than maxFXStale.
+	staleOr := func(err error) (map[string]float64, time.Duration, error) {
 		if ok {
+			age := time.Since(rs.fetched)
+			if age > maxFXStale {
+				return nil, 0, fmt.Errorf("fx rates for %s are %s old and refresh failed (%w) — refusing to convert on rates this stale", base, age.Round(time.Hour), err)
+			}
 			fmt.Fprintf(os.Stderr, "parts-finder: fx refresh for %s failed (%v), using rates from %s\n", base, err, rs.fetched.Format(time.RFC3339))
-			return rs.rates, nil
+			return rs.rates, age, nil
 		}
-		return nil, err
+		return nil, 0, err
 	}
 	u := "https://api.frankfurter.app/latest?base=" + url.QueryEscape(base)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -68,34 +80,34 @@ func ratesFor(ctx context.Context, base string) (map[string]float64, error) {
 		return staleOr(err)
 	}
 	if body.Rates == nil { // 200 with no rates (unknown base) — nil-map write would panic
-		return nil, fmt.Errorf("frankfurter returned no rates for %s", base)
+		return nil, 0, fmt.Errorf("frankfurter returned no rates for %s", base)
 	}
 	body.Rates[base] = 1 // base->base
 	fxMu.Lock()
 	fxCache[base] = rateSet{rates: body.Rates, fetched: time.Now()}
 	fxMu.Unlock()
-	return body.Rates, nil
+	return body.Rates, 0, nil
 }
 
 // convert returns amount in `from` currency expressed in `to`. Returns an error
 // if either currency is unknown to the rate source — or empty: silently
 // treating an unlabeled amount as already-converted is how a SEK price ends up
 // ranked as DKK.
-func convert(ctx context.Context, amount float64, from, to string) (float64, error) {
+func convert(ctx context.Context, amount float64, from, to string) (converted float64, staleAge time.Duration, err error) {
 	from, to = strings.ToUpper(from), strings.ToUpper(to)
 	if from == "" || to == "" {
-		return 0, fmt.Errorf("convert: missing currency (from=%q to=%q)", from, to)
+		return 0, 0, fmt.Errorf("convert: missing currency (from=%q to=%q)", from, to)
 	}
 	if from == to {
-		return amount, nil
+		return amount, 0, nil
 	}
-	rates, err := ratesFor(ctx, from)
+	rates, staleAge, err := ratesFor(ctx, from)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	rate, ok := rates[to]
 	if !ok {
-		return 0, fmt.Errorf("no rate %s->%s", from, to)
+		return 0, 0, fmt.Errorf("no rate %s->%s", from, to)
 	}
-	return amount * rate, nil
+	return amount * rate, staleAge, nil
 }

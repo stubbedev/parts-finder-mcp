@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -23,6 +24,11 @@ func openStore(path string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One connection serializes this process's writers (no intra-process
+	// SQLITE_BUSY) and, crucially, keeps ":memory:" test stores coherent — a
+	// pool would give each conn its own in-memory DB. Reads never hold the conn
+	// across network (handlers fetch AFTER the store call returns), so a write
+	// waits at most one fast query; storeWriteTimeout bounds even that.
 	db.SetMaxOpenConns(1)
 	schema := `
 CREATE TABLE IF NOT EXISTS parts (
@@ -94,12 +100,25 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	return &Store{db}, nil
 }
 
+// storeWriteTimeout bounds every write. A save is sub-second; if it can't
+// finish in this window the DB is wedged or contended, and a FAST clean error
+// the agent can retry beats minutes of dead air — a client reads a silent hang
+// as a broken tool. Independent of the request deadline so a write stays
+// cancellable even when a handler forwards no context (the save handlers don't).
+const storeWriteTimeout = 15 * time.Second
+
+func writeCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), storeWriteTimeout)
+}
+
 func (s *Store) savePart(p Part) error {
 	conns, _ := json.Marshal(p.PowerConnectors)
 	prov, _ := json.Marshal(p.Provides)
 	req, _ := json.Marshal(p.Requires)
 	attrs, _ := json.Marshal(p.Attrs)
-	_, err := s.db.Exec(`
+	ctx, cancel := writeCtx()
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `
 INSERT INTO parts (id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
   tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
   attrs,raw_specs,source_url,fetched_at)
@@ -246,9 +265,22 @@ func fromNullBool(n sql.NullInt64) *bool {
 	return &b
 }
 
+// partExists reports whether a part id is stored — the guard that keeps a
+// typo'd part_id from persisting an ORPHAN listing (a saved price find_deals
+// can never reach, indistinguishable from "no deal recorded").
+func (s *Store) partExists(id string) bool {
+	var one int
+	return s.db.QueryRow(`SELECT 1 FROM parts WHERE id=? LIMIT 1`, id).Scan(&one) == nil
+}
+
 func (s *Store) saveListing(l Listing) error {
+	if !s.partExists(l.PartID) {
+		return fmt.Errorf("unknown part id %q — save_part before save_listing", l.PartID)
+	}
 	ships, _ := json.Marshal(l.ShipsTo)
-	_, err := s.db.Exec(`INSERT INTO listings
+	ctx, cancel := writeCtx()
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO listings
   (id,part_id,vendor,price,shipping,currency,condition,url,ships_to,seen_at,
    vat_included,vat_rate,qty_available,in_stock,lead_days)
   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
@@ -273,16 +305,18 @@ ON CONFLICT(id) DO UPDATE SET part_id=excluded.part_id,vendor=excluded.vendor,
 // The tool promises every price change is kept, so a lost insert must fail
 // the save, not vanish silently.
 func (s *Store) recordHistory(l Listing) error {
+	ctx, cancel := writeCtx()
+	defer cancel()
 	var price float64
 	var shipping sql.NullFloat64
-	err := s.db.QueryRow(`SELECT price, shipping FROM listing_history
+	err := s.db.QueryRowContext(ctx, `SELECT price, shipping FROM listing_history
   WHERE listing_id=? ORDER BY seen_at DESC, rowid DESC LIMIT 1`, l.ID).Scan(&price, &shipping)
 	sameShipping := (l.Shipping == nil && !shipping.Valid) ||
 		(l.Shipping != nil && shipping.Valid && *l.Shipping == shipping.Float64)
 	if err == nil && price == l.Price && sameShipping {
 		return nil
 	}
-	_, err = s.db.Exec(`INSERT INTO listing_history
+	_, err = s.db.ExecContext(ctx, `INSERT INTO listing_history
   (listing_id,part_id,vendor,price,shipping,currency,seen_at)
   VALUES (?,?,?,?,?,?,?)`,
 		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency,
@@ -292,9 +326,13 @@ func (s *Store) recordHistory(l Listing) error {
 
 // utcRFC3339 renders a timestamp for storage. Always UTC: timestamps are
 // compared and ORDERed as strings, and mixed zone offsets ("Z" vs "+02:00")
-// break lexicographic time order. Nano resolution so same-second history rows
-// still order deterministically (RFC3339 parsing accepts fractional seconds).
-func utcRFC3339(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
+// break lexicographic time order. FIXED-WIDTH nanoseconds (not RFC3339Nano,
+// which drops trailing zeros): "…00Z" would otherwise sort AFTER "…00.5Z"
+// (because 'Z' > '.'), mis-ordering same-second rows written at whole vs
+// fractional seconds. Padding to 9 digits keeps string order == time order.
+func utcRFC3339(t time.Time) string {
+	return t.UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+}
 
 // PriceObs is one historical price observation for a listing.
 type PriceObs struct {
@@ -384,10 +422,45 @@ func (s *Store) knownVendors(country string) (map[string]bool, error) {
 	return out, nil
 }
 
+// validateSpecRefs rejects a spec save that points at parts or sub-specs that
+// don't exist (a typo'd id), forms a cycle, or lists an owned unit not in the
+// build. Without it a dangling spec persists silently and only breaks later at
+// load/compose — exactly the kind of footgun a save should catch at the door.
+func (s *Store) validateSpecRefs(partIDs, ownedIDs []string) error {
+	if len(partIDs) == 0 {
+		return fmt.Errorf("part_ids is empty — a spec with no parts is almost always a mistake")
+	}
+	// expandSpecIDs resolves "spec:<id>" refs, surfacing missing sub-specs and
+	// cycles; getParts then errors on any unknown concrete part id.
+	parts, owned, err := s.expandSpecIDs(partIDs, ownedIDs)
+	if err != nil {
+		return err
+	}
+	if _, err := s.getParts(parts); err != nil {
+		return fmt.Errorf("%w — save the parts (save_part) before the spec", err)
+	}
+	have := map[string]int{}
+	for _, id := range parts {
+		have[id]++
+	}
+	for _, id := range owned {
+		if have[id] == 0 {
+			return fmt.Errorf("owned id %q is not in the build's parts — you can't own what isn't in the spec", id)
+		}
+		have[id]--
+	}
+	return nil
+}
+
 func (s *Store) saveSpec(id, name string, partIDs, ownedIDs []string) error {
+	if err := s.validateSpecRefs(partIDs, ownedIDs); err != nil {
+		return err
+	}
 	ids, _ := json.Marshal(partIDs)
 	owned, _ := json.Marshal(ownedIDs)
-	_, err := s.db.Exec(`INSERT INTO specs (id,name,part_ids,owned_ids,created_at) VALUES (?,?,?,?,?)
+	ctx, cancel := writeCtx()
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO specs (id,name,part_ids,owned_ids,created_at) VALUES (?,?,?,?,?)
 ON CONFLICT(id) DO UPDATE SET name=excluded.name,part_ids=excluded.part_ids,
   owned_ids=excluded.owned_ids`,
 		id, name, string(ids), string(owned), utcRFC3339(time.Now()))
@@ -583,7 +656,9 @@ func (s *Store) composeTree(ids []string, visiting map[string]bool) (Spec, error
 
 // saveRule upserts a store compat rule (added, overridden, or disabled).
 func (s *Store) saveRule(r CompatRule) error {
-	_, err := s.db.Exec(`INSERT INTO compat_rules
+	ctx, cancel := writeCtx()
+	defer cancel()
+	_, err := s.db.ExecContext(ctx, `INSERT INTO compat_rules
   (name,kind,cat_a,attr_a,cat_b,attr_b,mode,note,source_url,disabled)
   VALUES (?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(name) DO UPDATE SET kind=excluded.kind,cat_a=excluded.cat_a,
@@ -673,7 +748,9 @@ func (s *Store) getCache(url string) (cacheRec, bool) {
 // putCache is best-effort — a failed cache write must not fail the fetch, but
 // it is logged (stderr, so the stdio protocol stays clean).
 func (s *Store) putCache(url, title, content, etag, lastMod, kind string) {
-	if _, err := s.db.Exec(`INSERT INTO content_cache (url,title,content,etag,last_modified,kind,fetched_at)
+	ctx, cancel := writeCtx()
+	defer cancel()
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO content_cache (url,title,content,etag,last_modified,kind,fetched_at)
   VALUES (?,?,?,?,?,?,?)
 ON CONFLICT(url) DO UPDATE SET title=excluded.title,content=excluded.content,
   etag=excluded.etag,last_modified=excluded.last_modified,kind=excluded.kind,
@@ -686,7 +763,9 @@ ON CONFLICT(url) DO UPDATE SET title=excluded.title,content=excluded.content,
 // touchCache bumps fetched_at after a 304 — the content is still current, so
 // reset its TTL without re-storing the body. Best-effort like putCache.
 func (s *Store) touchCache(url string) {
-	if _, err := s.db.Exec(`UPDATE content_cache SET fetched_at=? WHERE url=?`,
+	ctx, cancel := writeCtx()
+	defer cancel()
+	if _, err := s.db.ExecContext(ctx, `UPDATE content_cache SET fetched_at=? WHERE url=?`,
 		utcRFC3339(time.Now()), url); err != nil {
 		log.Printf("cache touch failed for %s: %v", url, err)
 	}

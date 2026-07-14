@@ -13,6 +13,12 @@ func TestExpandSpecIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Parts must exist before a spec references them (save-time validation).
+	for _, id := range []string{"cpu", "ram", "switch", "pdu"} {
+		if err := st.savePart(Part{ID: id}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := st.saveSpec("node", "", []string{"cpu", "ram", "ram"}, []string{"ram"}); err != nil {
 		t.Fatal(err)
 	}
@@ -31,12 +37,42 @@ func TestExpandSpecIDs(t *testing.T) {
 	if oc := toCount(owned); oc["ram"] != 2 {
 		t.Fatalf("sub-spec owned must carry up per instance, got %v", owned)
 	}
-	// Cycle: a spec referencing itself must error, not recurse forever.
-	if err := st.saveSpec("loop", "", []string{"spec:loop"}, nil); err != nil {
+	// Load-time cycle guard: the save validator rejects a self-referential spec,
+	// so insert one directly to prove expand ERRORS instead of recursing forever.
+	if _, err := st.db.Exec(
+		`INSERT INTO specs (id,name,part_ids,owned_ids,created_at) VALUES ('loop','','["spec:loop"]','',?)`,
+		utcRFC3339(time.Now())); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := st.expandSpecIDs([]string{"spec:loop"}, nil); err == nil {
 		t.Fatal("cycle must error")
+	}
+}
+
+// save_spec must reject footguns at the door: no parts, dangling/typo'd ids, or
+// an owned unit not in the build — a broken spec must never persist silently.
+func TestSaveSpecValidation(t *testing.T) {
+	st, err := openStore(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.saveSpec("s", "", nil, nil); err == nil {
+		t.Error("empty part_ids must be rejected")
+	}
+	if err := st.saveSpec("s", "", []string{"ghost"}, nil); err == nil {
+		t.Error("unknown part id must be rejected")
+	}
+	if err := st.savePart(Part{ID: "a"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.savePart(Part{ID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.saveSpec("s", "", []string{"a"}, []string{"b"}); err == nil {
+		t.Error("owned id not in the build must be rejected")
+	}
+	if err := st.saveSpec("s", "", []string{"a", "b"}, []string{"a"}); err != nil {
+		t.Errorf("valid spec must save: %v", err)
 	}
 }
 
@@ -118,6 +154,9 @@ func TestComposeHierarchical(t *testing.T) {
 func TestPriceHistory(t *testing.T) {
 	st, err := openStore(":memory:")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.savePart(Part{ID: "p1"}); err != nil {
 		t.Fatal(err)
 	}
 	l := Listing{ID: "l1", PartID: "p1", Price: 100, Currency: "DKK",
@@ -213,6 +252,9 @@ func TestRulesRoundTrip(t *testing.T) {
 func TestListingFieldsRoundTrip(t *testing.T) {
 	st, err := openStore(":memory:")
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.savePart(Part{ID: "p1"}); err != nil {
 		t.Fatal(err)
 	}
 	tr := true

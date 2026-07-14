@@ -148,7 +148,7 @@ func cheapestConverted(ctx context.Context, ls []Listing, currency string) (List
 			if l.Currency == "" {
 				continue // unknown currency can't be ranked against converted totals
 			}
-			c, err := convert(ctx, t, l.Currency, currency)
+			c, _, err := convert(ctx, t, l.Currency, currency)
 			if err != nil {
 				continue // can't compare -> skip
 			}
@@ -183,7 +183,7 @@ func annotateDisplay(ctx context.Context, ls []Listing, display string) {
 			ls[i].Unconverted = true // saved before currency became required
 			continue
 		}
-		if v, err := convert(ctx, ls[i].total(), ls[i].Currency, display); err == nil {
+		if v, _, err := convert(ctx, ls[i].total(), ls[i].Currency, display); err == nil {
 			ls[i].DisplayTotal = v
 			ls[i].DisplayCurr = display
 		} else {
@@ -191,7 +191,7 @@ func annotateDisplay(ctx context.Context, ls []Listing, display string) {
 			continue
 		}
 		if ex, ok := ls[i].exVATTotal(); ok {
-			if v, err := convert(ctx, ex, ls[i].Currency, display); err == nil {
+			if v, _, err := convert(ctx, ex, ls[i].Currency, display); err == nil {
 				ls[i].DisplayExVAT = v
 			}
 		}
@@ -295,6 +295,13 @@ func probeURL(ctx context.Context, u string) bool {
 		default:
 			return true // 403/429/5xx/challenges — ambiguous, never kill a deal on ambiguity
 		}
+	}
+	// A deadline/cancellation (10s budget spent on gate queue + retries, or the
+	// parent request ending) is NOT proof the listing is gone — killing it here
+	// would drop a live deal from the totals. Only a genuine transport failure
+	// with time left counts as dead.
+	if ctx.Err() != nil {
+		return true
 	}
 	return false // network-level failure on both methods
 }

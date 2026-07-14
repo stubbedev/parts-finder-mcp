@@ -5,6 +5,22 @@ import (
 	"testing"
 )
 
+// A 13-digit GTIN saved as a JSON number (→ float64) must read back as plain
+// decimal, not "4.71e+12" — the mangled form silently breaks Icecat lookups.
+func TestFlattenStrNumericGTIN(t *testing.T) {
+	p := Part{Attrs: map[string]any{"gtin": float64(4711234567891), "mpn": "ABC-123"}}
+	if got, ok := flattenStr(p, "gtin"); !ok || got != "4711234567891" {
+		t.Errorf("numeric GTIN: got %q (ok=%v), want \"4711234567891\"", got, ok)
+	}
+	if got, ok := flattenStr(p, "mpn"); !ok || got != "ABC-123" {
+		t.Errorf("string MPN: got %q (ok=%v)", got, ok)
+	}
+	// A zero-valued number still reads as unknown, not "0".
+	if _, ok := flattenStr(Part{Attrs: map[string]any{"gtin": float64(0)}}, "gtin"); ok {
+		t.Error("zero numeric attr must read as unknown")
+	}
+}
+
 // Self-test: known-good build has no violations; known-bad build fires the
 // expected rules. Guards the compat engine against silent breakage.
 func TestCompat(t *testing.T) {
