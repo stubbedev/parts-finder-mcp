@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -32,7 +34,11 @@ func recoverLog(where string) {
 
 // fingerprints: realistic desktop browser identities. One is chosen per host
 // (hashed) and kept stable for the process — flipping identity mid-session is
-// itself a bot tell.
+// itself a bot tell. The Chrome/Firefox versions below are pinned FALLBACKS:
+// refreshFingerprints splices in the current stable majors from the vendors'
+// keyless version APIs once per process, so the identities never age. (No Go
+// package does this — UA packages embed static lists that go stale exactly
+// like a pinned string.) Safari's version churns slowly; it stays pinned.
 var fingerprints = []struct {
 	UA         string
 	AcceptLang string
@@ -63,6 +69,98 @@ var fingerprints = []struct {
 		SecChUA:    "",
 		Platform:   "",
 	},
+}
+
+// Pinned fallback majors baked into the fingerprint strings above — must
+// match them, they're the search keys refreshFingerprints replaces.
+const (
+	pinnedChromeMajor  = "131"
+	pinnedFirefoxMajor = "133"
+)
+
+var fpOnce sync.Once
+
+// refreshFingerprints replaces the pinned Chrome/Firefox majors with the
+// current stable ones, once per process, before the first outbound request.
+// Best-effort with a benign fallback: a slightly old UA still works, so a
+// failed lookup (offline start) keeps the pins and is not retried.
+func refreshFingerprints(ctx context.Context) {
+	fpOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		if v := latestChromeMajor(ctx); v != "" && v != pinnedChromeMajor {
+			for i := range fingerprints {
+				fp := &fingerprints[i]
+				fp.UA = strings.ReplaceAll(fp.UA, "Chrome/"+pinnedChromeMajor+".", "Chrome/"+v+".")
+				fp.SecChUA = strings.ReplaceAll(fp.SecChUA, `v="`+pinnedChromeMajor+`"`, `v="`+v+`"`)
+			}
+		}
+		if v := latestFirefoxMajor(ctx); v != "" && v != pinnedFirefoxMajor {
+			for i := range fingerprints {
+				fp := &fingerprints[i]
+				fp.UA = strings.ReplaceAll(fp.UA, "rv:"+pinnedFirefoxMajor+".0", "rv:"+v+".0")
+				fp.UA = strings.ReplaceAll(fp.UA, "Firefox/"+pinnedFirefoxMajor+".0", "Firefox/"+v+".0")
+			}
+		}
+	})
+}
+
+// latestChromeMajor: current stable Chrome major from Google's keyless
+// versionhistory API. "" on any failure.
+func latestChromeMajor(ctx context.Context) string {
+	var body struct {
+		Versions []struct {
+			Version string `json:"version"`
+		} `json:"versions"`
+	}
+	if !fetchJSON(ctx, "https://versionhistory.googleapis.com/v1/chrome/platforms/linux/channels/stable/versions?pageSize=1", &body) ||
+		len(body.Versions) == 0 {
+		return ""
+	}
+	return majorOf(body.Versions[0].Version)
+}
+
+// latestFirefoxMajor: current release Firefox major from Mozilla's keyless
+// product-details API. "" on any failure.
+func latestFirefoxMajor(ctx context.Context) string {
+	var body struct {
+		Latest string `json:"LATEST_FIREFOX_VERSION"`
+	}
+	if !fetchJSON(ctx, "https://product-details.mozilla.org/1.0/firefox_versions.json", &body) {
+		return ""
+	}
+	return majorOf(body.Latest)
+}
+
+// fetchJSON GETs a trusted vendor API straight through httpClient (no
+// fingerprinting/throttling — and doRequest would recurse into refresh).
+func fetchJSON(ctx context.Context, u string, out any) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return false
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	return json.NewDecoder(resp.Body).Decode(out) == nil
+}
+
+// majorOf extracts the leading numeric major from "137.0.7151.68" ("" if the
+// value isn't version-shaped — never splice junk into a UA).
+func majorOf(v string) string {
+	maj, _, _ := strings.Cut(v, ".")
+	if maj == "" {
+		return ""
+	}
+	if _, err := strconv.Atoi(maj); err != nil {
+		return ""
+	}
+	return maj
 }
 
 func fingerprintFor(host string) int {
@@ -162,6 +260,7 @@ const maxAttempts = 4
 // (e.g. Referer, Accept overrides) win over the defaults. The returned
 // response's Body is open — caller closes it.
 func doRequest(ctx context.Context, method, rawURL string, extra map[string]string) (*http.Response, error) {
+	refreshFingerprints(ctx) // once per process, before the first fingerprinted request
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
