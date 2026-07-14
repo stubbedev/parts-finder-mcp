@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -37,6 +38,16 @@ func ratesFor(ctx context.Context, base string) (map[string]float64, error) {
 	if ok && time.Since(rs.fetched) < fxTTL {
 		return rs.rates, nil
 	}
+	// On any fetch failure below, an EXPIRED cached set still beats no rates:
+	// hours-stale reference rates rank deals fine; a conversion failure would
+	// silently drop listings out of cross-currency comparison instead.
+	staleOr := func(err error) (map[string]float64, error) {
+		if ok {
+			fmt.Fprintf(os.Stderr, "parts-finder: fx refresh for %s failed (%v), using rates from %s\n", base, err, rs.fetched.Format(time.RFC3339))
+			return rs.rates, nil
+		}
+		return nil, err
+	}
 	u := "https://api.frankfurter.app/latest?base=" + url.QueryEscape(base)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
@@ -44,17 +55,17 @@ func ratesFor(ctx context.Context, base string) (map[string]float64, error) {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return staleOr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("frankfurter returned %s", resp.Status)
+		return staleOr(fmt.Errorf("frankfurter returned %s", resp.Status))
 	}
 	var body struct {
 		Rates map[string]float64 `json:"rates"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		return nil, err
+		return staleOr(err)
 	}
 	if body.Rates == nil { // 200 with no rates (unknown base) — nil-map write would panic
 		return nil, fmt.Errorf("frankfurter returned no rates for %s", base)
@@ -67,10 +78,15 @@ func ratesFor(ctx context.Context, base string) (map[string]float64, error) {
 }
 
 // convert returns amount in `from` currency expressed in `to`. Returns an error
-// if either currency is unknown to the rate source.
+// if either currency is unknown to the rate source — or empty: silently
+// treating an unlabeled amount as already-converted is how a SEK price ends up
+// ranked as DKK.
 func convert(ctx context.Context, amount float64, from, to string) (float64, error) {
 	from, to = strings.ToUpper(from), strings.ToUpper(to)
-	if from == to || from == "" || to == "" {
+	if from == "" || to == "" {
+		return 0, fmt.Errorf("convert: missing currency (from=%q to=%q)", from, to)
+	}
+	if from == to {
 		return amount, nil
 	}
 	rates, err := ratesFor(ctx, from)

@@ -19,6 +19,7 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	readability "github.com/go-shiori/go-readability"
 	"github.com/ledongthuc/pdf"
+	"golang.org/x/net/html/charset"
 )
 
 // Plain HTTP + DDG HTML endpoint covers static vendor/reseller pages;
@@ -36,19 +37,41 @@ var httpClient = newHTTPClient()
 
 func newHTTPClient() *http.Client {
 	jar, _ := cookiejar.New(nil) // only errors on nil PublicSuffixList options
-	return &http.Client{Timeout: 30 * time.Second, Jar: jar}
+	// Header timeout catches dead hosts fast; the overall timeout only bounds
+	// the body read, so a big datasheet on a slow link isn't killed at 30s.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	return &http.Client{Timeout: 120 * time.Second, Jar: jar, Transport: tr}
 }
 
 // get fetches a URL through the hardened core, preferring https: it upgrades
-// plain-http URLs and falls back to the original scheme only if TLS won't
-// answer.
+// plain-http URLs and falls back to the original scheme if TLS won't answer —
+// or answers with an error status (a parked https vhost must not shadow a
+// working http:// page).
 func get(ctx context.Context, u string) (*http.Response, error) {
 	if strings.HasPrefix(u, "http://") {
 		if resp, err := doRequest(ctx, http.MethodGet, "https://"+strings.TrimPrefix(u, "http://"), nil); err == nil {
-			return resp, nil
+			if resp.StatusCode < 400 {
+				return resp, nil
+			}
+			drainClose(resp.Body)
 		}
 	}
 	return doRequest(ctx, http.MethodGet, u, nil)
+}
+
+// readCapped reads r up to cap bytes and reports whether the source had more —
+// a hit cap is TRUNCATION and the caller must say so, never present a cut
+// document as complete.
+func readCapped(r io.Reader, cap int64) (data []byte, truncated bool, err error) {
+	data, err = io.ReadAll(io.LimitReader(r, cap+1))
+	if err != nil {
+		return nil, false, err
+	}
+	if int64(len(data)) > cap {
+		return data[:cap], true, nil
+	}
+	return data, false, nil
 }
 
 // fetchPDFBrowserish re-tries a bot-blocked PDF download with a site-root
@@ -85,9 +108,14 @@ func fetchImage(ctx context.Context, rawURL, mode string, maxEdge int) (data []b
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("fetch image %s: %s", rawURL, resp.Status)
 	}
-	data, err = io.ReadAll(io.LimitReader(resp.Body, 12<<20)) // 12MB cap
+	data, truncated, err := readCapped(resp.Body, 12<<20) // 12MB cap
 	if err != nil {
 		return nil, "", err
+	}
+	if truncated {
+		// A cut image still has a valid header — vision would silently read
+		// half a spec sheet. Fail loudly instead.
+		return nil, "", fmt.Errorf("fetch image %s: exceeds the 12MB cap", rawURL)
 	}
 	mime = resp.Header.Get("Content-Type")
 	if i := strings.IndexByte(mime, ';'); i >= 0 {
@@ -308,6 +336,22 @@ func isDDGAnomaly(body []byte) bool {
 	return strings.Contains(b, "anomaly") || strings.Contains(b, "bots use duckduckgo")
 }
 
+// isChallengePage recognizes generic bot-wall/challenge markers. A 200
+// challenge page parses to zero hits — without this check that reads as "the
+// query has no results" and the chain stops instead of trying the next engine.
+func isChallengePage(body []byte) bool {
+	b := strings.ToLower(string(body))
+	for _, marker := range []string{
+		"verify you are human", "are you a robot", "unusual traffic",
+		"enable javascript and cookies", "captcha", "cf-challenge",
+	} {
+		if strings.Contains(b, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // searchDDGLite scrapes lite.duckduckgo.com — a separate, simpler endpoint
 // with its own throttle bucket; often up when /html is angry.
 func searchDDGLite(ctx context.Context, query string, limit int, r Region) ([]SearchHit, error) {
@@ -323,20 +367,23 @@ func searchDDGLite(ctx context.Context, query string, limit int, r Region) ([]Se
 	if err != nil {
 		return nil, err
 	}
-	snippets := doc.Find("td.result-snippet")
+	// Walk rows structurally: a snippet row belongs to the link row above it.
+	// Index-pairing (link i ↔ snippet i) shifts every later snippet onto the
+	// wrong hit as soon as one result lacks a snippet row.
 	var hits []SearchHit
-	doc.Find("a.result-link").EachWithBreak(func(i int, a *goquery.Selection) bool {
-		href, _ := a.Attr("href")
-		link := decodeDDGLink(href)
-		if link == "" {
-			return true
+	doc.Find("tr").Each(func(_ int, tr *goquery.Selection) {
+		if a := tr.Find("a.result-link").First(); a.Length() > 0 {
+			if len(hits) >= limit {
+				return
+			}
+			if link := decodeDDGLink(a.AttrOr("href", "")); link != "" {
+				hits = append(hits, SearchHit{Title: strings.TrimSpace(a.Text()), URL: link})
+			}
+			return
 		}
-		h := SearchHit{Title: strings.TrimSpace(a.Text()), URL: link}
-		if i < snippets.Length() {
-			h.Snippet = strings.TrimSpace(snippets.Eq(i).Text())
+		if s := tr.Find("td.result-snippet").First(); s.Length() > 0 && len(hits) > 0 && hits[len(hits)-1].Snippet == "" {
+			hits[len(hits)-1].Snippet = strings.TrimSpace(s.Text())
 		}
-		hits = append(hits, h)
-		return len(hits) < limit
 	})
 	if len(hits) == 0 && isDDGAnomaly(body) {
 		return nil, fmt.Errorf("duckduckgo-lite anomaly page: %w", errRateLimited)
@@ -378,6 +425,9 @@ func searchBrave(ctx context.Context, query string, limit int, r Region) ([]Sear
 		})
 		return len(hits) < limit
 	})
+	if len(hits) == 0 && isChallengePage(body) {
+		return nil, fmt.Errorf("brave challenge page: %w", errRateLimited)
+	}
 	return hits, nil
 }
 
@@ -408,6 +458,9 @@ func searchEcosia(ctx context.Context, query string, limit int, _ Region) ([]Sea
 		})
 		return len(hits) < limit
 	})
+	if len(hits) == 0 && isChallengePage(body) {
+		return nil, fmt.Errorf("ecosia challenge page: %w", errRateLimited)
+	}
 	return hits, nil
 }
 
@@ -509,19 +562,21 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 	rec, have := store.getCache(rawURL)
 	if have && !render {
 		if time.Since(rec.FetchedAt) < ttlFor(kind) {
-			return rec.fetched(), true, nil // fresh
+			return rec.fetched(false, ""), true, nil // fresh
 		}
 		if rec.ETag != "" || rec.LastModified != "" {
 			f, notMod, err := revalidate(ctx, rawURL, rec.ETag, rec.LastModified)
 			switch {
 			case err == nil && notMod:
 				store.touchCache(rawURL)
-				return rec.fetched(), true, nil
+				return rec.fetched(false, ""), true, nil
 			case err == nil:
 				store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
 				return f, false, nil
 			default:
-				return rec.fetched(), true, nil // revalidation blocked → serve stale
+				// Revalidation blocked → serve stale, SAYING SO — a week-old
+				// price must never read as current.
+				return rec.fetched(true, err.Error()), true, nil
 			}
 		}
 	}
@@ -536,20 +591,28 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 	}
 	if err != nil {
 		if have {
-			return rec.fetched(), true, nil // serve stale on failure
+			return rec.fetched(true, err.Error()), true, nil // serve stale on failure, flagged
 		}
 		return Fetched{}, false, err
 	}
-	// Don't cache scanned-PDF image results — the cache only holds text, and a
-	// hit would return empty text with no images. Re-extract each time (rare).
-	if len(f.Images) == 0 {
+	f.FetchedAt = time.Now()
+	// Don't cache scanned-PDF image results (the cache only holds text — a hit
+	// would return empty text with no images), and don't cache near-empty
+	// text: a JS-shell SPA would poison the cache for the whole TTL and block
+	// a later render=true from ever seeing fresh content.
+	if len(f.Images) == 0 && len(strings.TrimSpace(f.Text)) >= minCacheChars {
 		store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
 	}
 	return f, false, nil
 }
 
-func (r cacheRec) fetched() Fetched {
-	return Fetched{Title: r.Title, Text: r.Text, ETag: r.ETag, LastModified: r.LastModified}
+// minCacheChars: extractions thinner than this are not worth caching — almost
+// always a JS-only shell or a challenge page, not real content.
+const minCacheChars = 200
+
+func (r cacheRec) fetched(stale bool, reason string) Fetched {
+	return Fetched{Title: r.Title, Text: r.Text, ETag: r.ETag, LastModified: r.LastModified,
+		FetchedAt: r.FetchedAt, Stale: stale, StaleReason: reason}
 }
 
 // Fetched is the result of a content fetch plus HTTP validators for cheap
@@ -562,6 +625,10 @@ type Fetched struct {
 	Rendered     bool
 	Images       []DocImage // scanned-PDF page images for visual OCR (not cached)
 	ImageTotal   int        // page images found in the document (>len(Images) = some dropped)
+	FetchedAt    time.Time  // when the content was actually downloaded (cache hits keep the original time)
+	Stale        bool       // served from cache PAST its TTL because the live fetch failed
+	StaleReason  string     // why the live fetch failed when Stale
+	Truncated    bool       // the source exceeded the size cap — text is a PREFIX, not the whole document
 }
 
 func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
@@ -605,26 +672,36 @@ func extractResponse(resp *http.Response, rawURL string) (Fetched, error) {
 	ct := resp.Header.Get("Content-Type")
 	magic, _ := br.Peek(5)
 	if strings.Contains(ct, "application/pdf") || isPDFURL(rawURL) || bytes.HasPrefix(magic, []byte("%PDF-")) {
-		raw, err := io.ReadAll(io.LimitReader(br, 64<<20)) // 64MB PDF cap
+		raw, truncated, err := readCapped(br, 64<<20) // 64MB PDF cap
 		if err != nil {
 			return Fetched{}, err
 		}
-		t, x, _ := extractPDF(bytes.NewReader(raw))
+		if truncated {
+			// A PDF's xref table lives at the end — a cut PDF is unparseable
+			// (or worse, half-parseable). Refuse rather than return junk.
+			return Fetched{}, fmt.Errorf("pdf %s exceeds the 64MB cap — find a smaller mirror of the document", rawURL)
+		}
+		t, x, perr := extractPDF(bytes.NewReader(raw))
 		f.Title, f.Text = t, x
-		// Scanned/image-only PDF (no usable text layer): fall back to page
-		// images so vision can OCR the datasheet.
-		if len(strings.Fields(x)) < scannedWordThreshold || len(strings.TrimSpace(x)) < scannedTextThreshold {
+		// Scanned/image-only PDF (no usable text layer) — or a text extraction
+		// failure: fall back to page images so vision can OCR the datasheet.
+		if perr != nil || len(strings.Fields(x)) < scannedWordThreshold || len(strings.TrimSpace(x)) < scannedTextThreshold {
 			if imgs, total := pdfPageImages(raw, 5); len(imgs) > 0 {
 				f.Images, f.ImageTotal = imgs, total
+			} else if perr != nil {
+				// No text layer AND no images — an empty success here would
+				// cache "the datasheet says nothing" for a month.
+				return Fetched{}, fmt.Errorf("unreadable pdf %s: %w", rawURL, perr)
 			}
 		}
 		return f, nil
 	}
-	buf, err := io.ReadAll(io.LimitReader(br, 8<<20)) // 8MB page cap
+	buf, truncated, err := readCapped(br, 8<<20) // 8MB page cap
 	if err != nil {
 		return Fetched{}, err
 	}
-	t, x, err := extractHTML(buf, rawURL)
+	f.Truncated = truncated // partial HTML still extracts useful text — flagged, not fatal
+	t, x, err := extractHTML(buf, rawURL, ct)
 	f.Title, f.Text = t, x
 	return f, err
 }
@@ -658,8 +735,17 @@ func revalidate(ctx context.Context, rawURL, etag, lastMod string) (f Fetched, n
 // extractHTML is the single HTML→text path — readability for prose plus
 // <table> preservation as markdown (hardware specs ARE tables). Used by both
 // the plain fetcher and the headless renderer so a bot-blocked site never
-// yields worse extraction than an unblocked one.
-func extractHTML(buf []byte, rawURL string) (title, text string, err error) {
+// yields worse extraction than an unblocked one. contentType drives charset
+// decoding (older shops still serve ISO-8859-1 — æ/ø/å and "kr." prices must
+// not extract as mojibake); "" means already-UTF-8 (the renderer's DOM dump).
+func extractHTML(buf []byte, rawURL, contentType string) (title, text string, err error) {
+	if contentType != "" {
+		if cr, cerr := charset.NewReader(bytes.NewReader(buf), contentType); cerr == nil {
+			if decoded, derr := io.ReadAll(cr); derr == nil {
+				buf = decoded
+			}
+		}
+	}
 	pageURL, _ := url.Parse(rawURL)
 	art, err := readability.FromReader(bytes.NewReader(buf), pageURL)
 	if err != nil {

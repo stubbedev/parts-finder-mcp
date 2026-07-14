@@ -4,11 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -50,6 +53,15 @@ func main() {
 	s.AddReceivingMiddleware(recoverMiddleware)
 	registerTools(s)
 
+	// SIGINT/SIGTERM skip deferred calls — reap the spawned renderer
+	// explicitly so a killed MCP session never orphans a lightpanda.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigs
+		stopRenderer()
+		os.Exit(1)
+	}()
 	defer stopRenderer() // kill any lightpanda we spawned
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		stopRenderer()
@@ -85,17 +97,22 @@ type searchOut struct {
 type fetchIn struct {
 	URL    string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
 	Kind   string `json:"kind,omitempty" jsonschema:"cache freshness bucket: spec (datasheets ~30d), listing (prices ~1h), page (default ~1d)"`
-	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed lightpanda). Bot-blocked sites (403/429) escalate to this automatically"`
-	Offset int    `json:"offset,omitempty" jsonschema:"character offset into the extracted text — big documents are paginated; pass the previous call's next_offset to continue (served from cache, no re-download)"`
+	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed lightpanda). Bot-blocked sites (403/429) escalate to this automatically. Applies to the initial fetch only — offset pages read the cached text"`
+	Offset int    `json:"offset,omitempty" jsonschema:"byte offset into the extracted text — big documents are paginated; pass the previous call's next_offset to continue (served from cache, no re-download)"`
 }
 type fetchOut struct {
-	Title      string `json:"title"`
-	Text       string `json:"text"`
-	Cached     bool   `json:"cached"`
-	Rendered   bool   `json:"rendered,omitempty"`
-	Images     int    `json:"images,omitempty"`      // scanned-PDF page images returned as vision blocks
-	TotalChars int    `json:"total_chars"`           // full extracted-text length
-	NextOffset int    `json:"next_offset,omitempty"` // more text remains: re-call with offset=this
+	Title       string `json:"title"`
+	Text        string `json:"text"`
+	Cached      bool   `json:"cached"`
+	Rendered    bool   `json:"rendered,omitempty"`
+	Images      int    `json:"images,omitempty"`      // scanned-PDF page images returned as vision blocks
+	TotalBytes  int    `json:"total_bytes"`           // full extracted-text length
+	NextOffset  int    `json:"next_offset,omitempty"` // more text remains: re-call with offset=this
+	FetchedAt   string `json:"fetched_at,omitempty"`  // when the content was actually downloaded
+	Stale       bool   `json:"stale,omitempty"`       // live fetch FAILED — this is old cache, treat prices/stock as unverified
+	StaleReason string `json:"stale_reason,omitempty"`
+	Truncated   bool   `json:"truncated,omitempty"` // source exceeded the size cap — text is a prefix, not the whole document
+	Note        string `json:"note,omitempty"`      // degradation hints (thin extraction, etc.)
 }
 
 // maxFetchChars caps the text returned per fetch_content call. Clients hard-cap
@@ -160,6 +177,7 @@ type queryIn struct {
 }
 type queryOut struct {
 	Parts []Part `json:"parts"`
+	Total int    `json:"total"` // matches before the limit — parts may be a subset
 }
 
 type compareIn struct {
@@ -214,9 +232,10 @@ type dealsIn struct {
 	DisplayCurrency string `json:"display_currency,omitempty" jsonschema:"convert every total into this currency for comparison; defaults to region currency"`
 }
 type dealsOut struct {
-	Region   Region      `json:"region"`
-	Listings []Listing   `json:"listings"`
-	Hits     []SearchHit `json:"search_hits,omitempty"`
+	Region      Region      `json:"region"`
+	Listings    []Listing   `json:"listings"`
+	Hits        []SearchHit `json:"search_hits,omitempty"`
+	SearchError string      `json:"search_error,omitempty"` // search=true but the web search failed — hits are missing, not empty
 }
 
 type historyIn struct {
@@ -332,6 +351,7 @@ type deepOut struct {
 	Part        Part         `json:"part"`
 	EmptyFields []string     `json:"empty_fields"` // what still needs filling for full accuracy
 	Sources     []deepSource `json:"sources"`
+	Notes       []string     `json:"notes,omitempty"` // degradations: failed searches/sources — the source set may be smaller than intended
 }
 
 const (
@@ -469,24 +489,38 @@ func registerTools(s *mcp.Server) {
 		Name:        "fetch_content",
 		Description: "Fetch a URL and return readable text (HTML tables + PDFs preserved), smartly cached. Bot-blocked sites auto-escalate to a headless browser. `kind` tunes cache freshness: \"spec\" (datasheets, ~30d), \"listing\" (prices, ~1h), or \"page\" (default, ~1d); stale entries are cheaply revalidated. Big documents are PAGINATED: when next_offset is set, more text remains — re-call with offset=next_offset (served from cache) until you've seen what you need. Use this to read spec/listing pages, then save_part / save_listing.",
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in fetchIn) (*mcp.CallToolResult, fetchOut, error) {
-		f, cached, err := fetchCached(ctx, in.URL, in.Kind, in.Render)
+		// Offset pages read the CACHED text — re-rendering per page would
+		// hydrate different text and silently skip/duplicate rows.
+		f, cached, err := fetchCached(ctx, in.URL, in.Kind, in.Render && in.Offset == 0)
 		if err != nil {
 			return nil, fetchOut{}, err
 		}
 		text, total, next := pageText(f.Text, in.Offset)
 		if in.Offset > 0 && text == "" {
-			return nil, fetchOut{}, fmt.Errorf("offset %d is past the end of the extracted text (%d chars)", in.Offset, total)
+			return nil, fetchOut{}, fmt.Errorf("offset %d is past the end of the extracted text (%d bytes)", in.Offset, total)
 		}
 		if next > 0 {
-			text += fmt.Sprintf("\n\n…[document continues: showing chars %d–%d of %d — re-call fetch_content with offset=%d for the next page]", in.Offset, next, total, next)
+			text += fmt.Sprintf("\n\n…[document continues: showing bytes %d–%d of %d — re-call fetch_content with offset=%d for the next page]", in.Offset, next, total, next)
 		}
-		out := fetchOut{Title: f.Title, Text: text, Cached: cached, Rendered: f.Rendered, Images: len(f.Images), TotalChars: total, NextOffset: next}
+		out := fetchOut{Title: f.Title, Text: text, Cached: cached, Rendered: f.Rendered,
+			Images: len(f.Images), TotalBytes: total, NextOffset: next,
+			Stale: f.Stale, StaleReason: f.StaleReason, Truncated: f.Truncated}
+		if !f.FetchedAt.IsZero() {
+			out.FetchedAt = f.FetchedAt.UTC().Format(time.RFC3339)
+		}
+		if len(f.Images) == 0 && !f.Rendered && total < minCacheChars {
+			out.Note = "extracted text is very thin — likely a JS-rendered page; retry with render=true"
+		}
 		// Scanned PDF: no text layer, so return the page images as vision
 		// blocks for the model to OCR directly.
 		if len(f.Images) > 0 {
-			note := fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning %d page image(s); read the specs visually.", len(f.Images))
+			var pages []string
+			for _, img := range f.Images {
+				pages = append(pages, fmt.Sprint(img.Page))
+			}
+			note := fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning %d page image(s) (pages %s, in document order); read the specs visually.", len(f.Images), strings.Join(pages, ","))
 			if f.ImageTotal > len(f.Images) {
-				note = fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning the %d largest of %d page images; the rest were dropped to fit — if a needed page is missing, find the document elsewhere or ask for it.", len(f.Images), f.ImageTotal)
+				note = fmt.Sprintf("Scanned/image-only PDF — no text layer. Returning the %d largest of %d page images (pages %s, in document order); the rest were dropped to fit — if a needed page is missing, find the document elsewhere or ask for it.", len(f.Images), f.ImageTotal, strings.Join(pages, ","))
 			}
 			res := &mcp.CallToolResult{Content: []mcp.Content{
 				&mcp.TextContent{Text: note},
@@ -523,6 +557,7 @@ func registerTools(s *mcp.Server) {
 		Name:        "save_part",
 		Description: "Persist a structured Part (extracted from a spec page) into the local store. Returns its id. Leave fields unknown rather than guessing — unknown attributes are treated as gaps, not incompatibilities. Before extracting, call list_rules once: its attrs_by_category is the checklist of attributes the compat engine reads per category, and known_tokens is the resource-token vocabulary already in use — the rules are the source of truth, not this description. For build validation across ANY part type (from DIMM slots to rack units), fill provides/requires with 'kind:variant' -> count resource tokens (a motherboard provides {\"dimm:ddr5\":12,\"pcie:x16\":3}, a RAM stick requires {\"dimm:ddr5\":1}; the same pattern covers bays, ports, PSU cables, rack u:, PDU outlets, switch ports). The engine checks sum(requires) <= sum(provides) per token, with width/superset flexibility (x16 slots take x8 cards, sas ports take sata drives). If a datasheet or vendor QVL reveals a constraint the rules miss, add it with save_rule.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, p Part) (*mcp.CallToolResult, savePartOut, error) {
+		p.Category = strings.ToLower(strings.TrimSpace(p.Category)) // "CPU" and "cpu" must be one category — rules and queries compare exact
 		if p.Category == "" {
 			return nil, savePartOut{}, fmt.Errorf("category is required")
 		}
@@ -545,6 +580,7 @@ func registerTools(s *mcp.Server) {
 		Name:        "query_parts",
 		Description: "Query stored parts by ids, category, and/or attribute clauses over scalar fields AND free-form attrs — e.g. find a GPU with cuda_compute >= 8.9, or a CPU with l3_cache_mb >= 256. Ops: eq, ne, gt, gte, lt, lte, contains, exists. Numeric when both sides parse as numbers. Parts missing the attribute never match — deep_specs them first if the pool looks thin. The store only knows what was saved: an empty result means 'not ingested yet', NOT 'does not exist' — use search_parts to look live.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in queryIn) (*mcp.CallToolResult, queryOut, error) {
+		in.Category = strings.ToLower(strings.TrimSpace(in.Category))
 		var parts []Part
 		var err error
 		if len(in.IDs) > 0 {
@@ -568,10 +604,11 @@ func registerTools(s *mcp.Server) {
 				out = append(out, p)
 			}
 		}
+		total := len(out)
 		if in.Limit > 0 && len(out) > in.Limit {
 			out = out[:in.Limit]
 		}
-		return nil, queryOut{Parts: out}, nil
+		return nil, queryOut{Parts: out, Total: total}, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -605,8 +642,19 @@ func registerTools(s *mcp.Server) {
 		if l.PartID == "" {
 			return nil, savePartOut{}, fmt.Errorf("part_id is required")
 		}
+		// save_listing is the trust boundary for every ranking downstream: a
+		// zero price would sort as the cheapest deal, and a currency-less
+		// price can never be compared. Reject, don't guess.
+		if l.Price <= 0 {
+			return nil, savePartOut{}, fmt.Errorf("price must be > 0 — if the page didn't state one, skip the listing instead of saving it")
+		}
+		if l.Currency == "" {
+			return nil, savePartOut{}, fmt.Errorf("currency is required (ISO code of the listing price)")
+		}
 		if l.ID == "" {
-			l.ID = slug(l.PartID, l.Vendor, l.Condition)
+			// URL in the key: two live offers from the same vendor in the same
+			// condition (two eBay items) must not overwrite each other.
+			l.ID = slug(l.PartID, l.Vendor, l.Condition, urlKey(l.URL))
 		}
 		if l.SeenAt.IsZero() {
 			l.SeenAt = time.Now()
@@ -642,7 +690,11 @@ func registerTools(s *mcp.Server) {
 		out := dealsOut{Region: region, Listings: listings}
 		if in.Search {
 			if name := strings.TrimSpace(parts[0].Vendor + " " + parts[0].Model); name != "" {
-				out.Hits, _ = searchRegion(ctx, name+" buy price", 10, region) // best-effort
+				var serr error
+				out.Hits, serr = searchRegion(ctx, name+" buy price", 10, region)
+				if serr != nil {
+					out.SearchError = serr.Error() // "search is blind" ≠ "no results"
+				}
 			}
 		}
 		return nil, out, nil
@@ -1018,12 +1070,17 @@ func registerTools(s *mcp.Server) {
 		out := deepOut{Part: p, EmptyFields: emptyFields(p)}
 		// Open Icecat first when configured: brand-authorized normalized specs
 		// + vendor PDF links, independent of whatever the web search finds.
-		if src, ok := icecatSource(ctx, p); ok {
+		if src, ok, ierr := icecatSource(ctx, p); ok {
 			out.Sources = append(out.Sources, src)
+		} else if ierr != nil {
+			out.Notes = append(out.Notes, "icecat lookup failed (brand-authorized source skipped): "+ierr.Error())
 		}
 		seen := map[string]bool{p.SourceURL: true, "": true}
 		for _, q := range queries {
-			hits, _ := searchRegion(ctx, q, 5, region)
+			hits, serr := searchRegion(ctx, q, 5, region)
+			if serr != nil {
+				out.Notes = append(out.Notes, fmt.Sprintf("search %q failed: %v", q, serr))
+			}
 			for _, h := range hits {
 				if seen[h.URL] || len(out.Sources) >= maxDeepSources {
 					continue
@@ -1031,7 +1088,8 @@ func registerTools(s *mcp.Server) {
 				seen[h.URL] = true
 				f, _, ferr := fetchCached(ctx, h.URL, "spec", false)
 				if ferr != nil {
-					continue // unreadable source — move on, search gave us more
+					out.Notes = append(out.Notes, fmt.Sprintf("source %s skipped: %v", h.URL, ferr))
+					continue // move on, search gave us more
 				}
 				text := f.Text
 				if len(text) > maxDeepSourceChars {
@@ -1124,4 +1182,17 @@ func slug(parts ...string) string {
 	s := strings.ToLower(strings.Join(parts, "-"))
 	s = slugStrip.ReplaceAllString(s, "-")
 	return strings.Trim(s, "-")
+}
+
+// urlKey reduces a listing URL to host+path — enough to tell two offers apart,
+// stable across query-string noise (tracking params, session ids).
+func urlKey(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return raw
+	}
+	return u.Host + u.Path
 }

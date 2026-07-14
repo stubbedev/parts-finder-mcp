@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,8 +98,15 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 	var f *excelize.File
 	fresh := true
 	if appendMode {
-		if existing, err := excelize.OpenFile(path); err == nil {
+		existing, err := excelize.OpenFile(path)
+		switch {
+		case err == nil:
 			f, fresh = existing, false // edit the existing workbook in place
+		case errors.Is(err, os.ErrNotExist):
+			// no workbook yet → start fresh below
+		default:
+			// corrupt/locked/unreadable: bail rather than silently overwrite
+			return "", fmt.Errorf("append to %s: %w", path, err)
 		}
 	}
 	if f == nil {
@@ -135,7 +143,9 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 		if idx, err := f.GetSheetIndex(sheet); err == nil && idx != -1 {
 			f.DeleteSheet(sheet)
 		}
-		f.NewSheet(sheet)
+		if _, err := f.NewSheet(sheet); err != nil {
+			return "", fmt.Errorf("sheet %q: %w", sheet, err)
+		}
 
 		// Title.
 		title := sid
@@ -287,7 +297,9 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 		if idx, err := f.GetSheetIndex("Compare"); err == nil && idx != -1 {
 			f.DeleteSheet("Compare") // refresh on re-export
 		}
-		writeCompareSheet(f, st, summaries, display)
+		if err := writeCompareSheet(f, st, summaries, display); err != nil {
+			return "", err
+		}
 	}
 
 	// Drop the default sheet now that real sheets exist (only present on a
@@ -299,7 +311,14 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 		}
 	}
 
-	if err := f.SaveAs(path); err != nil {
+	// Save via temp + rename so a crash mid-write never truncates a good workbook.
+	tmp := path + ".tmp"
+	if err := f.SaveAs(tmp); err != nil {
+		os.Remove(tmp)
+		return "", err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return "", err
 	}
 	return path, nil
@@ -341,9 +360,11 @@ type cmpRow struct {
 	buy, owned, parts int
 }
 
-func writeCompareSheet(f *excelize.File, st styles, rows []cmpRow, display string) {
+func writeCompareSheet(f *excelize.File, st styles, rows []cmpRow, display string) error {
 	cmp := "Compare"
-	f.NewSheet(cmp)
+	if _, err := f.NewSheet(cmp); err != nil {
+		return fmt.Errorf("sheet %q: %w", cmp, err)
+	}
 	labels := []string{"Spec", "Compatible", "Total TDP (W)", "TO BUY (" + display + ")", "Parts to buy", "Already owned"}
 	for i, l := range labels {
 		c := cell(1, i+1)
@@ -366,6 +387,7 @@ func writeCompareSheet(f *excelize.File, st styles, rows []cmpRow, display strin
 	if idx, err := f.GetSheetIndex(cmp); err == nil {
 		f.SetActiveSheet(idx)
 	}
+	return nil
 }
 
 func cell(col, row int) string {
@@ -407,8 +429,8 @@ func keySpecs(p Part) string {
 func safeSheetName(sid string) string {
 	repl := strings.NewReplacer("[", "(", "]", ")", ":", "-", "*", "-", "?", "-", "/", "-", "\\", "-")
 	n := repl.Replace(sid)
-	if len(n) > 28 {
-		n = n[:28]
+	if r := []rune(n); len(r) > 28 { // rune-aware: don't split a UTF-8 char
+		n = string(r[:28])
 	}
 	if n == "" {
 		n = "spec"

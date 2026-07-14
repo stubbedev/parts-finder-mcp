@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 	"time"
@@ -15,10 +16,14 @@ import (
 type Store struct{ db *sql.DB }
 
 func openStore(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	// Two MCP sessions share this DB; without a busy timeout the second writer
+	// gets an instant SQLITE_BUSY. WAL lets a reader coexist with the other
+	// session's writer, and one conn serializes this process's own writers.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	schema := `
 CREATE TABLE IF NOT EXISTS parts (
   id TEXT PRIMARY KEY, category TEXT, vendor TEXT, model TEXT,
@@ -51,19 +56,26 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	if _, err := db.Exec(schema); err != nil {
 		return nil, err
 	}
-	// Migrate pre-existing DBs; "duplicate column" errors are expected noise.
-	db.Exec(`ALTER TABLE parts ADD COLUMN provides TEXT`)
-	db.Exec(`ALTER TABLE parts ADD COLUMN requires TEXT`)
-	db.Exec(`ALTER TABLE parts ADD COLUMN attrs TEXT`)
-	db.Exec(`ALTER TABLE content_cache ADD COLUMN etag TEXT`)
-	db.Exec(`ALTER TABLE content_cache ADD COLUMN last_modified TEXT`)
-	db.Exec(`ALTER TABLE content_cache ADD COLUMN kind TEXT`)
-	db.Exec(`ALTER TABLE specs ADD COLUMN owned_ids TEXT`)
-	db.Exec(`ALTER TABLE listings ADD COLUMN vat_included INT`)
-	db.Exec(`ALTER TABLE listings ADD COLUMN vat_rate REAL`)
-	db.Exec(`ALTER TABLE listings ADD COLUMN qty_available INT`)
-	db.Exec(`ALTER TABLE listings ADD COLUMN in_stock INT`)
-	db.Exec(`ALTER TABLE listings ADD COLUMN lead_days INT`)
+	// Migrate pre-existing DBs; "duplicate column" errors are expected noise,
+	// anything else is a real failure.
+	for _, stmt := range []string{
+		`ALTER TABLE parts ADD COLUMN provides TEXT`,
+		`ALTER TABLE parts ADD COLUMN requires TEXT`,
+		`ALTER TABLE parts ADD COLUMN attrs TEXT`,
+		`ALTER TABLE content_cache ADD COLUMN etag TEXT`,
+		`ALTER TABLE content_cache ADD COLUMN last_modified TEXT`,
+		`ALTER TABLE content_cache ADD COLUMN kind TEXT`,
+		`ALTER TABLE specs ADD COLUMN owned_ids TEXT`,
+		`ALTER TABLE listings ADD COLUMN vat_included INT`,
+		`ALTER TABLE listings ADD COLUMN vat_rate REAL`,
+		`ALTER TABLE listings ADD COLUMN qty_available INT`,
+		`ALTER TABLE listings ADD COLUMN in_stock INT`,
+		`ALTER TABLE listings ADD COLUMN lead_days INT`,
+	} {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			return nil, err
+		}
+	}
 	// Timestamps are compared and ORDERed as strings, so every stored value
 	// must be UTC ("...Z") — rewrite pre-UTC local-offset rows once. COALESCE
 	// keeps anything strftime can't parse; the NOT LIKE guard makes re-runs
@@ -73,9 +85,11 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 		{"listing_history", "seen_at"}, {"specs", "created_at"},
 		{"content_cache", "fetched_at"},
 	} {
-		db.Exec(fmt.Sprintf(
+		if _, err := db.Exec(fmt.Sprintf(
 			`UPDATE %s SET %s = COALESCE(strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', %s), %s) WHERE %s NOT LIKE '%%Z'`,
-			tc.table, tc.col, tc.col, tc.col, tc.col))
+			tc.table, tc.col, tc.col, tc.col, tc.col)); err != nil {
+			return nil, err
+		}
 	}
 	return &Store{db}, nil
 }
@@ -118,12 +132,29 @@ func scanPart(rows *sql.Rows) (Part, error) {
 		&p.SourceURL, &fetched); err != nil {
 		return Part{}, err
 	}
-	json.Unmarshal([]byte(conns.String), &p.PowerConnectors)
-	json.Unmarshal([]byte(prov.String), &p.Provides)
-	json.Unmarshal([]byte(req.String), &p.Requires)
-	json.Unmarshal([]byte(attrs.String), &p.Attrs)
-	p.FetchedAt, _ = time.Parse(time.RFC3339, fetched.String)
+	unmarshalLogged("part "+p.ID, "power_connectors", conns.String, &p.PowerConnectors)
+	unmarshalLogged("part "+p.ID, "provides", prov.String, &p.Provides)
+	unmarshalLogged("part "+p.ID, "requires", req.String, &p.Requires)
+	unmarshalLogged("part "+p.ID, "attrs", attrs.String, &p.Attrs)
+	if fetched.String != "" {
+		var err error
+		if p.FetchedAt, err = time.Parse(time.RFC3339, fetched.String); err != nil {
+			log.Printf("part %s: bad fetched_at %q: %v", p.ID, fetched.String, err)
+		}
+	}
 	return p, nil
+}
+
+// unmarshalLogged decodes a JSON column, logging (not failing) a corrupt blob
+// so it's distinguishable from a never-extracted NULL/empty one. Logs go to
+// stderr to keep the stdio protocol clean.
+func unmarshalLogged(rowID, col, blob string, dst any) {
+	if blob == "" {
+		return
+	}
+	if err := json.Unmarshal([]byte(blob), dst); err != nil {
+		log.Printf("%s: corrupt %s: %v", rowID, col, err)
+	}
 }
 
 func (s *Store) getParts(ids []string) ([]Part, error) {
@@ -233,46 +264,51 @@ ON CONFLICT(id) DO UPDATE SET part_id=excluded.part_id,vendor=excluded.vendor,
 	if err != nil {
 		return err
 	}
-	s.recordHistory(l)
-	return nil
+	return s.recordHistory(l)
 }
 
 // recordHistory appends a price observation so re-saving a listing (same
 // part+vendor+condition id) never silently erases the previous price. Only
 // price movements are recorded — a repeat save at the same price is noise.
-// Best-effort: history must never fail a save.
-func (s *Store) recordHistory(l Listing) {
-	var price, shipping float64
+// The tool promises every price change is kept, so a lost insert must fail
+// the save, not vanish silently.
+func (s *Store) recordHistory(l Listing) error {
+	var price float64
+	var shipping sql.NullFloat64
 	err := s.db.QueryRow(`SELECT price, shipping FROM listing_history
-  WHERE listing_id=? ORDER BY seen_at DESC LIMIT 1`, l.ID).Scan(&price, &shipping)
-	if err == nil && price == l.Price && shipping == l.Shipping {
-		return
+  WHERE listing_id=? ORDER BY seen_at DESC, rowid DESC LIMIT 1`, l.ID).Scan(&price, &shipping)
+	sameShipping := (l.Shipping == nil && !shipping.Valid) ||
+		(l.Shipping != nil && shipping.Valid && *l.Shipping == shipping.Float64)
+	if err == nil && price == l.Price && sameShipping {
+		return nil
 	}
-	s.db.Exec(`INSERT INTO listing_history
+	_, err = s.db.Exec(`INSERT INTO listing_history
   (listing_id,part_id,vendor,price,shipping,currency,seen_at)
   VALUES (?,?,?,?,?,?,?)`,
 		l.ID, l.PartID, l.Vendor, l.Price, l.Shipping, l.Currency,
 		utcRFC3339(l.SeenAt))
+	return err
 }
 
 // utcRFC3339 renders a timestamp for storage. Always UTC: timestamps are
 // compared and ORDERed as strings, and mixed zone offsets ("Z" vs "+02:00")
-// break lexicographic time order.
-func utcRFC3339(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+// break lexicographic time order. Nano resolution so same-second history rows
+// still order deterministically (RFC3339 parsing accepts fractional seconds).
+func utcRFC3339(t time.Time) string { return t.UTC().Format(time.RFC3339Nano) }
 
 // PriceObs is one historical price observation for a listing.
 type PriceObs struct {
 	ListingID string    `json:"listing_id"`
 	Vendor    string    `json:"vendor,omitempty"`
 	Price     float64   `json:"price"`
-	Shipping  float64   `json:"shipping,omitempty"`
+	Shipping  *float64  `json:"shipping,omitempty"` // nil = shipping wasn't recorded
 	Currency  string    `json:"currency,omitempty"`
 	SeenAt    time.Time `json:"seen_at"`
 }
 
 func (s *Store) priceHistory(partID string) ([]PriceObs, error) {
 	rows, err := s.db.Query(`SELECT listing_id,vendor,price,shipping,currency,seen_at
-  FROM listing_history WHERE part_id=? ORDER BY seen_at`, partID)
+  FROM listing_history WHERE part_id=? ORDER BY seen_at, rowid`, partID)
 	if err != nil {
 		return nil, err
 	}
@@ -380,8 +416,8 @@ func (s *Store) listSpecs() ([]SpecInfo, error) {
 		if err := rows.Scan(&si.ID, &si.Name, &ids, &owned); err != nil {
 			return nil, err
 		}
-		json.Unmarshal([]byte(ids), &si.PartIDs)
-		json.Unmarshal([]byte(owned.String), &si.OwnedIDs)
+		unmarshalLogged("spec "+si.ID, "part_ids", ids, &si.PartIDs)
+		unmarshalLogged("spec "+si.ID, "owned_ids", owned.String, &si.OwnedIDs)
 		out = append(out, si)
 	}
 	return out, nil
@@ -394,8 +430,8 @@ func (s *Store) loadSpec(id string) (name string, partIDs, ownedIDs []string, er
 	if err != nil {
 		return "", nil, nil, err
 	}
-	json.Unmarshal([]byte(owned.String), &ownedIDs)
-	json.Unmarshal([]byte(ids), &partIDs)
+	unmarshalLogged("spec "+id, "owned_ids", owned.String, &ownedIDs)
+	unmarshalLogged("spec "+id, "part_ids", ids, &partIDs)
 	return name, partIDs, ownedIDs, nil
 }
 
@@ -634,18 +670,24 @@ func (s *Store) getCache(url string) (cacheRec, bool) {
 	return r, true
 }
 
+// putCache is best-effort — a failed cache write must not fail the fetch, but
+// it is logged (stderr, so the stdio protocol stays clean).
 func (s *Store) putCache(url, title, content, etag, lastMod, kind string) {
-	s.db.Exec(`INSERT INTO content_cache (url,title,content,etag,last_modified,kind,fetched_at)
+	if _, err := s.db.Exec(`INSERT INTO content_cache (url,title,content,etag,last_modified,kind,fetched_at)
   VALUES (?,?,?,?,?,?,?)
 ON CONFLICT(url) DO UPDATE SET title=excluded.title,content=excluded.content,
   etag=excluded.etag,last_modified=excluded.last_modified,kind=excluded.kind,
   fetched_at=excluded.fetched_at`,
-		url, title, content, etag, lastMod, kind, utcRFC3339(time.Now()))
+		url, title, content, etag, lastMod, kind, utcRFC3339(time.Now())); err != nil {
+		log.Printf("cache write failed for %s: %v", url, err)
+	}
 }
 
 // touchCache bumps fetched_at after a 304 — the content is still current, so
-// reset its TTL without re-storing the body.
+// reset its TTL without re-storing the body. Best-effort like putCache.
 func (s *Store) touchCache(url string) {
-	s.db.Exec(`UPDATE content_cache SET fetched_at=? WHERE url=?`,
-		utcRFC3339(time.Now()), url)
+	if _, err := s.db.Exec(`UPDATE content_cache SET fetched_at=? WHERE url=?`,
+		utcRFC3339(time.Now()), url); err != nil {
+		log.Printf("cache touch failed for %s: %v", url, err)
+	}
 }

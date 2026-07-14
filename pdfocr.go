@@ -14,6 +14,7 @@ import (
 type DocImage struct {
 	Data []byte
 	MIME string
+	Page int // 1-based source page — so the reader knows WHICH pages it got
 }
 
 // A PDF below EITHER threshold is treated as image-only (scanned) and falls
@@ -40,6 +41,7 @@ func pdfPageImages(data []byte, max int) ([]DocImage, int) {
 	type cand struct {
 		data []byte
 		mime string
+		page int
 	}
 	var cands []cand
 	for _, perPage := range pages {
@@ -53,19 +55,23 @@ func pdfPageImages(data []byte, max int) ([]DocImage, int) {
 			if err != nil || len(raw) < 2000 {
 				continue
 			}
-			cands = append(cands, cand{raw, pdfImageMIME(img.FileType)})
+			cands = append(cands, cand{raw, pdfImageMIME(img.FileType), img.PageNr})
 		}
 	}
+	// Keep the `max` largest (biggest = the actual page scans), then restore
+	// document order — page identity matters when reading cross-page tables.
 	sort.Slice(cands, func(i, j int) bool { return len(cands[i].data) > len(cands[j].data) })
+	total := len(cands)
+	if len(cands) > max {
+		cands = cands[:max]
+	}
+	sort.Slice(cands, func(i, j int) bool { return cands[i].page < cands[j].page })
 	var out []DocImage
 	for _, c := range cands {
-		if len(out) >= max {
-			break
-		}
 		d, m := optimizeImage(c.data, c.mime, modeText, 0) // scanned datasheets are text — binarize for fewest bytes
-		out = append(out, DocImage{Data: d, MIME: m})
+		out = append(out, DocImage{Data: d, MIME: m, Page: c.page})
 	}
-	return out, len(cands)
+	return out, total
 }
 
 func pdfImageMIME(fileType string) string {

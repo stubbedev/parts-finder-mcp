@@ -9,6 +9,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/text/currency"
+	"golang.org/x/text/language"
 )
 
 // Region is the user's locale, used to bias search toward local vendors and to
@@ -109,39 +112,55 @@ func fetchCountry(ctx context.Context, u, field string) string {
 	return strings.ToUpper(cc)
 }
 
-// currencyOf maps ISO country -> ISO currency. Standards data, not vendor
-// preference: non-euro currencies listed explicitly, EU members default to
-// EUR, everything else to USD (safe display fallback — override with
-// REGION_CURRENCY).
-var countryCurrency = map[string]string{
-	"DK": "DKK", "SE": "SEK", "NO": "NOK", "IS": "ISK", "CH": "CHF",
-	"GB": "GBP", "PL": "PLN", "CZ": "CZK", "HU": "HUF", "RO": "RON",
-	"BG": "BGN", "US": "USD", "CA": "CAD", "AU": "AUD", "NZ": "NZD",
-	"JP": "JPY", "CN": "CNY", "KR": "KRW", "IN": "INR", "BR": "BRL",
-	"MX": "MXN", "SG": "SGD", "HK": "HKD", "TR": "TRY",
-	// TW deliberately absent: frankfurter (ECB reference rates) carries no
-	// TWD, so a TWD default would make every conversion fail. TW falls back
-	// to USD; override with REGION_CURRENCY if you accept unconvertible totals.
-}
-
+// currencyOf maps ISO country -> ISO currency via CLDR (x/text) — the full
+// standards table, not a hand-picked subset, so a Thai or Israeli user gets
+// THB/ILS figures instead of a silent USD fallback. Unknown/unparseable
+// countries fall back to USD. Note: frankfurter carries only ECB reference
+// currencies — a region whose currency it lacks (e.g. TWD) gets honest
+// `unconverted` flags on cross-currency listings; override with
+// REGION_CURRENCY to pick a convertible display currency instead.
 func currencyOf(country string) string {
-	if c, ok := countryCurrency[country]; ok {
-		return c
+	r, err := language.ParseRegion(country)
+	if err != nil {
+		return "USD"
 	}
-	if euCountries[country] {
-		return "EUR"
+	if u, ok := currency.FromRegion(r); ok {
+		return u.String()
 	}
 	return "USD"
 }
 
-// ddgRegion maps a country to DuckDuckGo's kl locale param. Unknown -> "".
-var ddgLang = map[string]string{
-	"DK": "dk-da", "SE": "se-sv", "NO": "no-no", "FI": "fi-fi",
-	"DE": "de-de", "NL": "nl-nl", "GB": "uk-en", "US": "us-en",
-	"FR": "fr-fr", "ES": "es-es", "IT": "it-it", "PL": "pl-pl",
+// ddgRegion derives DuckDuckGo's kl locale param ("dk-da") from the country's
+// CLDR likely language — data-driven, so every country DDG knows gets a locale
+// bias, not just a hand-maintained few. Unknown -> "" (DDG ignores unknown kl
+// values, matching the old no-locale behavior).
+func ddgRegion(country string) string {
+	if country == "" {
+		return ""
+	}
+	r, err := language.ParseRegion(strings.ToUpper(country))
+	if err != nil {
+		return ""
+	}
+	tag, err := language.Compose(r)
+	if err != nil {
+		return ""
+	}
+	base, conf := tag.Base() // infers the likely language from the region
+	if conf == language.No {
+		return ""
+	}
+	cc, lang := strings.ToLower(country), base.String()
+	// Standards quirks, not vendor data: DDG says "uk" for Great Britain, and
+	// uses the macrolanguage code "no" where CLDR says Bokmål ("nb").
+	if cc == "gb" {
+		cc = "uk"
+	}
+	if lang == "nb" || lang == "nn" {
+		lang = "no"
+	}
+	return cc + "-" + lang
 }
-
-func ddgRegion(country string) string { return ddgLang[strings.ToUpper(country)] }
 
 // euCountries lets ships-to "EU" match any member.
 var euCountries = map[string]bool{
@@ -234,10 +253,15 @@ func shipsTo(tokens []string, country string) bool {
 	}
 	for _, t := range tokens {
 		u := strings.ToUpper(strings.TrimSpace(t))
+		// Common real-world aliases — a listing saved with "UK" or "Europe"
+		// must not read as unshippable to GB/DK.
+		if a, ok := ccTLDAlias[strings.ToLower(u)]; ok {
+			u = a
+		}
 		switch u {
 		case "WORLD", "WORLDWIDE", "GLOBAL", "*":
 			return true
-		case "EU":
+		case "EU", "EUROPE", "EUROPEAN UNION":
 			if euCountries[country] {
 				return true
 			}

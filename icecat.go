@@ -86,26 +86,33 @@ func icecatQuery(p Part) string {
 
 // icecatSource fetches a part's Open Icecat record and renders it as a
 // deep_specs source: spec table as markdown plus the vendor PDF URLs to
-// fetch_content next. Best-effort — any miss returns ok=false and deep_specs
-// carries on with web search.
-func icecatSource(ctx context.Context, p Part) (deepSource, bool) {
+// fetch_content next. A catalog MISS returns (_, false, nil) and deep_specs
+// carries on with web search; a transport/server failure returns an error —
+// "couldn't check the brand-authorized source" must never masquerade as
+// "the part isn't in the catalog".
+func icecatSource(ctx context.Context, p Part) (deepSource, bool, error) {
 	u := icecatQuery(p)
 	if u == "" {
-		return deepSource{}, false
+		return deepSource{}, false, nil
 	}
 	resp, err := doRequest(ctx, http.MethodGet, u, map[string]string{"Accept": "application/json"})
 	if err != nil {
-		return deepSource{}, false
+		return deepSource{}, false, fmt.Errorf("icecat: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return deepSource{}, false // not in Open Icecat / bad key — skip quietly
+	switch {
+	case resp.StatusCode == http.StatusOK:
+	case resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests:
+		return deepSource{}, false, nil // not in Open Icecat / brand not open-content — a legit miss
+	default:
+		return deepSource{}, false, fmt.Errorf("icecat returned %s", resp.Status)
 	}
 	var body icecatResp
-	if json.NewDecoder(resp.Body).Decode(&body) != nil {
-		return deepSource{}, false
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return deepSource{}, false, fmt.Errorf("icecat: decode: %w", err)
 	}
-	return renderIcecat(u, body)
+	src, ok := renderIcecat(u, body)
+	return src, ok, nil
 }
 
 // renderIcecat turns an Icecat record into readable source text. Pure —

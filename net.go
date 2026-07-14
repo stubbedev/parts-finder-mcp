@@ -293,7 +293,7 @@ func doRequest(ctx context.Context, method, rawURL string, extra map[string]stri
 		}
 		if isRetryable(resp.StatusCode) && attempt < maxAttempts-1 {
 			ra := retryAfter(resp)
-			resp.Body.Close()
+			drainClose(resp.Body) // drained body returns the connection to the pool — reconnecting mid-throttle is a bot tell
 			if !sleepBackoff(ctx, attempt, ra) {
 				return nil, ctx.Err()
 			}
@@ -309,24 +309,32 @@ func doRequest(ctx context.Context, method, rawURL string, extra map[string]stri
 
 func isRetryable(code int) bool {
 	return code == http.StatusTooManyRequests ||
+		code == http.StatusRequestTimeout ||
+		code == http.StatusInternalServerError || // transient on shops often enough to be worth one more try
 		code == http.StatusBadGateway ||
 		code == http.StatusServiceUnavailable ||
 		code == http.StatusGatewayTimeout
 }
 
-// retryAfter reads a Retry-After header (seconds form) if present.
+// retryAfter reads a Retry-After header (seconds or HTTP-date form) if present.
 func retryAfter(resp *http.Response) time.Duration {
 	v := resp.Header.Get("Retry-After")
 	if v == "" {
 		return 0
 	}
+	var d time.Duration
 	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-		if secs > 30 {
-			secs = 30 // cap — don't stall a shopping run on a hostile header
-		}
-		return time.Duration(secs) * time.Second
+		d = time.Duration(secs) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = time.Until(t)
 	}
-	return 0
+	if d < 0 {
+		return 0
+	}
+	if d > 30*time.Second {
+		d = 30 * time.Second // cap — don't stall a shopping run on a hostile header
+	}
+	return d
 }
 
 // sleepBackoff waits before the next attempt. Honours an explicit Retry-After,

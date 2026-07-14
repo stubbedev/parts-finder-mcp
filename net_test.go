@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -34,5 +35,21 @@ func TestFingerprintStable(t *testing.T) {
 	}
 	if a < 0 || a >= len(fingerprints) {
 		t.Errorf("fingerprint index out of range: %d", a)
+	}
+}
+
+func TestRetryAfterHTTPDate(t *testing.T) {
+	resp := &http.Response{Header: http.Header{}}
+	resp.Header.Set("Retry-After", time.Now().Add(10*time.Second).UTC().Format(http.TimeFormat))
+	if d := retryAfter(resp); d < 5*time.Second || d > 15*time.Second {
+		t.Errorf("HTTP-date Retry-After should be ~10s, got %v", d)
+	}
+	resp.Header.Set("Retry-After", time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat))
+	if d := retryAfter(resp); d != 0 {
+		t.Errorf("past date should be 0, got %v", d)
+	}
+	resp.Header.Set("Retry-After", "120")
+	if d := retryAfter(resp); d != 30*time.Second {
+		t.Errorf("hostile seconds should cap at 30s, got %v", d)
 	}
 }

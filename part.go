@@ -27,8 +27,8 @@ type Part struct {
 	PCIeGen         int      `json:"pcie_gen,omitempty"`
 	PCIeLanes       int      `json:"pcie_lanes,omitempty"`
 	PowerConnectors []string `json:"power_connectors,omitempty"`
-	LengthMM        int      `json:"length_mm,omitempty"` // gpu = card length; case = max gpu clearance
-	Watts           int      `json:"watts,omitempty"`     // psu rated output
+	LengthMM        int      `json:"length_mm,omitempty" jsonschema:"gpu: the card's own length in mm; case: the MAX GPU CLEARANCE in mm (never the chassis depth — saving chassis depth here passes cards that don't fit)"`
+	Watts           int      `json:"watts,omitempty" jsonschema:"PSU rated output in watts; also set on a barebones/server whose chassis includes the PSUs"`
 
 	// Generic resource accounting — covers every part type without a rule per
 	// pair. A part PROVIDES resources (motherboard: "dimm:ddr5":12,
@@ -372,16 +372,21 @@ var rules = []rule{
 	attrRuleViolations,
 	// Combined PSU output must supply total TDP with headroom. Summing
 	// covers dual/quad-PSU servers; whether the pair also gives N+1 redundancy
-	// is reported as a gap in composeSpec, not a violation.
+	// is reported as a gap in composeSpec, not a violation. Watts is summed
+	// across ALL parts, not just category "psu" — a server barebones carries
+	// its PSUs' output on itself.
 	func(c map[string][]Part) []Violation {
 		var sum int
 		var ids []string
-		for _, psu := range c["psu"] {
-			if psu.Watts > 0 {
-				sum += psu.Watts
-				ids = append(ids, psu.ID)
+		for _, ps := range c {
+			for _, p := range ps {
+				if p.Watts > 0 {
+					sum += p.Watts
+					ids = append(ids, p.ID)
+				}
 			}
 		}
+		sort.Strings(ids) // map order is random — keep violation output stable
 		if sum == 0 {
 			return nil
 		}
@@ -489,8 +494,23 @@ func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
 			users[tok] = append(users[tok], p.ID)
 		}
 	}
+	// Deterministic order: narrowest PCIe requirements first (then by name).
+	// Ranging the maps directly made wider-slot allocation random — an x4 card
+	// could grab the x16 slot the GPU needed, a false violation on half the runs.
+	reqToks := make([]string, 0, len(requires))
+	for tok := range requires {
+		reqToks = append(reqToks, tok)
+	}
+	sort.Slice(reqToks, func(i, j int) bool {
+		wi, wj := pcieWidth(reqToks[i]), pcieWidth(reqToks[j])
+		if wi != wj {
+			return wi < wj
+		}
+		return reqToks[i] < reqToks[j]
+	})
 	deficits := map[string]int{}
-	for tok, need := range requires {
+	for _, tok := range reqToks {
+		need := requires[tok]
 		have := provides[tok]
 		if have >= need {
 			provides[tok] -= need
@@ -498,16 +518,22 @@ func resourceDeficits(parts []Part) (map[string]int, map[string][]string) {
 		}
 		deficit := need - have
 		provides[tok] = 0
-		// PCIe width flexibility: fill remaining deficit from wider slots.
+		// PCIe width flexibility: fill remaining deficit from wider slots,
+		// NARROWEST first — best-fit keeps the widest slots for the widest cards.
 		if w := pcieWidth(tok); w > 0 {
+			var widers []string
 			for wider, avail := range provides {
 				if avail > 0 && pcieWidth(wider) > w {
-					take := min(avail, deficit)
-					provides[wider] -= take
-					deficit -= take
-					if deficit == 0 {
-						break
-					}
+					widers = append(widers, wider)
+				}
+			}
+			sort.Slice(widers, func(i, j int) bool { return pcieWidth(widers[i]) < pcieWidth(widers[j]) })
+			for _, wider := range widers {
+				take := min(provides[wider], deficit)
+				provides[wider] -= take
+				deficit -= take
+				if deficit == 0 {
+					break
 				}
 			}
 		}
@@ -705,6 +731,34 @@ type Spec struct {
 // requiredCategories is the minimum for a bootable server build.
 var requiredCategories = []string{"cpu", "motherboard", "ram", "psu"}
 
+// categoryCovered reports whether a required category's FUNCTION is present —
+// by a part of that category, or by a part that carries the function's
+// signature data. Server gear is often bought as a barebones/chassis that IS
+// the motherboard + PSUs + case in one part; requiring the literal categories
+// would mark every such build "partial" forever.
+func categoryCovered(cat string, parts []Part, byCat map[string][]Part) bool {
+	if len(byCat[cat]) > 0 {
+		return true
+	}
+	switch cat {
+	case "motherboard":
+		for _, p := range parts {
+			for tok := range p.Provides {
+				if strings.HasPrefix(strings.ToLower(tok), "dimm:") {
+					return true // something in the build offers DIMM slots — the board function exists
+				}
+			}
+		}
+	case "psu":
+		for _, p := range parts {
+			if p.Watts > 0 {
+				return true // something carries rated PSU output
+			}
+		}
+	}
+	return false
+}
+
 // subSpecCategory marks the synthetic aggregate part composeIDs injects for a
 // composed sub-spec: it carries only the child's bubbled-up needs (as
 // Requires) and TDP, so parent-level parts can satisfy them. Data-quality
@@ -724,7 +778,7 @@ func composeSpec(parts []Part) Spec {
 	// it out of gaps so real data issues stay visible.
 	var missing []string
 	for _, cat := range requiredCategories {
-		if len(byCat[cat]) == 0 {
+		if !categoryCovered(cat, parts, byCat) {
 			missing = append(missing, cat)
 		}
 	}

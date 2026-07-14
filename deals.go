@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -11,15 +12,15 @@ import (
 // Listing is a price observation for a part from one vendor/reseller. Prices
 // die fast: SeenAt drives the staleness flag; there is no live-price guarantee.
 type Listing struct {
-	ID        string    `json:"id,omitempty"` // derived from part+vendor+condition if omitted
+	ID        string    `json:"id,omitempty"` // derived from part+vendor+condition+url if omitted
 	PartID    string    `json:"part_id"`
 	Vendor    string    `json:"vendor,omitempty"` // seller, e.g. "ebay:seller123", "lenovo"
 	Price     float64   `json:"price"`
-	Shipping  float64   `json:"shipping,omitempty"`
-	Currency  string    `json:"currency,omitempty"`  // ISO code of Price/Shipping
+	Shipping  *float64  `json:"shipping,omitempty" jsonschema:"shipping cost in the listing currency; 0 = FREE shipping, omit = unknown (flagged, so record 0 explicitly when the page says free)"`
+	Currency  string    `json:"currency" jsonschema:"ISO code of price/shipping — required; a price without its currency cannot be compared"`
 	Condition string    `json:"condition,omitempty"` // new, used, refurbished
 	URL       string    `json:"url,omitempty"`
-	ShipsTo   []string  `json:"ships_to,omitempty"` // country codes / "EU" / "WORLD"; empty = unknown
+	ShipsTo   []string  `json:"ships_to,omitempty" jsonschema:"ISO alpha-2 country codes, 'EU', or 'WORLD'; empty = unknown"`
 	SeenAt    time.Time `json:"seen_at,omitempty"`
 
 	// VAT basis. Consumer marketplaces list incl-VAT, B2B resellers ex-VAT —
@@ -35,13 +36,15 @@ type Listing struct {
 
 	// Derived on read, not stored. Deals are never dropped for these — they
 	// are flagged and sorted below usable ones, so nothing is hidden.
-	Stale        bool    `json:"stale,omitempty"`
-	Dead         bool    `json:"dead,omitempty"`           // URL no longer reachable (live-check)
-	Unshippable  bool    `json:"unshippable,omitempty"`    // doesn't ship to the region
-	VATUnknown   bool    `json:"vat_unknown,omitempty"`    // VAT basis not recorded — total may be ±VAT vs peers
-	DisplayTotal float64 `json:"display_total,omitempty"`  // total converted to display currency
-	DisplayExVAT float64 `json:"display_ex_vat,omitempty"` // ex-VAT total converted (when VAT basis known)
-	DisplayCurr  string  `json:"display_currency,omitempty"`
+	Stale           bool    `json:"stale,omitempty"`
+	Dead            bool    `json:"dead,omitempty"`             // URL no longer reachable (live-check)
+	Unshippable     bool    `json:"unshippable,omitempty"`      // doesn't ship to the region
+	VATUnknown      bool    `json:"vat_unknown,omitempty"`      // VAT basis not recorded — total may be ±VAT vs peers
+	Unconverted     bool    `json:"unconverted,omitempty"`      // couldn't convert to the display currency — total is NATIVE, not comparable to peers
+	ShippingUnknown bool    `json:"shipping_unknown,omitempty"` // shipping not recorded — total may understate the real cost
+	DisplayTotal    float64 `json:"display_total,omitempty"`    // total converted to display currency
+	DisplayExVAT    float64 `json:"display_ex_vat,omitempty"`   // ex-VAT total converted (when VAT basis known)
+	DisplayCurr     string  `json:"display_currency,omitempty"`
 }
 
 // usable = clickable and buyable right now: reachable, ships to the region,
@@ -56,7 +59,12 @@ func markShippable(ls []Listing, country string) {
 	}
 }
 
-func (l Listing) total() float64 { return l.Price + l.Shipping }
+func (l Listing) total() float64 {
+	if l.Shipping != nil {
+		return l.Price + *l.Shipping
+	}
+	return l.Price // shipping unknown — flagged via ShippingUnknown, never guessed
+}
 
 // effectiveTotal is the converted total when available, else the native total.
 // Used for cross-currency sorting/comparison.
@@ -107,6 +115,8 @@ func markStale(ls []Listing, now time.Time) {
 }
 
 // sortListings orders usable (live + shippable + in stock) first, then
+// converted-comparable before unconverted (a native SEK total sorted against
+// DKK totals is meaningless — sink it, flagged, rather than misrank it), then
 // cheapest by comparisonTotal (ex-VAT basis when known); ties broken by most
 // recent. Dead/unshippable/out-of-stock listings sink to the bottom but are
 // never removed.
@@ -114,6 +124,9 @@ func sortListings(ls []Listing) {
 	sort.SliceStable(ls, func(i, j int) bool {
 		if ls[i].usable() != ls[j].usable() {
 			return ls[i].usable()
+		}
+		if ls[i].Unconverted != ls[j].Unconverted {
+			return !ls[i].Unconverted
 		}
 		if ls[i].comparisonTotal() != ls[j].comparisonTotal() {
 			return ls[i].comparisonTotal() < ls[j].comparisonTotal()
@@ -156,17 +169,26 @@ type Substitute struct {
 
 // annotateDisplay fills DisplayTotal/DisplayExVAT/DisplayCurr by converting
 // each listing's totals into the display currency, and flags listings whose
-// VAT basis is unrecorded. Best-effort: on conversion error the display fields
-// stay empty rather than failing the whole call.
+// VAT basis, shipping, or conversion is missing. Best-effort: a conversion
+// error never fails the call, but it MUST flag — an unconverted native total
+// silently compared against converted peers is a misranking, not a fallback.
 func annotateDisplay(ctx context.Context, ls []Listing, display string) {
 	for i := range ls {
 		ls[i].VATUnknown = ls[i].VATIncluded == nil
-		if display == "" || ls[i].Currency == "" {
+		ls[i].ShippingUnknown = ls[i].Shipping == nil
+		if display == "" {
+			continue
+		}
+		if ls[i].Currency == "" {
+			ls[i].Unconverted = true // saved before currency became required
 			continue
 		}
 		if v, err := convert(ctx, ls[i].total(), ls[i].Currency, display); err == nil {
 			ls[i].DisplayTotal = v
 			ls[i].DisplayCurr = display
+		} else {
+			ls[i].Unconverted = true
+			continue
 		}
 		if ex, ok := ls[i].exVATTotal(); ok {
 			if v, err := convert(ctx, ex, ls[i].Currency, display); err == nil {
@@ -294,6 +316,13 @@ func substituteMatch(orig, cand Part) bool {
 	}
 	if orig.FormFactor != "" && cand.FormFactor != "" && orig.FormFactor != cand.FormFactor {
 		return false
+	}
+	// RDIMM/UDIMM/LRDIMM: a substitute of the wrong module type won't boot —
+	// the same trap the ram_module_type rule catches in builds.
+	if om, ok := flattenStr(orig, "mem_module"); ok {
+		if cm, cok := flattenStr(cand, "mem_module"); cok && !strings.EqualFold(om, cm) {
+			return false
+		}
 	}
 	return true
 }

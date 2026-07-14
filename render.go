@@ -96,7 +96,13 @@ func ensureRenderer(ctx context.Context) (string, error) {
 		if ws, err := wsFromBase(ctx, lpBase); err == nil {
 			return ws, nil
 		}
-		lpBase, lpCmd = "", nil // died — respawn below
+		// Unresponsive: kill before respawning — it may be alive-but-stuck,
+		// and dropping the handle without killing would orphan it while a
+		// second instance spawns.
+		if lpCmd != nil && lpCmd.Process != nil {
+			lpCmd.Process.Kill()
+		}
+		lpBase, lpCmd = "", nil
 	}
 	bin, err := lightpandaBinary(ctx)
 	if err != nil {
@@ -231,6 +237,7 @@ func spawnLightpanda(ctx context.Context, bin string) (base string, cmd *exec.Cm
 	}
 	cmd = exec.Command(bin, "serve", "--host", "127.0.0.1", "--port", fmt.Sprint(port))
 	cmd.Stdout, cmd.Stderr = nil, nil // MCP protocol runs on our stdio — keep it clean
+	dieWithParent(cmd)                // never orphan a renderer, even if we're SIGKILLed
 	if err := cmd.Start(); err != nil {
 		return "", nil, fmt.Errorf("start lightpanda: %w", err)
 	}
@@ -333,5 +340,5 @@ func fetchRendered(ctx context.Context, rawURL string) (title, text string, err 
 	}
 	// Same extraction as the plain fetcher (readability + table preservation):
 	// rendering is an implementation detail, never a downgrade.
-	return extractHTML([]byte(html), rawURL)
+	return extractHTML([]byte(html), rawURL, "")
 }

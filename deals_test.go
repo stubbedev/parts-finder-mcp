@@ -6,12 +6,14 @@ import (
 	"time"
 )
 
+func fptr(v float64) *float64 { return &v }
+
 func TestListingsSortAndStale(t *testing.T) {
 	now := time.Date(2026, 7, 13, 0, 0, 0, 0, time.UTC)
 	ls := []Listing{
-		{ID: "a", Price: 100, Shipping: 20, SeenAt: now},                   // total 120, fresh
-		{ID: "b", Price: 90, Shipping: 10, SeenAt: now.AddDate(0, 0, -30)}, // total 100, stale
-		{ID: "c", Price: 100, Shipping: 0, SeenAt: now},                    // total 100, fresh
+		{ID: "a", Price: 100, Shipping: fptr(20), SeenAt: now},                   // total 120, fresh
+		{ID: "b", Price: 90, Shipping: fptr(10), SeenAt: now.AddDate(0, 0, -30)}, // total 100, stale
+		{ID: "c", Price: 100, Shipping: fptr(0), SeenAt: now},                    // total 100, fresh
 	}
 	markStale(ls, now)
 	sortListings(ls)
@@ -49,8 +51,8 @@ func TestFlaggedListingsSinkNotDropped(t *testing.T) {
 func TestCheapestConverted(t *testing.T) {
 	// Same-currency comparison needs no network (no convert() call).
 	ls := []Listing{
-		{ID: "a", Price: 50, Shipping: 10, Currency: "USD"}, // total 60
-		{ID: "b", Price: 55, Currency: "USD"},               // total 55 <- cheapest
+		{ID: "a", Price: 50, Shipping: fptr(10), Currency: "USD"}, // total 60
+		{ID: "b", Price: 55, Currency: "USD"},                     // total 55 <- cheapest
 		{ID: "c", Price: 90, Currency: "USD"},
 	}
 	best, total, ok := cheapestConverted(context.Background(), ls, "USD")
@@ -176,5 +178,66 @@ func TestSubstituteMatch(t *testing.T) {
 		if got := substituteMatch(orig, c.cand); got != c.want {
 			t.Errorf("substituteMatch(%s)=%v want %v", c.cand.ID, got, c.want)
 		}
+	}
+}
+
+// A listing that couldn't convert to the display currency must sink below
+// converted peers — a native SEK total compared raw against DKK misranks.
+func TestUnconvertedSinks(t *testing.T) {
+	ls := []Listing{
+		{ID: "no-currency", Price: 90},                 // saved before currency was required
+		{ID: "converted", Price: 100, Currency: "DKK"}, // display==currency → converts offline
+	}
+	annotateDisplay(context.Background(), ls, "DKK")
+	if !ls[0].Unconverted {
+		t.Fatalf("currency-less listing must be flagged unconverted")
+	}
+	if ls[1].Unconverted || ls[1].DisplayTotal != 100 {
+		t.Fatalf("same-currency listing must convert: %+v", ls[1])
+	}
+	sortListings(ls)
+	if ls[0].ID != "converted" {
+		t.Errorf("unconverted must sink below converted peers, got %s first", ls[0].ID)
+	}
+}
+
+// Shipping: nil = unknown (flagged), 0 = explicitly free.
+func TestShippingUnknownFlag(t *testing.T) {
+	ls := []Listing{
+		{ID: "unknown", Price: 100, Currency: "DKK"},
+		{ID: "free", Price: 100, Shipping: fptr(0), Currency: "DKK"},
+	}
+	annotateDisplay(context.Background(), ls, "DKK")
+	if !ls[0].ShippingUnknown || ls[1].ShippingUnknown {
+		t.Errorf("nil shipping flagged, explicit 0 not: %+v %+v", ls[0], ls[1])
+	}
+}
+
+func TestShipsToAliases(t *testing.T) {
+	if !shipsTo([]string{"UK"}, "GB") {
+		t.Errorf("UK must match GB")
+	}
+	if !shipsTo([]string{"Europe"}, "DK") {
+		t.Errorf("Europe must cover an EU member")
+	}
+	if shipsTo([]string{"Europe"}, "US") {
+		t.Errorf("Europe must not cover US")
+	}
+}
+
+// RDIMM in a UDIMM slot won't boot — substitutes must respect mem_module.
+func TestSubstituteMatchMemModule(t *testing.T) {
+	orig := Part{ID: "r1", Category: "ram", Attrs: map[string]any{"mem_module": "RDIMM"}}
+	udimm := Part{ID: "r2", Category: "ram", Attrs: map[string]any{"mem_module": "UDIMM"}}
+	rdimm := Part{ID: "r3", Category: "ram", Attrs: map[string]any{"mem_module": "rdimm"}}
+	unknown := Part{ID: "r4", Category: "ram"}
+	if substituteMatch(orig, udimm) {
+		t.Errorf("UDIMM must not substitute RDIMM")
+	}
+	if !substituteMatch(orig, rdimm) {
+		t.Errorf("same module type (case-insensitive) must match")
+	}
+	if !substituteMatch(orig, unknown) {
+		t.Errorf("unknown module type stays allowed (unknown ≠ violation)")
 	}
 }

@@ -414,3 +414,37 @@ func TestUnknownNoFalseViolation(t *testing.T) {
 		t.Errorf("missing TDP/attrs should surface as gaps")
 	}
 }
+
+// x4 + x16 requirements against x8 + x16 slots must ALWAYS fit (x4→x8,
+// x16→x16). Before best-fit ordering this failed on ~half of runs when the x4
+// requirement randomly grabbed the x16 slot.
+func TestPCIeWiderSlotBestFit(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		parts := []Part{
+			{ID: "board", Category: "motherboard", Provides: map[string]int{"pcie:x16": 1, "pcie:x8": 1}},
+			{ID: "nic", Category: "nic", Requires: map[string]int{"pcie:x4": 1}},
+			{ID: "gpu", Category: "gpu", Requires: map[string]int{"pcie:x16": 1}},
+		}
+		deficits, _ := resourceDeficits(parts)
+		if len(deficits) != 0 {
+			t.Fatalf("run %d: false deficit %v — wider-slot fill must be best-fit", i, deficits)
+		}
+	}
+}
+
+// A server barebones (chassis + board + PSUs in one part) must cover the
+// motherboard and psu functions — otherwise every barebones build reads
+// "partial" forever.
+func TestBarebonesCoversBoardAndPSU(t *testing.T) {
+	spec := composeSpec([]Part{
+		{ID: "r730", Category: "barebones", Watts: 1100,
+			Provides: map[string]int{"dimm:ddr4": 24, "pcie:x16": 2}},
+		{ID: "cpu1", Category: "cpu", Socket: "LGA2011-3"},
+		{ID: "ram1", Category: "ram", Requires: map[string]int{"dimm:ddr4": 1}},
+	})
+	for _, m := range spec.MissingForBuild {
+		if m == "motherboard" || m == "psu" {
+			t.Errorf("barebones with dimm slots + watts must cover %s", m)
+		}
+	}
+}
