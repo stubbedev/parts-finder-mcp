@@ -93,6 +93,49 @@ Optional env:
   (e.g. `DK` / `DKK`). By default the region is auto-detected from your IP
   (ifconfig.co over https) and cached for the process.
 
+## Register (Claude Desktop)
+
+Claude Desktop has no `claude mcp add`; edit its config file directly.
+**Settings → Developer → Edit Config** opens `claude_desktop_config.json`
+(macOS: `~/Library/Application Support/Claude/`, Windows:
+`%APPDATA%\Claude\`). Add parts-finder under `mcpServers`, then restart
+Claude Desktop.
+
+Docker (same volumes as above; add an `-v "<host>:/exports"` line to `args`
+if you want `export_spec` files on the host):
+
+```json
+{
+  "mcpServers": {
+    "parts-finder": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "parts-finder-data:/data",
+        "-v", "parts-finder-cache:/root/.cache",
+        "ghcr.io/stubbedev/parts-finder-mcp:latest"
+      ]
+    }
+  }
+}
+```
+
+Native binary (macOS `brew`/Nix install — use an absolute path):
+
+```json
+{
+  "mcpServers": {
+    "parts-finder": {
+      "command": "/abs/path/to/parts-finder",
+      "env": { "PARTS_DB": "/Users/you/.parts-finder.db" }
+    }
+  }
+}
+```
+
+The optional env vars above go in the `env` object. Every tool works
+identically to Claude Code — same stdio server.
+
 ## Region & currency
 
 Search is biased to your region: DuckDuckGo `kl` locale + ranking that floats
