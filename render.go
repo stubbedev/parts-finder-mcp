@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,13 +23,57 @@ import (
 // Zero-config headless rendering. Resolution order for a CDP endpoint:
 //  1. LIGHTPANDA_URL env (externally managed lightpanda/chrome)
 //  2. `lightpanda` binary on PATH — spawned on demand
-//  3. cached binary in ~/.cache/parts-finder/ — spawned on demand
-//  4. auto-download from lightpanda's GitHub releases, then spawn
+//  3. cached binary in ~/.cache/parts-finder/ (per release tag) — spawned on demand
+//  4. auto-download of the LATEST GitHub release (sha256-verified), then spawn
 // The spawned process lives for the MCP's lifetime and dies with it.
 // fetch_content auto-escalates to rendering when a site bot-blocks plain
 // HTTP (403/429), so the user never has to configure or request it.
 
-const lightpandaRelease = "https://github.com/lightpanda-io/browser/releases/download/0.3.4/"
+// lightpandaAPI resolves the newest release: tag, per-platform asset URLs,
+// and each asset's sha256 digest. Always tracking latest means trusting
+// lightpanda's release channel — the digest (same API) still catches
+// transit/CDN corruption, and a mismatching binary is discarded, never run.
+const lightpandaAPI = "https://api.github.com/repos/lightpanda-io/browser/releases/latest"
+
+type lpAsset struct {
+	Name   string `json:"name"`
+	URL    string `json:"browser_download_url"`
+	Digest string `json:"digest"` // "sha256:<hex>"
+}
+
+// latestLightpanda asks GitHub for the newest release and picks this
+// platform's asset.
+func latestLightpanda(ctx context.Context, platform string) (tag string, asset lpAsset, err error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, lightpandaAPI, nil)
+	if err != nil {
+		return "", lpAsset{}, err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", lpAsset{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", lpAsset{}, fmt.Errorf("github releases API: %s", resp.Status)
+	}
+	var body struct {
+		TagName string    `json:"tag_name"`
+		Assets  []lpAsset `json:"assets"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		return "", lpAsset{}, err
+	}
+	want := "lightpanda-" + platform
+	for _, a := range body.Assets {
+		if a.Name == want {
+			return body.TagName, a, nil
+		}
+	}
+	return "", lpAsset{}, fmt.Errorf("release %s has no asset %s", body.TagName, want)
+}
 
 var (
 	lpMu   sync.Mutex
@@ -63,7 +109,10 @@ func ensureRenderer(ctx context.Context) (string, error) {
 	return wsFromBase(ctx, base)
 }
 
-// lightpandaBinary finds or fetches the lightpanda executable.
+// lightpandaBinary finds or fetches the lightpanda executable: PATH first,
+// then the newest release (resolved live, cached per version so a new release
+// is picked up on the next cold start), falling back to any cached build when
+// the release API is unreachable — a slightly old renderer beats none.
 func lightpandaBinary(ctx context.Context) (string, error) {
 	if p, err := exec.LookPath("lightpanda"); err == nil {
 		return p, nil
@@ -72,46 +121,104 @@ func lightpandaBinary(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	dest := filepath.Join(cacheDir, "parts-finder", "lightpanda")
-	if _, err := os.Stat(dest); err == nil {
-		return dest, nil
-	}
+	dir := filepath.Join(cacheDir, "parts-finder")
 	arch := map[string]string{"amd64": "x86_64", "arm64": "aarch64"}[runtime.GOARCH]
 	osName := map[string]string{"linux": "linux", "darwin": "macos"}[runtime.GOOS]
 	if arch == "" || osName == "" {
 		return "", fmt.Errorf("no lightpanda build for %s/%s — set LIGHTPANDA_URL to a running instance", runtime.GOOS, runtime.GOARCH)
 	}
-	u := lightpandaRelease + "lightpanda-" + arch + "-" + osName
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	tag, asset, err := latestLightpanda(ctx, arch+"-"+osName)
 	if err != nil {
+		if p := newestCachedLightpanda(dir); p != "" {
+			fmt.Fprintf(os.Stderr, "parts-finder: lightpanda release lookup failed (%v) — using cached %s\n", err, filepath.Base(p))
+			return p, nil
+		}
+		return "", fmt.Errorf("resolve latest lightpanda: %w", err)
+	}
+	dest := filepath.Join(dir, "lightpanda-"+tag)
+	if _, err := os.Stat(dest); err == nil {
+		return dest, nil
+	}
+	if err := downloadVerified(ctx, asset, dest); err != nil {
 		return "", err
+	}
+	cleanupOldLightpanda(dir, dest)
+	return dest, nil
+}
+
+// cleanupOldLightpanda deletes superseded cached builds once a new one is
+// verified in place — only after, so a failed download never leaves us with
+// nothing. Best-effort.
+func cleanupOldLightpanda(dir, keep string) {
+	matches, _ := filepath.Glob(filepath.Join(dir, "lightpanda-*"))
+	matches = append(matches, filepath.Join(dir, "lightpanda")) // legacy unversioned name
+	for _, m := range matches {
+		if m != keep {
+			os.Remove(m)
+		}
+	}
+}
+
+// newestCachedLightpanda returns the most recently downloaded cached build
+// ("" if none). Mod time, not tag order — version strings don't sort.
+func newestCachedLightpanda(dir string) string {
+	matches, _ := filepath.Glob(filepath.Join(dir, "lightpanda-*"))
+	// Pre-latest-tracking cache used an unversioned name; still usable.
+	if fi, err := os.Stat(filepath.Join(dir, "lightpanda")); err == nil && !fi.IsDir() {
+		matches = append(matches, filepath.Join(dir, "lightpanda"))
+	}
+	best, bestAt := "", time.Time{}
+	for _, m := range matches {
+		if strings.HasSuffix(m, ".tmp") {
+			continue
+		}
+		if fi, err := os.Stat(m); err == nil && fi.ModTime().After(bestAt) {
+			best, bestAt = m, fi.ModTime()
+		}
+	}
+	return best
+}
+
+// downloadVerified streams an asset to dest, checking its sha256 against the
+// release digest. The binary gets EXECUTED — a mismatch is deleted, never run.
+func downloadVerified(ctx context.Context, asset lpAsset, dest string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, asset.URL, nil)
+	if err != nil {
+		return err
 	}
 	resp, err := (&http.Client{Timeout: 5 * time.Minute}).Do(req)
 	if err != nil {
-		return "", fmt.Errorf("download lightpanda: %w", err)
+		return fmt.Errorf("download lightpanda: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download lightpanda: %s", resp.Status)
+		return fmt.Errorf("download lightpanda: %s", resp.Status)
 	}
 	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
-		return "", err
+		return err
 	}
 	tmp := dest + ".tmp"
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
 	if err != nil {
-		return "", err
+		return err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
 		f.Close()
 		os.Remove(tmp)
-		return "", err
+		return err
 	}
 	f.Close()
-	if err := os.Rename(tmp, dest); err != nil {
-		return "", err
+	want := strings.TrimPrefix(asset.Digest, "sha256:")
+	if want == "" {
+		// Digest field missing from the API — proceed but say so; HTTPS is
+		// then the only integrity layer.
+		fmt.Fprintf(os.Stderr, "parts-finder: release API carried no digest for %s — skipping checksum\n", asset.Name)
+	} else if got := hex.EncodeToString(h.Sum(nil)); got != want {
+		os.Remove(tmp)
+		return fmt.Errorf("lightpanda %s checksum mismatch: got %s want %s", asset.Name, got, want)
 	}
-	return dest, nil
+	return os.Rename(tmp, dest)
 }
 
 // spawnLightpanda starts `lightpanda serve` on a free port and waits for the
