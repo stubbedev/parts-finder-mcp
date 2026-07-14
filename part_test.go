@@ -194,6 +194,46 @@ func TestExtendedCombos(t *testing.T) {
 	}
 }
 
+// Multi-node (rack) semantics: violations need proof — matches accept any
+// counterpart, capacity limits pool across nodes — and the aggregate check is
+// announced as a gap, never silent.
+func TestMultiNodeAggregate(t *testing.T) {
+	mb := Part{ID: "mb", Category: "motherboard", Socket: "SP5", MemType: "DDR5",
+		Attrs: map[string]any{"mem_max_gb": 512}}
+	cpu := Part{ID: "cpu", Category: "cpu", Socket: "SP5"}
+	ram := Part{ID: "ram", Category: "ram", MemType: "DDR5", Attrs: map[string]any{"capacity_gb": 256}}
+	// 2 nodes flattened: 4x256GB vs 2x512GB pooled limit — no cross-node
+	// false violation (the old first()-limit check would have fired here).
+	rack := []Part{mb, mb, cpu, cpu, ram, ram, ram, ram}
+	if vs := checkCompat(rack); len(vs) != 0 {
+		t.Fatalf("homogeneous rack must not cross-pair nodes, got: %+v", vs)
+	}
+	spec := composeSpec(rack)
+	found := false
+	for _, g := range spec.Gaps {
+		if strings.Contains(g, "multi-node") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("multi-node build must gap on aggregate checking, gaps: %v", spec.Gaps)
+	}
+	// A 5th stick blows the pooled limit (1280 > 1024).
+	if vs := checkCompat(append(rack, ram)); len(vs) == 0 {
+		t.Errorf("pooled capacity exceeded must violate")
+	}
+	// Reverse match direction: a board no CPU fits is a proven misfit even
+	// when every CPU found a home elsewhere.
+	lga := Part{ID: "mb2", Category: "motherboard", Socket: "LGA4677", MemType: "DDR5"}
+	got := map[string]bool{}
+	for _, v := range checkCompat([]Part{mb, lga, cpu, cpu}) {
+		got[v.Rule] = true
+	}
+	if !got["cpu_socket"] {
+		t.Errorf("board matched by no cpu must fire cpu_socket")
+	}
+}
+
 // Rules are data: the store overlay can disable a builtin, override it, and
 // add new rules (including supersets) that apply immediately.
 func TestRulesOverlay(t *testing.T) {

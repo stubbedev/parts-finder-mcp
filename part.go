@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -176,38 +177,101 @@ func currentSupersets() map[string][]string {
 }
 
 // attrRuleViolations evaluates every match/capacity rule over a build.
+//
+// Multi-instance semantics (a rack spec expands to 12 motherboards + 96 DIMMs
+// in ONE part list, so single-chassis pairwise checks would cross-pair nodes
+// and report garbage): a violation needs PROOF, consistent with unknowns-
+// never-violate. match: a part violates only when it fits NO counterpart.
+// capacity sum: usage is checked against the POOLED limit of every limit
+// holder. capacity each: a part violates only when it exceeds the LARGEST
+// limit holder. Single-chassis builds (one counterpart, one limit holder)
+// behave exactly as before; multi-node builds get an aggregate-check gap
+// from composeSpec so the coarser check is never silent.
 func attrRuleViolations(byCat map[string][]Part) []Violation {
 	var vs []Violation
 	for _, r := range currentRules() {
 		switch r.Kind {
 		case "match":
+			type known struct {
+				p Part
+				v string
+			}
+			var as, bs []known
 			for _, a := range byCat[r.CatA] {
-				av, aok := flattenStr(a, r.AttrA)
-				if !aok {
+				if v, ok := flattenStr(a, r.AttrA); ok {
+					as = append(as, known{a, v})
+				}
+			}
+			for _, b := range byCat[r.CatB] {
+				if v, ok := flattenStr(b, r.AttrB); ok {
+					bs = append(bs, known{b, v})
+				}
+			}
+			if len(as) == 0 || len(bs) == 0 {
+				continue
+			}
+			match := func(av, bv string) bool {
+				if r.Mode == "in" {
+					return tokensContain(bv, av)
+				}
+				return normFF(av) == normFF(bv)
+			}
+			misfit := func(x known, others []known, attr, otherCat, otherAttr string) Violation {
+				ids := []string{x.p.ID}
+				var vals []string
+				for _, o := range others {
+					ids = append(ids, o.p.ID)
+					vals = append(vals, o.v)
+				}
+				return Violation{r.Name, ids,
+					fmt.Sprintf("%s %s=%q matches no %s (%s: %s)", x.p.ID, attr, x.v, otherCat, otherAttr, strings.Join(vals, ", "))}
+			}
+			anyAMatched := false
+			for _, a := range as {
+				ok := false
+				for _, b := range bs {
+					if match(a.v, b.v) {
+						ok = true
+						break
+					}
+				}
+				if ok {
+					anyAMatched = true
 					continue
 				}
-				for _, b := range byCat[r.CatB] {
-					bv, bok := flattenStr(b, r.AttrB)
-					if !bok {
-						continue
-					}
-					ok := normFF(av) == normFF(bv)
-					if r.Mode == "in" {
-						ok = tokensContain(bv, av)
+				vs = append(vs, misfit(a, bs, r.AttrA, r.CatB, r.AttrB))
+			}
+			// The reverse direction (a counterpart no part fits) only adds
+			// information when some pairs DID match — otherwise the forward
+			// pass already reported the total mismatch.
+			if anyAMatched {
+				for _, b := range bs {
+					ok := false
+					for _, a := range as {
+						if match(a.v, b.v) {
+							ok = true
+							break
+						}
 					}
 					if !ok {
-						vs = append(vs, Violation{r.Name, []string{a.ID, b.ID},
-							fmt.Sprintf("%s %s=%q incompatible with %s %s=%q", a.ID, r.AttrA, av, b.ID, r.AttrB, bv)})
+						vs = append(vs, misfit(b, as, r.AttrB, r.CatA, r.AttrA))
 					}
 				}
 			}
 		case "capacity":
-			lim, ok := first(byCat[r.CatA])
-			if !ok {
-				continue
+			var limSum, limMax float64
+			var limIDs []string
+			limMaxID := ""
+			for _, l := range byCat[r.CatA] {
+				if v, ok := flattenNum(l, r.AttrA); ok {
+					limSum += v
+					limIDs = append(limIDs, l.ID)
+					if v > limMax {
+						limMax, limMaxID = v, l.ID
+					}
+				}
 			}
-			limV, lok := flattenNum(lim, r.AttrA)
-			if !lok {
+			if len(limIDs) == 0 {
 				continue
 			}
 			var sum float64
@@ -217,16 +281,16 @@ func attrRuleViolations(byCat map[string][]Part) []Violation {
 				if !uok {
 					continue
 				}
-				if r.Mode == "each" && uv > limV {
-					vs = append(vs, Violation{r.Name, []string{u.ID, lim.ID},
-						fmt.Sprintf("%s %s=%g exceeds %s %s=%g", u.ID, r.AttrB, uv, lim.ID, r.AttrA, limV)})
+				if r.Mode == "each" && uv > limMax {
+					vs = append(vs, Violation{r.Name, []string{u.ID, limMaxID},
+						fmt.Sprintf("%s %s=%g exceeds %s %s=%g", u.ID, r.AttrB, uv, limMaxID, r.AttrA, limMax)})
 				}
 				sum += uv
 				users = append(users, u.ID)
 			}
-			if r.Mode == "sum" && sum > limV {
-				vs = append(vs, Violation{r.Name, append(users, lim.ID),
-					fmt.Sprintf("total %s %g exceeds %s %s=%g", r.AttrB, sum, lim.ID, r.AttrA, limV)})
+			if r.Mode == "sum" && sum > limSum {
+				vs = append(vs, Violation{r.Name, append(users, limIDs...),
+					fmt.Sprintf("total %s %g exceeds %s %s=%g", r.AttrB, sum, strings.Join(limIDs, "+"), r.AttrA, limSum)})
 			}
 		}
 	}
@@ -297,11 +361,16 @@ func tokensContain(list, needle string) bool {
 	return false
 }
 
+// psuHeadroom: combined PSU output must exceed total TDP by this factor.
+// Shared by the psu_headroom violation and the N+1 redundancy gap so the two
+// checks can never disagree.
+const psuHeadroom = 1.3
+
 // rules seeds the core server-build predicates that need bespoke logic; the
 // simple equality/limit pairs live in matchRules/capacityRules as data.
 var rules = []rule{
 	attrRuleViolations,
-	// Combined PSU output must supply total TDP with 30% headroom. Summing
+	// Combined PSU output must supply total TDP with headroom. Summing
 	// covers dual/quad-PSU servers; whether the pair also gives N+1 redundancy
 	// is reported as a gap in composeSpec, not a violation.
 	func(c map[string][]Part) []Violation {
@@ -320,49 +389,65 @@ var rules = []rule{
 		if total == 0 {
 			return nil
 		}
-		need := int(float64(total) * 1.3)
+		need := int(float64(total) * psuHeadroom)
 		if sum < need {
 			return []Violation{{"psu_headroom", ids,
-				fmt.Sprintf("PSU output %dW < %dW needed (total TDP %dW * 1.3)", sum, need, total)}}
+				fmt.Sprintf("PSU output %dW < %dW needed (total TDP %dW * %g)", sum, need, total, psuHeadroom)}}
 		}
 		return nil
 	},
 	// Motherboard form factor must fit the case. A case's form factor is the
-	// largest board it accepts (an ATX case also fits mATX/mITX).
+	// largest board it accepts (an ATX case also fits mATX/mITX). With several
+	// cases (multi-node), a board only provably misfits when even the largest
+	// case can't take it — proof-based, same as the data-driven rules.
 	func(c map[string][]Part) []Violation {
-		mb, ok1 := first(c["motherboard"])
-		cs, ok2 := first(c["case"])
-		if !ok1 || !ok2 {
-			return nil
+		csSize := 0
+		var csPart Part
+		for _, cs := range c["case"] {
+			if s, ok := formFactorSize[normFF(cs.FormFactor)]; ok && s > csSize {
+				csSize, csPart = s, cs
+			}
 		}
-		mbSize, ok3 := formFactorSize[normFF(mb.FormFactor)]
-		csSize, ok4 := formFactorSize[normFF(cs.FormFactor)]
-		if !ok3 || !ok4 {
-			return nil // unknown or unrecognized form factor => gap, not violation
+		if csSize == 0 {
+			return nil // no case with a recognized form factor => gap, not violation
 		}
-		if mbSize > csSize {
-			return []Violation{{"form_factor_fit", []string{mb.ID, cs.ID},
-				fmt.Sprintf("motherboard %s (%s) too large for case %s (%s)",
-					mb.ID, mb.FormFactor, cs.ID, cs.FormFactor)}}
+		var vs []Violation
+		for _, mb := range c["motherboard"] {
+			mbSize, ok := formFactorSize[normFF(mb.FormFactor)]
+			if !ok {
+				continue
+			}
+			if mbSize > csSize {
+				vs = append(vs, Violation{"form_factor_fit", []string{mb.ID, csPart.ID},
+					fmt.Sprintf("motherboard %s (%s) too large for case %s (%s)",
+						mb.ID, mb.FormFactor, csPart.ID, csPart.FormFactor)})
+			}
 		}
-		return nil
+		return vs
 	},
-	// PSU must provide every power connector each GPU requires (by type).
+	// PSUs together must provide every power connector type each GPU requires.
+	// Union across PSUs: in a multi-PSU build any PSU may feed the card.
 	func(c map[string][]Part) []Violation {
-		psu, ok := first(c["psu"])
-		if !ok || len(psu.PowerConnectors) == 0 {
-			return nil
-		}
 		have := map[string]bool{}
-		for _, pc := range psu.PowerConnectors {
-			have[normFF(pc)] = true
+		var psuIDs []string
+		for _, psu := range c["psu"] {
+			if len(psu.PowerConnectors) == 0 {
+				continue
+			}
+			psuIDs = append(psuIDs, psu.ID)
+			for _, pc := range psu.PowerConnectors {
+				have[normFF(pc)] = true
+			}
+		}
+		if len(have) == 0 {
+			return nil
 		}
 		var vs []Violation
 		for _, gpu := range c["gpu"] {
 			for _, need := range gpu.PowerConnectors {
 				if !have[normFF(need)] {
-					vs = append(vs, Violation{"power_connector", []string{gpu.ID, psu.ID},
-						fmt.Sprintf("GPU %s needs %s connector, PSU %s doesn't provide it", gpu.ID, need, psu.ID)})
+					vs = append(vs, Violation{"power_connector", append([]string{gpu.ID}, psuIDs...),
+						fmt.Sprintf("GPU %s needs %s connector, no PSU provides it", gpu.ID, need)})
 				}
 			}
 		}
@@ -576,8 +661,9 @@ func toFloat(v any) (float64, bool) {
 	case int:
 		return float64(x), true
 	case string:
-		var f float64
-		if _, err := fmt.Sscanf(strings.TrimSpace(x), "%g", &f); err == nil {
+		// Full-string parse: Sscanf %g would read "4x8GB" as 4 and silently
+		// match garbage in numeric queries.
+		if f, err := strconv.ParseFloat(strings.TrimSpace(x), 64); err == nil {
 			return f, true
 		}
 	}
@@ -636,6 +722,14 @@ func composeSpec(parts []Part) Spec {
 			missing = append(missing, cat)
 		}
 	}
+	// Multiple motherboards = a flattened multi-node build (rack of specs).
+	// Rules then check in aggregate (matches accept any counterpart, capacity
+	// limits pool across nodes), which can miss a per-node overload — say so
+	// loudly instead of hiding behind a green checkmark.
+	if n := len(byCat["motherboard"]); n > 1 {
+		gaps = append(gaps, fmt.Sprintf(
+			"multi-node build (%d motherboards): compatibility checked in aggregate — verify one node alone with compose_spec on its sub-spec", n))
+	}
 	// Flag parts whose category has no wattage — undercuts PSU sizing.
 	for _, p := range parts {
 		if (p.Category == "cpu" || p.Category == "gpu") && p.TDPW == 0 {
@@ -662,7 +756,7 @@ func composeSpec(parts []Part) Spec {
 				maxW = p.Watts
 			}
 		}
-		if need := int(float64(totalTDP(byCat)) * 1.3); maxW > 0 && need > 0 && maxW < need {
+		if need := int(float64(totalTDP(byCat)) * psuHeadroom); maxW > 0 && need > 0 && maxW < need {
 			gaps = append(gaps, fmt.Sprintf(
 				"no N+1 redundancy: largest PSU %dW < %dW needed — build only survives with all PSUs running", maxW, need))
 		}
