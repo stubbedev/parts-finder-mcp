@@ -51,6 +51,10 @@ func main() {
 	// SDK doesn't recover them. Turn a handler panic into a normal error so one
 	// bad request never takes the process down.
 	s.AddReceivingMiddleware(recoverMiddleware)
+	// Clients often send no deadline and give up silently after minutes.
+	// Whatever wedges underneath (hung probe, slow retry chain), the client
+	// must get an ERROR, never four minutes of dead air.
+	s.AddReceivingMiddleware(deadlineMiddleware)
 	registerTools(s)
 
 	// SIGINT/SIGTERM skip deferred calls — reap the spawned renderer
@@ -66,6 +70,22 @@ func main() {
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
 		stopRenderer()
 		log.Fatal(err)
+	}
+}
+
+// requestDeadline bounds every tool call that arrives without a client
+// deadline. ponytail: one global cap; per-tool budgets if a tool ever
+// legitimately needs longer.
+const requestDeadline = 3 * time.Minute
+
+func deadlineMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+		if _, ok := ctx.Deadline(); !ok {
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithTimeout(ctx, requestDeadline)
+			defer cancel()
+		}
+		return next(ctx, method, req)
 	}
 }
 
