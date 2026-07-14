@@ -60,34 +60,53 @@ func detectRegion(ctx context.Context) Region {
 	return r
 }
 
-// lookupIP asks a keyless https geo-IP service for the caller's country;
-// currency is derived from the ISO table below. ponytail: single provider
-// (ifconfig.co, https, no key); detection is cached for the process so one
-// call per run. Add a fallback provider only if it proves flaky.
+// geoIPProviders: independent keyless https services that report the
+// caller's country, tried in order — first valid answer wins. The field name
+// is the JSON key carrying the ISO alpha-2 code.
+var geoIPProviders = []struct{ url, field string }{
+	{"https://ifconfig.co/json", "country_iso"},
+	{"https://ipinfo.io/json", "country"},
+}
+
+// lookupIP asks the geo-IP provider chain for the caller's country; currency
+// is derived from the ISO table below. Each provider gets its own short cap:
+// detection blocks whichever tool call triggers it (and, via regionMu, any
+// concurrent ones) — one hung provider must not spend the whole budget.
 func lookupIP(ctx context.Context) Region {
-	// Own 5s cap: detection blocks whichever tool call triggers it (and, via
-	// regionMu, any concurrent ones) — never for the full client timeout.
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	for _, p := range geoIPProviders {
+		if cc := fetchCountry(ctx, p.url, p.field); cc != "" {
+			return Region{Country: cc, Currency: currencyOf(cc)}
+		}
+	}
+	return Region{}
+}
+
+func fetchCountry(ctx context.Context, u, field string) string {
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
-		"https://ifconfig.co/json", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return Region{}
+		return ""
 	}
 	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("Accept", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return Region{}
+		return ""
 	}
 	defer resp.Body.Close()
-	var v struct {
-		CountryISO string `json:"country_iso"`
+	if resp.StatusCode != http.StatusOK {
+		return ""
 	}
+	var v map[string]any
 	if json.NewDecoder(resp.Body).Decode(&v) != nil {
-		return Region{}
+		return ""
 	}
-	cc := strings.ToUpper(v.CountryISO)
-	return Region{Country: cc, Currency: currencyOf(cc)}
+	cc, _ := v[field].(string)
+	if len(cc) != 2 {
+		return ""
+	}
+	return strings.ToUpper(cc)
 }
 
 // currencyOf maps ISO country -> ISO currency. Standards data, not vendor

@@ -22,9 +22,10 @@ import (
 
 // Zero-config headless rendering. Resolution order for a CDP endpoint:
 //  1. LIGHTPANDA_URL env (externally managed lightpanda/chrome)
-//  2. `lightpanda` binary on PATH — spawned on demand
-//  3. cached binary in ~/.cache/parts-finder/ (per release tag) — spawned on demand
-//  4. auto-download of the LATEST GitHub release (sha256-verified), then spawn
+//  2. cached binary in ~/.cache/parts-finder/ (per release tag) — spawned on demand
+//  3. auto-download of the LATEST GitHub release (sha256-verified), then spawn
+//
+// No PATH lookup: self-managed binaries stay on the tracked latest version.
 // The spawned process lives for the MCP's lifetime and dies with it.
 // fetch_content auto-escalates to rendering when a site bot-blocks plain
 // HTTP (403/429), so the user never has to configure or request it.
@@ -109,14 +110,14 @@ func ensureRenderer(ctx context.Context) (string, error) {
 	return wsFromBase(ctx, base)
 }
 
-// lightpandaBinary finds or fetches the lightpanda executable: PATH first,
-// then the newest release (resolved live, cached per version so a new release
-// is picked up on the next cold start), falling back to any cached build when
-// the release API is unreachable — a slightly old renderer beats none.
+// lightpandaBinary fetches and manages the lightpanda executable: the newest
+// release, resolved live and cached per version so a new release is picked up
+// on the next cold start, falling back to any cached build when the release
+// API is unreachable — a slightly old renderer beats none. Deliberately no
+// PATH lookup: a system binary would be whatever version happens to be
+// installed, outside our update/cleanup management (LIGHTPANDA_URL covers
+// running your own).
 func lightpandaBinary(ctx context.Context) (string, error) {
-	if p, err := exec.LookPath("lightpanda"); err == nil {
-		return p, nil
-	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", err
