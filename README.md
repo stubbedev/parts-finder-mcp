@@ -82,6 +82,60 @@ Docker:
 }
 ```
 
+## Optional: your own SearXNG search backend
+
+Web search runs through a chain of keyless engines (DuckDuckGo, Brave,
+Ecosia). Heavy sessions can get rate-limited. The fix is a private
+[SearXNG](https://docs.searxng.org/) instance: when `SEARXNG_URL` is set it
+becomes the FIRST engine in the chain, with no rate-limit exposure — it
+queries Google, Startpage, DuckDuckGo and friends server-side, no API keys,
+and the public engines remain as fallbacks. (Public SearXNG instances don't
+work for this: they disable the JSON API and block automated clients by
+design — run your own.)
+
+Set it up (two commands):
+
+```sh
+docker run -d --name searxng --restart unless-stopped \
+  -p 127.0.0.1:8888:8080 \
+  -v searxng-config:/etc/searxng \
+  searxng/searxng
+
+# parts-finder uses the JSON API, which is off by default:
+docker exec searxng sh -c 'printf "\nsearch:\n  formats:\n    - html\n    - json\n" >> /etc/searxng/settings.yml' \
+  && docker restart searxng
+```
+
+Verify — should print JSON, not a 403:
+
+```sh
+curl 'http://localhost:8888/search?format=json&q=test'
+```
+
+Then pass `SEARXNG_URL` when registering. Claude Code:
+
+```sh
+claude mcp add parts-finder -e SEARXNG_URL=http://localhost:8888 -- /abs/path/to/parts-finder
+```
+
+Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "parts-finder": {
+      "command": "/abs/path/to/parts-finder",
+      "env": { "SEARXNG_URL": "http://localhost:8888" }
+    }
+  }
+}
+```
+
+If parts-finder itself runs in Docker, `localhost` is the container — point
+it at the host instead: add `--add-host=host.docker.internal:host-gateway`
+(Linux; built in on macOS/Windows) to the `docker run` args and use
+`SEARXNG_URL=http://host.docker.internal:8888` (pass it with `-e`).
+
 ## What you can ask
 
 Once registered, just talk to Claude in plain language:
