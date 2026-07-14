@@ -58,6 +58,20 @@ func TestSearchChain(t *testing.T) {
 	}
 }
 
+func TestDecodeYahooLink(t *testing.T) {
+	cases := map[string]string{
+		"https://r.search.yahoo.com/_ylt=Aw/RV=2/RE=1/RO=10/RU=https%3a%2f%2fwww.pishop.us%2fproduct%2fpi-4%2f/RK=2/RS=x-": "https://www.pishop.us/product/pi-4/",
+		"https://r.search.yahoo.com/x/RU=https%3a%2f%2fwww.bing.com%2faclick%3fld=e8/RK=2/RS=y-":                           "https://www.bing.com/aclick?ld=e8", // decoded; the aclick filter drops it at the call site
+		"https://example.com/no-redirect":                  "",
+		"https://r.search.yahoo.com/RU=not%20a%20url/RK=2": "",
+	}
+	for in, want := range cases {
+		if got := decodeYahooLink(in); got != want {
+			t.Errorf("decodeYahooLink(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestDDGAnomalyDetection(t *testing.T) {
 	if !isDDGAnomaly([]byte(`<html><body class="anomaly-modal">…</body></html>`)) {
 		t.Errorf("anomaly page must be detected")

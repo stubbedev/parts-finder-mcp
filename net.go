@@ -7,12 +7,15 @@ import (
 	"hash/fnv"
 	"io"
 	"math/rand/v2"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	utls "github.com/refraction-networking/utls"
 )
 
 // recoverLog turns a panicking goroutine into a logged non-event. A panic in
@@ -39,35 +42,50 @@ func recoverLog(where string) {
 // keyless version APIs once per process, so the identities never age. (No Go
 // package does this — UA packages embed static lists that go stale exactly
 // like a pinned string.) Safari's version churns slowly; it stays pinned.
+// Hello ties each identity's uTLS ClientHello to its browser family so the TLS
+// handshake's JA3 AGREES with the UA — a Chrome UA riding a Go TLS handshake is
+// the exact contradiction that gets a single request bot-walled (verified:
+// engines block Go's ClientHello but pass a real browser's; Ecosia 403→200,
+// DDG's curl-fingerprint 202→200). dialUTLS applies these. The _Auto IDs alias
+// the NEWEST ClientHello the linked utls ships (Chrome_Auto→133 today), so the
+// handshake ages forward when the utls dep is bumped — the TLS analogue of
+// refreshFingerprints' UA refresh. (Runtime vendor-API following like the UA's
+// is impossible for TLS: utls can only emit specs it ships, so "newest shipped"
+// is the ceiling — and Chrome's ClientHello shape barely drifts across majors.)
 var fingerprints = []struct {
 	UA         string
 	AcceptLang string
 	SecChUA    string
 	Platform   string
+	Hello      utls.ClientHelloID
 }{
 	{
 		UA:         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 		AcceptLang: "en-US,en;q=0.9",
 		SecChUA:    `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
 		Platform:   `"Linux"`,
+		Hello:      utls.HelloChrome_Auto,
 	},
 	{
 		UA:         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 		AcceptLang: "en-GB,en;q=0.9",
 		SecChUA:    `"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"`,
 		Platform:   `"Windows"`,
+		Hello:      utls.HelloChrome_Auto,
 	},
 	{
 		UA:         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15",
 		AcceptLang: "en-US,en;q=0.9",
 		SecChUA:    "",
 		Platform:   `"macOS"`,
+		Hello:      utls.HelloSafari_Auto,
 	},
 	{
 		UA:         "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:133.0) Gecko/20100101 Firefox/133.0",
 		AcceptLang: "en-US,en;q=0.9",
 		SecChUA:    "",
 		Platform:   "",
+		Hello:      utls.HelloFirefox_Auto,
 	},
 }
 
@@ -170,6 +188,47 @@ func fingerprintFor(host string) int {
 	h := fnv.New32a()
 	h.Write([]byte(host))
 	return int(h.Sum32() % uint32(len(fingerprints)))
+}
+
+// dialUTLS is httpClient's TLS dialer. It handshakes with the ClientHello of
+// the same per-host fingerprint applyHeaders uses, so JA3 and the UA tell one
+// story (see fingerprints.Hello). ALPN is forced to http/1.1: the stdlib
+// http.Transport can't drive HTTP/2 over a uTLS conn (it can't detect the
+// negotiated protocol and reads h2 frames as garbage), and every HTTPS host
+// speaks h1.1 — while JA3, the signal WAFs actually block on, is unchanged (it
+// doesn't hash the ALPN value). Losing h2 costs a little multiplexing, nothing
+// for page-at-a-time scraping.
+// ponytail: Hello majors (Chrome 133 etc.) are pinned; refreshFingerprints ages
+// the UA string but not the ClientHello — bump these IDs if utls ships newer.
+func dialUTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	spec, err := utls.UTLSIdToSpec(fingerprints[fingerprintFor(host)].Hello)
+	if err != nil {
+		raw.Close()
+		return nil, err
+	}
+	for _, ext := range spec.Extensions {
+		if a, ok := ext.(*utls.ALPNExtension); ok {
+			a.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	u := utls.UClient(raw, &utls.Config{ServerName: host}, utls.HelloCustom)
+	if err := u.ApplyPreset(&spec); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	if err := u.HandshakeContext(ctx); err != nil {
+		raw.Close()
+		return nil, err
+	}
+	return u, nil
 }
 
 // applyHeaders sets a full browser header set for the request's host.
