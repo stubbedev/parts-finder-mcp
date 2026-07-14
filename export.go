@@ -124,7 +124,10 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 		}
 		ownedLeft := toCount(ownedIDs) // repeats = units owned; consumed per row
 		prewarmLiveness(ctx, partIDs)
-		spec := composeSpec(parts)
+		spec, err := store.composeIDs(rawIDs)
+		if err != nil {
+			return "", fmt.Errorf("spec %s: %w", sid, err)
+		}
 
 		// Deterministic sheet name so re-exporting a spec REPLACES its sheet
 		// (update-in-place) rather than piling up "~2" duplicates.

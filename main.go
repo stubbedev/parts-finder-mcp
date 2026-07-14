@@ -528,17 +528,13 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compose_spec",
-		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' to inline a saved build (repeat for quantity) — a rack is 12x 'spec:node' plus switches/PDUs. The rules applied are data: list_rules shows them, save_rule extends them. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
+		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' for a saved build (repeat for quantity) — sub-builds compose HIERARCHICALLY: rules check each node on its own (a rack of 12x 'spec:node' never cross-pairs nodes), child problems surface prefixed with their spec, and a node's unmet needs bubble up for rack-level parts (switches, PDUs, cabinets) to satisfy. The rules applied are data: list_rules shows them, save_rule extends them. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, Spec, error) {
-		partIDs, _, err := store.expandSpecIDs(in.PartIDs, nil)
+		spec, err := store.composeIDs(in.PartIDs)
 		if err != nil {
 			return nil, Spec{}, err
 		}
-		parts, err := store.getParts(partIDs)
-		if err != nil {
-			return nil, Spec{}, err
-		}
-		return nil, composeSpec(parts), nil
+		return nil, spec, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -762,6 +758,7 @@ func registerTools(s *mcp.Server) {
 			}
 			partIDs, ownedIDs = ids, owned
 		}
+		rawIDs := partIDs // pre-expansion, for hierarchical compat
 		partIDs, ownedIDs, err := store.expandSpecIDs(partIDs, ownedIDs)
 		if err != nil {
 			return nil, shopOut{}, err
@@ -785,7 +782,10 @@ func registerTools(s *mcp.Server) {
 			display = region.Currency
 		}
 		prewarmLiveness(ctx, partIDs) // one parallel probe sweep; per-part pricing then hits cache
-		spec := composeSpec(parts)
+		spec, err := store.composeIDs(rawIDs)
+		if err != nil {
+			return nil, shopOut{}, err
+		}
 		out := shopOut{
 			Region: region, Compatible: spec.Compatible,
 			Partial: spec.Partial, MissingForBuild: spec.MissingForBuild,
@@ -892,7 +892,10 @@ func registerTools(s *mcp.Server) {
 			demand := toCount(partIDs)
 			ownedQty := toCount(ownedIDs)
 			prewarmLiveness(ctx, partIDs)
-			spec := composeSpec(parts)
+			spec, err := store.composeIDs(rawIDs)
+			if err != nil {
+				return nil, compareOut{}, fmt.Errorf("spec %s: %w", sid, err)
+			}
 			opt := specOption{
 				ID: sid, Name: name, Compatible: spec.Compatible,
 				Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
@@ -1054,15 +1057,14 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, loadSpecOut{}, err
 		}
-		partIDs, ownedIDs, err := store.expandSpecIDs(rawIDs, rawOwned)
+		spec, err := store.composeIDs(rawIDs)
 		if err != nil {
 			return nil, loadSpecOut{}, err
 		}
-		parts, err := store.getParts(partIDs)
+		_, ownedIDs, err := store.expandSpecIDs(rawIDs, rawOwned)
 		if err != nil {
 			return nil, loadSpecOut{}, err
 		}
-		spec := composeSpec(parts)
 		spec.Owned = ownedIDs
 		return nil, loadSpecOut{Spec: &spec}, nil
 	})

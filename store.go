@@ -130,24 +130,33 @@ func (s *Store) getParts(ids []string) ([]Part, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	ph := strings.Repeat("?,", len(ids))
-	ph = ph[:len(ph)-1]
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	rows, err := s.db.Query(`SELECT `+partCols+` FROM parts WHERE id IN (`+ph+`)`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	// Query unique ids in bounded chunks: repeats (quantity) don't need their
+	// own placeholder, and one flat IN(...) would hit SQLite's variable limit
+	// on a large expanded spec.
+	const chunkSize = 500
+	unique := uniqueInOrder(ids)
 	found := map[string]Part{}
-	for rows.Next() {
-		p, err := scanPart(rows)
+	for start := 0; start < len(unique); start += chunkSize {
+		chunk := unique[start:min(start+chunkSize, len(unique))]
+		ph := strings.Repeat("?,", len(chunk))
+		ph = ph[:len(ph)-1]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := s.db.Query(`SELECT `+partCols+` FROM parts WHERE id IN (`+ph+`)`, args...)
 		if err != nil {
 			return nil, err
 		}
-		found[p.ID] = p
+		for rows.Next() {
+			p, err := scanPart(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			found[p.ID] = p
+		}
+		rows.Close()
 	}
 	// Preserve request order; error on any missing id so callers see the gap.
 	var out []Part
@@ -439,6 +448,101 @@ func (s *Store) expand(ids []string, visiting map[string]bool) (parts, owned []s
 		owned = append(owned, soo...)
 	}
 	return parts, owned, nil
+}
+
+// composeIDs composes a build from part ids that may contain "spec:<id>"
+// references — HIERARCHICALLY. Each sub-spec composes on its own, so rules
+// see one node at a time and a rack can never cross-pair nodes (or hide a
+// per-node overload inside a pooled limit). Child violations and gaps bubble
+// up prefixed with their spec; child UNMET needs become requirements at the
+// parent level, where a rack's switch/PDU/cabinet can satisfy them — a node's
+// internal surplus (spare DIMM slots) deliberately does NOT leak to siblings.
+// Distinct sub-specs compose once and multiply by their count. A flat id list
+// (no refs) behaves exactly like composeSpec.
+func (s *Store) composeIDs(ids []string) (Spec, error) {
+	return s.composeTree(ids, map[string]bool{})
+}
+
+func (s *Store) composeTree(ids []string, visiting map[string]bool) (Spec, error) {
+	var direct []string
+	counts := map[string]int{}
+	var refs []string
+	for _, id := range ids {
+		if sub, ok := strings.CutPrefix(id, "spec:"); ok {
+			if counts[sub] == 0 {
+				refs = append(refs, sub)
+			}
+			counts[sub]++
+		} else {
+			direct = append(direct, id)
+		}
+	}
+	parts, err := s.getParts(direct)
+	if err != nil {
+		return Spec{}, err
+	}
+	level := append([]Part(nil), parts...)    // direct parts + synthetic child aggregates
+	allParts := append([]Part(nil), parts...) // flattened output (children repeated per count)
+	var childViolations []Violation
+	var childGaps []string
+	anyChildPartial := false
+	for _, sub := range refs {
+		n := counts[sub]
+		if visiting[sub] {
+			return Spec{}, fmt.Errorf("spec cycle at %q", sub)
+		}
+		visiting[sub] = true
+		_, subIDs, _, err := s.loadSpec(sub)
+		if err != nil {
+			return Spec{}, fmt.Errorf("sub-spec %s: %w", sub, err)
+		}
+		child, err := s.composeTree(subIDs, visiting)
+		if err != nil {
+			return Spec{}, err
+		}
+		delete(visiting, sub)
+		tag := "spec:" + sub
+		if n > 1 {
+			tag = fmt.Sprintf("spec:%s (x%d)", sub, n)
+		}
+		for _, v := range child.Violations {
+			if v.Rule == "resource" {
+				// A child's resource deficit bubbles up as a need the parent
+				// may satisfy (switch ports, PDU outlets); the parent's own
+				// resource check re-raises whatever stays unmet.
+				continue
+			}
+			childViolations = append(childViolations, Violation{v.Rule, v.Parts, tag + ": " + v.Message})
+		}
+		for _, g := range child.Gaps {
+			childGaps = append(childGaps, tag+": "+g)
+		}
+		if child.Partial {
+			anyChildPartial = true
+			childGaps = append(childGaps, tag+": partial build (missing "+strings.Join(child.MissingForBuild, ", ")+")")
+		}
+		req := map[string]int{}
+		for _, need := range child.Needs {
+			req[need.Resource] = need.Count * n
+		}
+		level = append(level, Part{ID: "spec:" + sub, Category: subSpecCategory,
+			TDPW: child.TotalTDPW * n, Requires: req})
+		for range n {
+			allParts = append(allParts, child.Parts...)
+		}
+	}
+	spec := composeSpec(level)
+	spec.Parts = allParts
+	spec.Violations = append(spec.Violations, childViolations...)
+	spec.Compatible = len(spec.Violations) == 0
+	spec.Gaps = append(spec.Gaps, childGaps...)
+	if len(refs) > 0 {
+		// A parent of sub-builds isn't itself a bootable machine; each
+		// child's completeness was checked (and gapped) per child above.
+		spec.MissingForBuild = nil
+		spec.Partial = anyChildPartial
+	}
+	return spec, nil
 }
 
 // saveRule upserts a store compat rule (added, overridden, or disabled).

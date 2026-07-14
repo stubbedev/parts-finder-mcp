@@ -705,6 +705,12 @@ type Spec struct {
 // requiredCategories is the minimum for a bootable server build.
 var requiredCategories = []string{"cpu", "motherboard", "ram", "psu"}
 
+// subSpecCategory marks the synthetic aggregate part composeIDs injects for a
+// composed sub-spec: it carries only the child's bubbled-up needs (as
+// Requires) and TDP, so parent-level parts can satisfy them. Data-quality
+// gaps never apply to it — it isn't real hardware.
+const subSpecCategory = "subspec"
+
 // partDataMaxAge: part data older than this gets a freshness gap.
 // ponytail: fixed 30d; make it a tool arg if it ever needs tuning.
 const partDataMaxAge = 30 * 24 * time.Hour
@@ -773,6 +779,9 @@ func composeSpec(parts []Part) Spec {
 	// green checkmark. Generic: no category list — driven by what's absent.
 	cs, hasCase := first(byCat["case"])
 	for _, p := range parts {
+		if p.Category == subSpecCategory {
+			continue // synthetic sub-build aggregate — not real hardware
+		}
 		if len(p.Provides) == 0 && len(p.Requires) == 0 {
 			gaps = append(gaps, p.ID+": no provides/requires declared — power cables, slots, bays unverified (run deep_specs)")
 		}
