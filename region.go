@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Region is the user's locale, used to bias search toward local vendors and to
@@ -20,17 +21,20 @@ type Region struct {
 }
 
 var (
-	regionMu  sync.Mutex
-	regionVal Region
-	regionSet bool
+	regionMu    sync.Mutex
+	regionVal   Region
+	regionSet   bool
+	regionRetry time.Time // after a failed lookup, don't retry before this
 )
 
 // detectRegion resolves the region. Env REGION_COUNTRY / REGION_CURRENCY
 // override IP detection; missing currency is derived from the country. Only a
-// SUCCESSFUL detection is cached — a failed IP lookup (offline start, short
-// first-call deadline) is retried on the next call instead of locking an
-// empty region in for the process lifetime. An empty Region means no bias and
-// a USD display fallback; it's visible in every tool's region output.
+// SUCCESSFUL detection is cached — a failed IP lookup (offline start) is
+// retried instead of locking an empty region in for the process lifetime, but
+// on a 1-minute backoff: regionMu serializes callers, so retrying on EVERY
+// call would stall every tool behind repeated lookups while offline. An empty
+// Region means no bias and a USD display fallback; it's visible in every
+// tool's region output.
 func detectRegion(ctx context.Context) Region {
 	regionMu.Lock()
 	defer regionMu.Unlock()
@@ -41,8 +45,11 @@ func detectRegion(ctx context.Context) Region {
 		Country:  strings.ToUpper(os.Getenv("REGION_COUNTRY")),
 		Currency: strings.ToUpper(os.Getenv("REGION_CURRENCY")),
 	}
-	if r.Country == "" {
+	if r.Country == "" && time.Now().After(regionRetry) {
 		r.Country = lookupIP(ctx).Country
+		if r.Country == "" {
+			regionRetry = time.Now().Add(time.Minute)
+		}
 	}
 	if r.Currency == "" && r.Country != "" {
 		r.Currency = currencyOf(r.Country)
@@ -58,6 +65,10 @@ func detectRegion(ctx context.Context) Region {
 // (ifconfig.co, https, no key); detection is cached for the process so one
 // call per run. Add a fallback provider only if it proves flaky.
 func lookupIP(ctx context.Context) Region {
+	// Own 5s cap: detection blocks whichever tool call triggers it (and, via
+	// regionMu, any concurrent ones) — never for the full client timeout.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
 		"https://ifconfig.co/json", nil)
 	if err != nil {

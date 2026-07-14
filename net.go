@@ -84,9 +84,12 @@ var fpOnce sync.Once
 // current stable ones, once per process, before the first outbound request.
 // Best-effort with a benign fallback: a slightly old UA still works, so a
 // failed lookup (offline start) keeps the pins and is not retried.
-func refreshFingerprints(ctx context.Context) {
+func refreshFingerprints() {
 	fpOnce.Do(func() {
-		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		// Own context: this is process-global state — the first caller's
+		// deadline (a 10s probe, a cancelled tool call) must not decide the
+		// UA every later request wears.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if v := latestChromeMajor(ctx); v != "" && v != pinnedChromeMajor {
 			for i := range fingerprints {
@@ -260,7 +263,7 @@ const maxAttempts = 4
 // (e.g. Referer, Accept overrides) win over the defaults. The returned
 // response's Body is open — caller closes it.
 func doRequest(ctx context.Context, method, rawURL string, extra map[string]string) (*http.Response, error) {
-	refreshFingerprints(ctx) // once per process, before the first fingerprinted request
+	refreshFingerprints() // once per process, before the first fingerprinted request
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, method, rawURL, nil)
@@ -280,6 +283,9 @@ func doRequest(ctx context.Context, method, rawURL string, extra map[string]stri
 		g.release()
 		if err != nil {
 			lastErr = err
+			if attempt == maxAttempts-1 { // out of attempts — don't sleep for nothing
+				return nil, err
+			}
 			if !sleepBackoff(ctx, attempt, 0) {
 				return nil, err
 			}

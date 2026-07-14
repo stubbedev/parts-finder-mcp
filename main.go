@@ -400,16 +400,14 @@ func exVATContribution(l Listing, display string) (float64, bool) {
 }
 
 // regionFor resolves the effective region for a call: an explicit country
-// override (currency and search locale re-derived to match — a US override
-// must not keep pricing in the detected region's DKK), else the detected
-// region. display_currency remains the per-call currency override.
+// override builds the region outright (currency and search locale derived
+// from the country — no IP detection needed, and a US override must not keep
+// pricing in the detected region's DKK), else the detected region.
+// display_currency remains the per-call currency override.
 func regionFor(ctx context.Context, country string) Region {
 	if country != "" {
-		r := detectRegion(ctx)
-		r.Country = strings.ToUpper(country)
-		r.Currency = currencyOf(r.Country)
-		r.DDG = ddgRegion(r.Country)
-		return r
+		c := strings.ToUpper(country)
+		return Region{Country: c, Currency: currencyOf(c), DDG: ddgRegion(c)}
 	}
 	return detectRegion(ctx)
 }

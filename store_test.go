@@ -73,6 +73,44 @@ func TestPriceHistory(t *testing.T) {
 	}
 }
 
+// Opening a store rewrites pre-UTC local-offset timestamps to UTC so string
+// ordering stays correct; unparsable values survive untouched.
+func TestTimestampMigration(t *testing.T) {
+	path := t.TempDir() + "/parts.db"
+	st, err := openStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Simulate rows written before UTC normalization.
+	if _, err := st.db.Exec(`INSERT INTO listing_history
+	  (listing_id,part_id,vendor,price,shipping,currency,seen_at)
+	  VALUES ('l1','p1','v',100,0,'DKK','2026-07-14T10:00:00+02:00'),
+	         ('l1','p1','v',90,0,'DKK','not-a-time')`); err != nil {
+		t.Fatal(err)
+	}
+	st.db.Close()
+	st, err = openStore(path) // migration runs on open
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := st.db.Query(`SELECT seen_at FROM listing_history ORDER BY price DESC`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, s)
+	}
+	if len(got) != 2 || got[0] != "2026-07-14T08:00:00Z" || got[1] != "not-a-time" {
+		t.Fatalf("want [2026-07-14T08:00:00Z not-a-time], got %v", got)
+	}
+}
+
 // Compat rules persist and round-trip (the overlay source).
 func TestRulesRoundTrip(t *testing.T) {
 	st, err := openStore(":memory:")

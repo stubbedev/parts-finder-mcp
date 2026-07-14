@@ -64,6 +64,19 @@ CREATE INDEX IF NOT EXISTS idx_parts_category ON parts(category);`
 	db.Exec(`ALTER TABLE listings ADD COLUMN qty_available INT`)
 	db.Exec(`ALTER TABLE listings ADD COLUMN in_stock INT`)
 	db.Exec(`ALTER TABLE listings ADD COLUMN lead_days INT`)
+	// Timestamps are compared and ORDERed as strings, so every stored value
+	// must be UTC ("...Z") — rewrite pre-UTC local-offset rows once. COALESCE
+	// keeps anything strftime can't parse; the NOT LIKE guard makes re-runs
+	// no-ops.
+	for _, tc := range []struct{ table, col string }{
+		{"parts", "fetched_at"}, {"listings", "seen_at"},
+		{"listing_history", "seen_at"}, {"specs", "created_at"},
+		{"content_cache", "fetched_at"},
+	} {
+		db.Exec(fmt.Sprintf(
+			`UPDATE %s SET %s = COALESCE(strftime('%%Y-%%m-%%dT%%H:%%M:%%SZ', %s), %s) WHERE %s NOT LIKE '%%Z'`,
+			tc.table, tc.col, tc.col, tc.col, tc.col))
+	}
 	return &Store{db}, nil
 }
 
