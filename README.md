@@ -125,8 +125,7 @@ Native binary (macOS `brew`/Nix install — use an absolute path):
 {
   "mcpServers": {
     "parts-finder": {
-      "command": "/abs/path/to/parts-finder",
-      "env": { "PARTS_DB": "/Users/you/.parts-finder.db" }
+      "command": "/abs/path/to/parts-finder"
     }
   }
 }
