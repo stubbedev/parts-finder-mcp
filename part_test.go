@@ -88,6 +88,92 @@ func TestResourceAccounting(t *testing.T) {
 	}
 }
 
+// The 12-fans-for-6-bays class: over-provisioning a slot is caught ONLY when
+// both sides declare the bay token, and a build that leaves it undeclared must
+// NOT read as verified (that green light is what let the bad recommendation
+// through).
+func TestFanBayOverProvisionAndVerified(t *testing.T) {
+	// Both sides declared, over capacity: 12 fans into 6 bays -> violation.
+	chassis := Part{ID: "chs", Category: "chassis", Provides: map[string]int{"fan_bay": 6}}
+	fans := Part{ID: "fan", Category: "fan", Requires: map[string]int{"fan_bay": 12}}
+	if vs := resourceViolations([]Part{chassis, fans}); len(vs) != 1 || vs[0].Rule != "resource" {
+		t.Fatalf("12 fans / 6 bays must violate, got %+v", vs)
+	}
+	// Declared and within capacity: no violation, and the build verifies
+	// (every expected slot token present on both sides).
+	okFans := Part{ID: "fan", Category: "fan", Requires: map[string]int{"fan_bay": 6}}
+	fullChassis := Part{ID: "chs", Category: "chassis",
+		Provides: map[string]int{"fan_bay": 6, "bay:2.5": 8, "bay:3.5": 0}}
+	spec := composeSpec([]Part{fullChassis, okFans})
+	if !spec.Compatible {
+		t.Fatalf("6 fans / 6 bays should be compatible, gaps=%v", spec.Gaps)
+	}
+	// Neither side declares the bay token: nothing to check, so no violation
+	// (compatible stays true) — but the build must NOT read as verified, and a
+	// gap must name the missing token so the model knows to extract it.
+	blindChassis := Part{ID: "chs", Category: "chassis"}
+	blindFans := Part{ID: "fan", Category: "fan"}
+	spec = composeSpec([]Part{blindChassis, blindFans})
+	if !spec.Compatible {
+		t.Error("undeclared bays => no violation => still 'compatible'")
+	}
+	if spec.Verified {
+		t.Error("undeclared fan bays must NOT read as verified")
+	}
+	found := false
+	for _, g := range spec.Gaps {
+		if strings.Contains(g, "fan_bay") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("a gap must name the missing fan_bay token, gaps=%v", spec.Gaps)
+	}
+}
+
+// Physical-fit rules are written for "case" but must also fire on server gear
+// saved as "chassis"/"barebones" (category aliasing) — otherwise the exact
+// gear this tool targets gets no fit check.
+func TestCategoryAliasCaseChassis(t *testing.T) {
+	chassis := Part{ID: "chs", Category: "chassis", LengthMM: 300} // 300mm GPU clearance
+	longGPU := Part{ID: "gpu", Category: "gpu", LengthMM: 400}     // 400mm card — won't fit
+	vs := attrRuleViolations(groupByCategory([]Part{chassis, longGPU}))
+	hit := false
+	for _, v := range vs {
+		if v.Rule == "gpu_length" {
+			hit = true
+		}
+	}
+	if !hit {
+		t.Fatalf("gpu_length must fire on a 'chassis' (aliased to case), got %+v", vs)
+	}
+	// A fitting card on the same chassis: no gpu_length violation.
+	okGPU := Part{ID: "gpu", Category: "gpu", LengthMM: 250}
+	for _, v := range attrRuleViolations(groupByCategory([]Part{chassis, okGPU})) {
+		if v.Rule == "gpu_length" {
+			t.Errorf("250mm card fits 300mm chassis clearance, should not violate")
+		}
+	}
+}
+
+func TestMissingExpectedTokens(t *testing.T) {
+	// Partial tokens must not pass as complete: a chassis that declares pcie
+	// but not fan_bay still has missing expected tokens (the fail-open hole).
+	partial := Part{ID: "c", Category: "chassis", Provides: map[string]int{"pcie:x16": 3}}
+	miss := missingExpectedTokens(partial)
+	if len(miss) == 0 {
+		t.Fatal("chassis without fan_bay/bays must report missing expected tokens")
+	}
+	// Family expectation: any typed dimm member satisfies "dimm:".
+	board := Part{ID: "mb", Category: "motherboard",
+		Provides: map[string]int{"dimm:ddr5": 8, "pcie:x16": 2}}
+	for _, e := range missingExpectedTokens(board) {
+		if e.Token == "dimm:" || e.Token == "pcie:" {
+			t.Errorf("declared %s should satisfy family expectation", e.Token)
+		}
+	}
+}
+
 // Repeating a part id in a spec = quantity: each instance consumes resources
 // and counts toward TDP; deficits surface as structured Needs.
 func TestQuantityAndNeeds(t *testing.T) {

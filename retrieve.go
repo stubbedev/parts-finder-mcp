@@ -791,6 +791,7 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 	}
 	f.FetchedAt = time.Now()
 	f.ConsentWall = isConsentWall(f.Text)
+	f.BotWall = isBotWall(f.Title + "\n" + f.Text)
 	// Don't cache scanned-PDF image results (the cache only holds text — a hit
 	// would return empty text with no images), and don't cache near-empty
 	// text: a JS-shell SPA would poison the cache for the whole TTL and block
@@ -800,7 +801,9 @@ func fetchCached(ctx context.Context, rawURL, kind string, render bool) (Fetched
 	// Don't cache a TRUNCATED extraction either: the cache carries no truncated
 	// flag, so a re-serve within the TTL (up to 30d for specs) would return the
 	// cut prefix as if it were the whole document — a silent half-a-spec-sheet.
-	if len(f.Images) == 0 && !f.Truncated && !f.ConsentWall && len(strings.TrimSpace(f.Text)) >= minCacheChars {
+	// A bot wall is the same cache trap as a consent wall: cached, it would
+	// read as "the page says nothing about price" for a whole TTL.
+	if len(f.Images) == 0 && !f.Truncated && !f.ConsentWall && !f.BotWall && len(strings.TrimSpace(f.Text)) >= minCacheChars {
 		store.putCache(rawURL, f.Title, f.Text, f.ETag, f.LastModified, kind)
 	}
 	return f, false, nil
@@ -830,6 +833,7 @@ type Fetched struct {
 	StaleReason  string     // why the live fetch failed when Stale
 	Truncated    bool       // the source exceeded the size cap — text is a PREFIX, not the whole document
 	ConsentWall  bool       // the text looks like a cookie-consent interstitial, NOT the page content
+	BotWall      bool       // the text looks like an anti-bot challenge page (Cloudflare/WAF), NOT the page content
 }
 
 func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
@@ -1028,6 +1032,29 @@ func isConsentWall(text string) bool {
 		}
 	}
 	return hits >= 2
+}
+
+// isBotWall recognizes an anti-bot challenge interstitial (Cloudflare,
+// Akamai, Azure WAF, ...) standing in for page content: short text dominated
+// by challenge vocabulary. The headless renderer cannot pass these — the
+// caller must know it got a wall, not a page. Advisory only — flag, never drop.
+func isBotWall(text string) bool {
+	t := strings.ToLower(strings.TrimSpace(text))
+	if len(t) == 0 || len(t) > 2000 {
+		return false // real content is longer; emptiness is a different problem
+	}
+	for _, marker := range []string{
+		"just a moment", "checking your browser", "verifying you are human",
+		"verify you are human", "performing security verification",
+		"security service to protect", "enable javascript and cookies",
+		"attention required", "request unsuccessful", "are you a robot",
+		"captcha", "azure waf", "access denied",
+	} {
+		if strings.Contains(t, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // extractTables renders every <table> on the page as a markdown table so

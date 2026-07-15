@@ -164,7 +164,7 @@ func TestExportHonesty(t *testing.T) {
 	}
 
 	// TO BUY total: 2×1000 + 200 + 300 = 2500 — nic excluded, but EXPLICITLY.
-	tot := findRow(rows, "TO BUY total (DKK)")
+	tot := findRow(rows, "TO BUY total (DKK, gross")
 	if tot == nil || tot[1] != "2500" {
 		t.Fatalf("TO BUY total wrong: %v", tot)
 	}
@@ -186,14 +186,14 @@ func TestExportHonesty(t *testing.T) {
 	}
 
 	// Priced count excludes the unconverted unit — 4 of 5 needed.
-	pc := findRow(rows, "Parts to buy")
+	pc := findRow(rows, "Units to buy")
 	if pc == nil || pc[1] != "4 priced of 5 needed" {
 		t.Fatalf("priced count wrong: %v", pc)
 	}
 
-	// As-of stamp.
-	if findRow(rows, "Prices fetched", "re-export to refresh") == nil {
-		t.Error("missing as-of stamp")
+	// Export stamp — honestly labeled as export time, not "prices fetched".
+	if findRow(rows, "Workbook exported", "re-run save_listing") == nil {
+		t.Error("missing export stamp")
 	}
 }
 

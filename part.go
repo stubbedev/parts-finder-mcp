@@ -132,6 +132,78 @@ var builtinRules = []CompatRule{
 		Note: "summed TDP of powered gear must stay under the PDU's rated feed (e.g. 16A/230V ≈ 3680W)"},
 }
 
+// tokenExpectation says a category normally carries a resource token, and on
+// which side. Slot/bay/socket capacity lives ONLY in free-form provides/
+// requires tokens — no compat rule references them — so the rule-derived
+// extraction checklist (ruleAttrsFor/emptyFields) can't name them, and a part
+// saved with none passes as fully specified. That blind spot is what let "12
+// fans for a 6-bay chassis" through: nothing told the model to extract the
+// chassis's fan-bay count, and a missing token fails OPEN (unknown = no
+// constraint). This table names the tokens per category so the checklist asks
+// for them and composeSpec flags a missing one — the seed-knowledge doctrine
+// of builtinRules, applied to the token layer.
+type tokenExpectation struct {
+	Token   string // exact token, or a "family:" prefix (trailing ':' matches any typed member, e.g. "dimm:" ⊇ "dimm:ddr5")
+	Provide bool   // true: the category SUPPLIES this slot/bay; false: it CONSUMES one
+}
+
+// expectedTokensByCat is a SEED, not a closed list — STANDARDS facts (a fan
+// occupies a fan bay, a stick occupies a DIMM slot, a card occupies a PCIe
+// slot). New categories/tokens still work without an entry here; this only
+// drives what the checklist proactively asks for and what composeSpec flags as
+// an unchecked slot. ponytail: extend by adding a row; per-model quirks stay in
+// the data (provides/requires on the part), never here.
+var expectedTokensByCat = map[string][]tokenExpectation{
+	"case":        {{"fan_bay", true}, {"bay:2.5", true}, {"bay:3.5", true}},
+	"chassis":     {{"fan_bay", true}, {"bay:2.5", true}, {"bay:3.5", true}},
+	"barebones":   {{"fan_bay", true}, {"bay:2.5", true}, {"bay:3.5", true}},
+	"server":      {{"fan_bay", true}, {"bay:2.5", true}, {"bay:3.5", true}},
+	"fan":         {{"fan_bay", false}},
+	"motherboard": {{"dimm:", true}, {"pcie:", true}},
+	"ram":         {{"dimm:", false}},
+	"gpu":         {{"pcie:", false}},
+}
+
+// hasExpectedToken reports whether p declares e on the expected side. A family
+// expectation (trailing ':') is satisfied by any typed member.
+func hasExpectedToken(p Part, e tokenExpectation) bool {
+	m := p.Requires
+	if e.Provide {
+		m = p.Provides
+	}
+	for tok := range m {
+		tok = strings.ToLower(strings.TrimSpace(tok))
+		if strings.HasSuffix(e.Token, ":") {
+			if strings.HasPrefix(tok, e.Token) {
+				return true
+			}
+		} else if tok == e.Token {
+			return true
+		}
+	}
+	return false
+}
+
+// missingExpectedTokens returns the slot/bay tokens p's category should declare
+// but doesn't — the concrete "extract this" list behind the fan-bay fix.
+func missingExpectedTokens(p Part) []tokenExpectation {
+	var out []tokenExpectation
+	for _, e := range expectedTokensByCat[strings.ToLower(strings.TrimSpace(p.Category))] {
+		if !hasExpectedToken(p, e) {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// tokenSide renders the checklist/gap label for an expectation.
+func (e tokenExpectation) side() string {
+	if e.Provide {
+		return "provides"
+	}
+	return "requires"
+}
+
 // ruleOverlay holds store-persisted rules (added, overridden, or disabled),
 // keyed by name. Guarded because tool handlers run concurrently.
 var (
@@ -209,12 +281,12 @@ func attrRuleViolations(byCat map[string][]Part) []Violation {
 				v string
 			}
 			var as, bs []known
-			for _, a := range byCat[r.CatA] {
+			for _, a := range catParts(byCat, r.CatA) {
 				if v, ok := flattenStr(a, r.AttrA); ok {
 					as = append(as, known{a, v})
 				}
 			}
-			for _, b := range byCat[r.CatB] {
+			for _, b := range catParts(byCat, r.CatB) {
 				if v, ok := flattenStr(b, r.AttrB); ok {
 					bs = append(bs, known{b, v})
 				}
@@ -274,7 +346,7 @@ func attrRuleViolations(byCat map[string][]Part) []Violation {
 			var limSum, limMax float64
 			var limIDs []string
 			limMaxID := ""
-			for _, l := range byCat[r.CatA] {
+			for _, l := range catParts(byCat, r.CatA) {
 				if v, ok := flattenNum(l, r.AttrA); ok {
 					limSum += v
 					limIDs = append(limIDs, l.ID)
@@ -315,7 +387,7 @@ func attrRuleViolations(byCat map[string][]Part) []Violation {
 // consume its own units). Deterministic order: category, then position.
 func consumersFor(byCat map[string][]Part, r CompatRule) []Part {
 	if r.CatB != "*" {
-		return byCat[r.CatB]
+		return catParts(byCat, r.CatB)
 	}
 	cats := make([]string, 0, len(byCat))
 	for c := range byCat {
@@ -386,7 +458,7 @@ func ruleGaps(byCat map[string][]Part) []string {
 	for _, r := range currentRules() {
 		switch r.Kind {
 		case "match":
-			as, bs := real(byCat[r.CatA]), real(byCat[r.CatB])
+			as, bs := real(catParts(byCat, r.CatA)), real(catParts(byCat, r.CatB))
 			if len(as) == 0 || len(bs) == 0 {
 				continue
 			}
@@ -401,7 +473,7 @@ func ruleGaps(byCat map[string][]Part) []string {
 				}
 			}
 		case "capacity":
-			lims := real(byCat[r.CatA])
+			lims := real(catParts(byCat, r.CatA))
 			if len(lims) == 0 {
 				continue
 			}
@@ -535,7 +607,7 @@ var rules = []rule{
 	func(c map[string][]Part) []Violation {
 		csSize := 0
 		var csPart Part
-		for _, cs := range c["case"] {
+		for _, cs := range catParts(c, "case") {
 			if s, ok := formFactorSize[normFF(cs.FormFactor)]; ok && s > csSize {
 				csSize, csPart = s, cs
 			}
@@ -711,6 +783,30 @@ func normFF(s string) string {
 	return ffStrip.ReplaceAllString(strings.ToLower(s), "")
 }
 
+// categoryAliases lets a rule written for one canonical category also apply to
+// its real-world synonyms. The physical-fit rules (gpu/cooler/psu vs case) are
+// written for "case", but server gear — the gear this tool targets — is saved
+// as "chassis"/"barebones"/"server"; without aliasing those rules silently
+// never fire on a server build. Read-side only: parts keep their real category,
+// so wildcard "*" consumer rules and category counts never double-count.
+var categoryAliases = map[string][]string{
+	"case": {"chassis", "barebones", "server"},
+}
+
+// catParts returns every part in a category PLUS its alias categories, as a
+// fresh slice (never aliases the map's backing array).
+func catParts(byCat map[string][]Part, cat string) []Part {
+	aliases := categoryAliases[cat]
+	if len(aliases) == 0 {
+		return byCat[cat]
+	}
+	out := append([]Part(nil), byCat[cat]...)
+	for _, alias := range aliases {
+		out = append(out, byCat[alias]...)
+	}
+	return out
+}
+
 func groupByCategory(parts []Part) map[string][]Part {
 	m := map[string][]Part{}
 	for _, p := range parts {
@@ -845,7 +941,8 @@ type Need struct {
 // Spec is a composed build: the parts plus derived compat + gaps + needs.
 type Spec struct {
 	Parts           []Part      `json:"parts"`
-	Compatible      bool        `json:"compatible"`
+	Compatible      bool        `json:"compatible"` // no rule VIOLATIONS found — but unknowns don't violate, so this alone can be a "nothing to check" green
+	Verified        bool        `json:"verified"`   // compatible AND no structural gap left the check blind (slots/bays/sockets/TDP/physical fit all had data). THIS is the trustworthy "safe to buy" signal
 	Violations      []Violation `json:"violations"`
 	Gaps            []string    `json:"gaps"`                             // data-quality problems: unverified/stale/unknown attributes
 	MissingForBuild []string    `json:"missing_for_full_build,omitempty"` // core categories absent — informational; a partial/upgrade spec may omit these on purpose
@@ -940,13 +1037,16 @@ func composeSpec(parts []Part) Spec {
 	// undercuts PSU/PDU sizing. Categories are learned from the store (see
 	// drawCategories), so coverage grows with the data, not with this code.
 	draw := drawCategories()
+	unknownTDP := false
 	for _, p := range parts {
 		if draw[p.Category] && p.TDPW == 0 {
+			unknownTDP = true // undercuts PSU/PDU sizing — a real can't-verify, not advisory
 			gaps = append(gaps, "unknown TDP for "+p.ID)
 		}
 	}
 	// Every active rule reports the data it's missing — see ruleGaps.
-	gaps = append(gaps, ruleGaps(byCat)...)
+	ruleGapList := ruleGaps(byCat)
+	gaps = append(gaps, ruleGapList...)
 	// RAM faster than the board's max isn't a failure — it downclocks — but
 	// it IS paid-for headroom you don't get. Surface it; don't violate.
 	if mb, ok := first(byCat["motherboard"]); ok && mb.MemSpeed > 0 {
@@ -982,15 +1082,33 @@ func composeSpec(parts []Part) Spec {
 	// "Compatible" only covers KNOWN data. Anything unverifiable gets a loud
 	// gap so a missing length or undeclared power cable can't hide behind a
 	// green checkmark. Generic: no category list — driven by what's absent.
-	cs, hasCase := first(byCat["case"])
+	// structuralGap tracks whether any gap below leaves a slot/bay/socket or
+	// physical-fit constraint UNCHECKED — the difference between "verified
+	// compatible" and "no violations found, but we couldn't actually look".
+	// Advisory gaps (downclock, N+1, freshness) don't count; a build shouldn't
+	// read unverified just for paying for RAM headroom.
+	structuralGap := len(ruleGapList) > 0 || aggregateOnly || unknownTDP
+	cs, hasCase := first(catParts(byCat, "case"))
 	for _, p := range parts {
 		if p.Category == subSpecCategory {
 			continue // synthetic sub-build aggregate — not real hardware
 		}
-		if len(p.Provides) == 0 && len(p.Requires) == 0 {
+		if miss := missingExpectedTokens(p); len(miss) > 0 {
+			// Per-token, not whole-map: a chassis that declares pcie slots but
+			// no fan_bay used to pass as complete — the exact partial-data hole
+			// behind the 12-fans-for-6-bays miss. Each missing slot token is its
+			// own gap so the model knows precisely what to extract.
+			structuralGap = true
+			for _, e := range miss {
+				gaps = append(gaps, fmt.Sprintf("%s (%s): no %s:%s declared — slot/bay capacity unchecked, over-provisioning can't be caught (run deep_specs)", p.ID, p.Category, e.side(), e.Token))
+			}
+		} else if len(p.Provides) == 0 && len(p.Requires) == 0 {
+			// No per-category expectation to guide us, but still nothing declared.
+			structuralGap = true
 			gaps = append(gaps, p.ID+": no provides/requires declared — power cables, slots, bays unverified (run deep_specs)")
 		}
 		if p.Category == "gpu" && hasCase && (p.LengthMM == 0 || cs.LengthMM == 0) {
+			structuralGap = true
 			gaps = append(gaps, p.ID+": physical fit vs "+cs.ID+" unverified — card length or case clearance unknown")
 		}
 	}
@@ -1003,6 +1121,7 @@ func composeSpec(parts []Part) Spec {
 	return Spec{
 		Parts:           parts,
 		Compatible:      len(vs) == 0,
+		Verified:        len(vs) == 0 && !structuralGap,
 		Violations:      vs,
 		Gaps:            gaps,
 		MissingForBuild: missing,

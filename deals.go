@@ -41,6 +41,7 @@ type Listing struct {
 	AgeDays         int     `json:"age_days,omitempty"` // days since the price was seen — judge freshness yourself, don't wait for the stale flag
 	Stale           bool    `json:"stale,omitempty"`
 	Dead            bool    `json:"dead,omitempty"`             // URL no longer reachable (live-check)
+	LiveUnknown     bool    `json:"live_unknown,omitempty"`     // liveness could not be verified (probe timed out / network contended) — NOT confirmed alive; price & stock unchecked
 	Unshippable     bool    `json:"unshippable,omitempty"`      // doesn't ship to the region
 	VATUnknown      bool    `json:"vat_unknown,omitempty"`      // VAT basis not recorded — total may be ±VAT vs peers
 	Unconverted     bool    `json:"unconverted,omitempty"`      // couldn't convert to the display currency — total is NATIVE, not comparable to peers
@@ -283,7 +284,12 @@ func liveCheckAll(ctx context.Context, ls []Listing) {
 			defer wg.Done()
 			defer func() { <-sem }() // release slot even if the probe panics
 			defer recoverLog("liveCheck")
-			ls[i].Dead = !urlAlive(ctx, ls[i].URL)
+			alive, known := urlAlive(ctx, ls[i].URL)
+			if !known {
+				ls[i].LiveUnknown = true // probe couldn't decide — flagged, not silently "alive"
+				return
+			}
+			ls[i].Dead = !alive
 		}(i)
 	}
 	wg.Wait()
@@ -303,18 +309,24 @@ type aliveEntry struct {
 
 const aliveTTL = 10 * time.Minute
 
-func urlAlive(ctx context.Context, u string) bool {
+// urlAlive returns (alive, known). known=false means the probe couldn't
+// decide (timeout/contention) — the caller must treat it as UNVERIFIED, not
+// alive. An unknown result is NOT cached, so a transient network stall doesn't
+// stick a false "alive" for the whole TTL.
+func urlAlive(ctx context.Context, u string) (alive, known bool) {
 	aliveMu.Lock()
 	if e, ok := aliveCache[u]; ok && time.Since(e.at) < aliveTTL {
 		aliveMu.Unlock()
-		return e.alive
+		return e.alive, true
 	}
 	aliveMu.Unlock()
-	alive := probeURL(ctx, u)
-	aliveMu.Lock()
-	aliveCache[u] = aliveEntry{alive: alive, at: time.Now()}
-	aliveMu.Unlock()
-	return alive
+	alive, known = probeURL(ctx, u)
+	if known {
+		aliveMu.Lock()
+		aliveCache[u] = aliveEntry{alive: alive, at: time.Now()}
+		aliveMu.Unlock()
+	}
+	return alive, known
 }
 
 // probeURL decides listing liveness. Principle: a deal is only dead on
@@ -323,7 +335,7 @@ func urlAlive(ctx context.Context, u string) bool {
 // total network failure. Bot walls answer probes with 403/429/500 (eBay does
 // all three depending on method); treating those as dead would hide every
 // marketplace deal.
-func probeURL(ctx context.Context, u string) bool {
+func probeURL(ctx context.Context, u string) (alive, known bool) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	origPath := "/"
@@ -333,15 +345,18 @@ func probeURL(ctx context.Context, u string) bool {
 	for _, method := range []string{http.MethodHead, http.MethodGet} {
 		resp, err := doRequest(ctx, method, u, nil)
 		if err != nil {
-			continue // try GET; both failing = network-dead below
+			continue // try GET; both failing = network-dead/unknown below
 		}
 		resp.Body.Close()
 		// Redirect chains are followed by the client; a deep listing URL that
-		// lands on "/" is the marketplace saying "this listing is gone" with a
-		// 200. Challenge pages keep a path, so bot walls don't trip this.
-		if resp.Request != nil && resp.Request.URL != nil &&
-			len(origPath) > 1 && (resp.Request.URL.Path == "/" || resp.Request.URL.Path == "") {
-			return false
+		// lands on the site ROOT is the marketplace saying "this listing is
+		// gone" with a 200. Root can carry a locale/consent query (/?country=dk),
+		// so match on the path being root regardless of query. Challenge pages
+		// keep the deep path, so bot walls don't trip this.
+		if resp.Request != nil && resp.Request.URL != nil && len(origPath) > 1 {
+			if rp := resp.Request.URL.Path; rp == "/" || rp == "" {
+				return false, true
+			}
 		}
 		ok := resp.StatusCode >= 200 && resp.StatusCode < 400
 		if method == http.MethodHead && !ok {
@@ -349,21 +364,21 @@ func probeURL(ctx context.Context, u string) bool {
 		}
 		switch {
 		case ok:
-			return true
+			return true, true
 		case resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone:
-			return false // definitive: listing is gone
+			return false, true // definitive: listing is gone
 		default:
-			return true // 403/429/5xx/challenges — ambiguous, never kill a deal on ambiguity
+			return true, true // 403/429/5xx/challenges — ambiguous, never kill a deal on ambiguity
 		}
 	}
 	// A deadline/cancellation (10s budget spent on gate queue + retries, or the
-	// parent request ending) is NOT proof the listing is gone — killing it here
-	// would drop a live deal from the totals. Only a genuine transport failure
-	// with time left counts as dead.
+	// parent request ending) is NOT proof of death — but it's NOT proof of life
+	// either. Return unknown so the caller flags it as unverified instead of
+	// silently summing a possibly-dead listing into the total as if alive.
 	if ctx.Err() != nil {
-		return true
+		return false, false
 	}
-	return false // network-level failure on both methods
+	return false, true // network-level failure on both methods = dead
 }
 
 // priceOutlierFactor: a new price this many times above/below the part's

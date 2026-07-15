@@ -6,6 +6,27 @@ import (
 	"time"
 )
 
+func TestSyncFetchSite(t *testing.T) {
+	mk := func(target, referer string) string {
+		req, _ := http.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("Sec-Fetch-Site", "none")
+		if referer != "" {
+			req.Header.Set("Referer", referer)
+		}
+		syncFetchSite(req)
+		return req.Header.Get("Sec-Fetch-Site")
+	}
+	if got := mk("https://shop.dk/p/123", ""); got != "none" {
+		t.Errorf("no referer must stay none, got %q", got)
+	}
+	if got := mk("https://shop.dk/p/123", "https://shop.dk/search?q=x"); got != "same-origin" {
+		t.Errorf("same-host referer -> same-origin, got %q", got)
+	}
+	if got := mk("https://shop.dk/p/123", "https://www.google.com/"); got != "cross-site" {
+		t.Errorf("different-host referer -> cross-site, got %q", got)
+	}
+}
+
 func TestRetryableAndTTL(t *testing.T) {
 	for _, code := range []int{429, 502, 503, 504} {
 		if !isRetryable(code) {

@@ -180,6 +180,40 @@ func TestConsentWallDetection(t *testing.T) {
 	}
 }
 
+func TestBotWallDetection(t *testing.T) {
+	// The three walls hit live during dogfood: Cloudflare, generic security
+	// verification, and Azure WAF (title-only signal, near-empty body).
+	for _, wall := range []string{
+		"Just a moment...\nVerifying you are human. This may take a few seconds.",
+		"Performing security verification. This website uses a security service to protect against malicious bots.",
+		"Azure WAF\n20260715T065541Z-15bdb66dc6dn66fbhC1AMS539400000005t000000000edfu",
+	} {
+		if !isBotWall(wall) {
+			t.Errorf("challenge page must be detected: %q", wall)
+		}
+	}
+	if isBotWall("HPE ProLiant DL380 Gen12 chassis, price 38.192 kr ex VAT, in stock.") {
+		t.Error("real listing text must not be flagged")
+	}
+	if isBotWall(strings.Repeat("our captcha solving service reviews access denied errors. ", 100)) {
+		t.Error("long real content mentioning challenge vocabulary must not be flagged")
+	}
+}
+
+func TestUnusableSummary(t *testing.T) {
+	if got := unusableSummary(nil); got != "none recorded" {
+		t.Errorf("got %q", got)
+	}
+	no := false
+	ls := []Listing{{Dead: true}, {Unshippable: true}, {Unshippable: true}, {InStock: &no}}
+	got := unusableSummary(ls)
+	for _, want := range []string{"4 recorded", "1 dead", "2 don't ship", "1 out of stock"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary %q missing %q", got, want)
+		}
+	}
+}
+
 func TestSubstituteCautions(t *testing.T) {
 	orig := Part{ID: "g1", Category: "gpu", LengthMM: 250, TDPW: 200, Requires: map[string]int{"pin:8": 2}}
 	cand := Part{ID: "g2", Category: "gpu", LengthMM: 300, TDPW: 300, Requires: map[string]int{"pin:8": 3}}

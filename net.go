@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -246,12 +247,37 @@ func applyHeaders(req *http.Request) {
 	// transparently. Setting it here would disable that and hand us a
 	// br/deflate body we can't decode.
 	set("Sec-CH-UA", fp.SecChUA)
+	if fp.SecChUA != "" {
+		set("Sec-CH-UA-Mobile", "?0") // paired with Sec-CH-UA; a desktop UA sending UA hints without it is a mismatch
+	}
 	set("Sec-CH-UA-Platform", fp.Platform)
 	set("Upgrade-Insecure-Requests", "1")
 	set("Sec-Fetch-Dest", "document")
 	set("Sec-Fetch-Mode", "navigate")
-	set("Sec-Fetch-Site", "none")
+	set("Sec-Fetch-Site", "none") // refined to cross-site by syncFetchSite when a Referer is set
 	set("Sec-Fetch-User", "?1")
+}
+
+// syncFetchSite makes Sec-Fetch-Site agree with the Referer. A deep product
+// URL with Sec-Fetch-Site:none reads as "typed in the address bar" — plausible
+// for a homepage, suspicious for a hit followed off a search page. When a
+// Referer is present, a real browser sends same-origin (same host) or
+// cross-site (different host) instead. Called after extra headers are applied,
+// so a caller-supplied Referer drives it.
+func syncFetchSite(req *http.Request) {
+	ref := req.Header.Get("Referer")
+	if ref == "" {
+		return
+	}
+	refURL, err := url.Parse(ref)
+	if err != nil {
+		return
+	}
+	if strings.EqualFold(refURL.Hostname(), req.URL.Hostname()) {
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+	} else {
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+	}
 }
 
 // hostGate rate-limits and caps concurrency per host so we stay polite and
@@ -360,6 +386,7 @@ func doRequestN(ctx context.Context, method, rawURL string, extra map[string]str
 		for k, v := range extra {
 			req.Header.Set(k, v)
 		}
+		syncFetchSite(req) // after extra: a caller Referer refines Sec-Fetch-Site
 		host := req.URL.Hostname()
 		g := gateFor(host)
 		if err := g.acquire(ctx); err != nil {

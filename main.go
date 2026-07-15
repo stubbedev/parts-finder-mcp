@@ -136,6 +136,7 @@ type fetchOut struct {
 	StaleReason string `json:"stale_reason,omitempty"`
 	Truncated   bool   `json:"truncated,omitempty"`    // source exceeded the size cap — text is a prefix, not the whole document
 	ConsentWall bool   `json:"consent_wall,omitempty"` // text is a cookie-consent interstitial, not the page content
+	BotWall     bool   `json:"bot_wall,omitempty"`     // text is an anti-bot challenge page (Cloudflare/WAF), not the page content
 	Note        string `json:"note,omitempty"`         // degradation hints (thin extraction, etc.)
 }
 
@@ -269,7 +270,8 @@ type dealsOut struct {
 }
 
 type historyIn struct {
-	PartID string `json:"part_id"`
+	PartID          string `json:"part_id"`
+	DisplayCurrency string `json:"display_currency,omitempty" jsonschema:"convert every observation into this currency so the series is comparable; defaults to the region currency"`
 }
 type rulesOut struct {
 	Rules           []CompatRule        `json:"rules"`
@@ -277,7 +279,9 @@ type rulesOut struct {
 	KnownTokens     []string            `json:"known_tokens,omitempty"` // resource-token vocabulary already in the store
 }
 type historyOut struct {
-	Observations []PriceObs `json:"observations"` // oldest first
+	Observations    []PriceObs `json:"observations"`               // oldest first
+	DisplayCurrency string     `json:"display_currency,omitempty"` // currency the display_total fields are in
+	Note            string     `json:"note,omitempty"`             // e.g. the raw series mixes currencies — compare display_total, not price
 }
 
 type substituteIn struct {
@@ -354,6 +358,7 @@ type cart struct {
 type shopOut struct {
 	Region          Region      `json:"region"`
 	Compatible      bool        `json:"compatible"`
+	Verified        bool        `json:"verified"`                         // compat actually checkable from known data (no slot/bay/socket/TDP gap) — a purchase plan on verified=false may over-provision (e.g. more fans than bays); resolve gaps first
 	Partial         bool        `json:"partial,omitempty"`                // not a full bootable build (may be intentional)
 	MissingForBuild []string    `json:"missing_for_full_build,omitempty"` // core categories absent
 	Violations      []Violation `json:"violations,omitempty"`
@@ -366,7 +371,42 @@ type shopOut struct {
 	ExVATCovers     int         `json:"ex_vat_covers,omitempty"`     // units the ex-VAT total includes
 	VATUnknownCount int         `json:"vat_unknown_count,omitempty"` // best listings with unrecorded VAT basis — record vat_included to firm the totals
 	TotalCurrency   string      `json:"total_currency,omitempty"`
-	TotalCovers     int         `json:"total_covers"` // how many units the total includes
+	TotalCovers     int         `json:"total_covers"`    // how many units the total includes
+	Notes           []string    `json:"notes,omitempty"` // WHY units are missing from the totals (no usable listing, failed conversion, ...)
+}
+
+// unusableSummary explains in one clause why none of a part's listings are
+// usable — the difference between "never priced" and "priced, but every
+// listing is dead/doesn't ship here/out of stock".
+func unusableSummary(ls []Listing) string {
+	if len(ls) == 0 {
+		return "none recorded"
+	}
+	var dead, unship, oos int
+	for _, l := range ls {
+		switch {
+		case l.Dead:
+			dead++
+		case l.Unshippable:
+			unship++
+		case l.InStock != nil && !*l.InStock:
+			oos++
+		}
+	}
+	var parts []string
+	if dead > 0 {
+		parts = append(parts, fmt.Sprintf("%d dead", dead))
+	}
+	if unship > 0 {
+		parts = append(parts, fmt.Sprintf("%d don't ship to your region", unship))
+	}
+	if oos > 0 {
+		parts = append(parts, fmt.Sprintf("%d out of stock", oos))
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%d recorded, none usable", len(ls))
+	}
+	return fmt.Sprintf("%d recorded: %s", len(ls), strings.Join(parts, ", "))
 }
 
 type deepIn struct {
@@ -419,6 +459,12 @@ func emptyFields(p Part) []string {
 	for _, attr := range ruleAttrsFor(p.Category) {
 		_, known := flattenStr(p, attr)
 		add(attr, !known)
+	}
+	// Name the slot/bay tokens this category should carry (fan_bay, dimm:, ...)
+	// — free-form tokens no rule references, so nothing else asks for them, and
+	// their absence is exactly what lets over-provisioning through.
+	for _, e := range missingExpectedTokens(p) {
+		add(e.side()+":"+e.Token, true)
 	}
 	return f
 }
@@ -581,11 +627,17 @@ func registerTools(s *mcp.Server) {
 		out := fetchOut{Title: f.Title, Text: text, Cached: cached, Rendered: f.Rendered,
 			Images: len(f.Images), TotalBytes: total, NextOffset: next,
 			Stale: f.Stale, StaleReason: f.StaleReason, Truncated: f.Truncated,
-			ConsentWall: f.ConsentWall}
+			ConsentWall: f.ConsentWall, BotWall: f.BotWall}
 		if !f.FetchedAt.IsZero() {
 			out.FetchedAt = f.FetchedAt.UTC().Format(time.RFC3339)
 		}
-		if f.ConsentWall {
+		if f.BotWall {
+			// The proshop/dustin failure mode: Cloudflare et al. serve a
+			// challenge page the headless renderer cannot pass — the "content"
+			// is the wall itself. Without this flag the model reads "the page
+			// mentions no price" as ground truth.
+			out.Note = "extracted text is an anti-bot challenge page (Cloudflare/WAF), NOT the page content — the headless renderer cannot pass this challenge. Use the price from the search snippet, another vendor's page, or fetch_image on the product photos instead"
+		} else if f.ConsentWall {
 			// The eBay.de failure mode: the renderer returns ONLY the cookie
 			// banner. Without this flag the model reads "the page mentions no
 			// price" as ground truth — the worst kind of silent degradation.
@@ -725,7 +777,7 @@ func registerTools(s *mcp.Server) {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "compose_spec",
-		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' for a saved build (repeat for quantity) — sub-builds compose HIERARCHICALLY: rules check each node on its own (a rack of 12x 'spec:node' never cross-pairs nodes), child problems surface prefixed with their spec, and a node's unmet needs bubble up for rack-level parts (switches, PDUs, cabinets) to satisfy. The rules applied are data: list_rules shows them, save_rule extends them. compatible=true is only trustworthy when gaps is empty; run deep_specs on flagged parts until it is. Use THIS while iterating on a build (instant, no network); switch to shop_spec when it's time to buy (same compat + live prices and a purchase plan).",
+		Description: "Compose a build from stored parts: compatibility over KNOWN data, gaps (anything unverifiable is flagged loudly — e.g. GPU length vs chassis, undeclared power cables), needs (resource shortages to shop for), and total TDP. Ids may include 'spec:<id>' for a saved build (repeat for quantity) — sub-builds compose HIERARCHICALLY: rules check each node on its own (a rack of 12x 'spec:node' never cross-pairs nodes), child problems surface prefixed with their spec, and a node's unmet needs bubble up for rack-level parts (switches, PDUs, cabinets) to satisfy. The rules applied are data: list_rules shows them, save_rule extends them. TRUST THE 'verified' FLAG, NOT 'compatible': compatible=true only means no rule was violated, but unknown data can't violate — a build with undeclared fan bays / DIMM slots / drive bays reads compatible while nothing was actually checked, which is how a plan can call for more fans than the chassis has bays. verified=true means every slot/bay/socket/TDP/fit constraint had the data to be checked. When verified=false, deep_specs the parts named in gaps (they now name the exact missing slot token, e.g. 'requires:fan_bay') until it flips true. Use THIS while iterating on a build (instant, no network); switch to shop_spec when it's time to buy (same compat + live prices and a purchase plan).",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in idsIn) (*mcp.CallToolResult, Spec, error) {
 		spec, err := store.composeIDs(in.PartIDs)
 		if err != nil {
@@ -888,7 +940,7 @@ func registerTools(s *mcp.Server) {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:        "price_history",
 		Description: "Price observations over time for a part, oldest first — every save_listing price change is kept, so re-saving a listing never erases what it cost before. Use to judge 'buy now or wait' and whether a deal is actually below trend.",
-	}, func(_ context.Context, _ *mcp.CallToolRequest, in historyIn) (*mcp.CallToolResult, historyOut, error) {
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in historyIn) (*mcp.CallToolResult, historyOut, error) {
 		if in.PartID == "" {
 			return nil, historyOut{}, fmt.Errorf("part_id is required")
 		}
@@ -896,7 +948,32 @@ func registerTools(s *mcp.Server) {
 		if err != nil {
 			return nil, historyOut{}, err
 		}
-		return nil, historyOut{Observations: obs}, nil
+		display := in.DisplayCurrency
+		if display == "" {
+			display = regionFor(ctx, "").Currency
+		}
+		// Convert every observation to one currency: a raw series mixing EUR and
+		// DKK rows compared as bare floats reads a 100 EUR→100 DKK drop as flat.
+		// display_total is the comparable number; flag when the raw prices mix.
+		out := historyOut{Observations: obs, DisplayCurrency: display}
+		currencies := map[string]bool{}
+		for i := range out.Observations {
+			o := &out.Observations[i]
+			currencies[o.Currency] = true
+			total := o.Price
+			if o.Shipping != nil {
+				total += *o.Shipping
+			}
+			if v, _, cerr := convert(ctx, total, o.Currency, display); cerr == nil {
+				o.DisplayTotal = v
+			} else {
+				o.Unconverted = true
+			}
+		}
+		if len(currencies) > 1 {
+			out.Note = "raw prices are in mixed currencies — compare display_total (converted to " + display + "), not price"
+		}
+		return nil, out, nil
 	})
 
 	mcp.AddTool(s, &mcp.Tool{
@@ -1020,14 +1097,57 @@ func registerTools(s *mcp.Server) {
 			return nil, shopOut{}, err
 		}
 		out := shopOut{
-			Region: region, Compatible: spec.Compatible,
+			Region: region, Compatible: spec.Compatible, Verified: spec.Verified,
 			Partial: spec.Partial, MissingForBuild: spec.MissingForBuild,
 			Violations: spec.Violations, Gaps: spec.Gaps, Needs: spec.Needs,
 			TotalCurrency: display,
 		}
+		// A purchase plan built on unverified compatibility is exactly how the
+		// 12-fans-for-6-bays recommendation happened. Lead with the caveat
+		// instead of letting compatible=true (no violations found) read as safe.
+		if !spec.Verified {
+			out.Notes = append([]string{fmt.Sprintf("COMPATIBILITY NOT VERIFIED: %d gap(s) left slot/bay/socket/TDP or fit unchecked — quantities in this plan (fans, DIMMs, cards, drives) may exceed what the chassis/board supports. Resolve the gaps (deep_specs the flagged parts) before trusting the quantities.", len(spec.Gaps))}, out.Notes...)
+		}
 		carts := map[string]*cart{}
 		var cartOrder []string
-		for _, id := range uniqueInOrder(partIDs) {
+		// Price (and, for uncovered parts, buy-search) every part CONCURRENTLY —
+		// the serial version paid one search round-trip per uncovered part back
+		// to back (~1s each, 15+s on a fresh build). Aggregation stays serial
+		// and in spec order below, so totals and carts are deterministic.
+		uniq := uniqueInOrder(partIDs)
+		type pricedPart struct {
+			ls   []Listing
+			hits []SearchHit
+			err  error
+		}
+		priced := make([]pricedPart, len(uniq))
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for i, id := range uniq {
+			if demand[id]-min(ownedQty[id], demand[id]) == 0 {
+				continue // fully owned: nothing to price or search
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, id string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				defer recoverLog("shopPart")
+				priced[i].ls, priced[i].err = pricePart(ctx, id, region, display)
+				if priced[i].err != nil {
+					return
+				}
+				if len(priced[i].ls) > 0 && priced[i].ls[0].usable() {
+					return
+				}
+				p := partByID[id]
+				if name := strings.TrimSpace(p.Vendor + " " + p.Model); !in.NoSearch && name != "" {
+					priced[i].hits, _ = searchRegion(ctx, name+" buy price "+region.Currency, 5, region) // best-effort
+				}
+			}(i, id)
+		}
+		wg.Wait()
+		for i, id := range uniq {
 			p := partByID[id]
 			qty := demand[id]
 			ownedN := min(ownedQty[id], qty)
@@ -1038,10 +1158,10 @@ func registerTools(s *mcp.Server) {
 				out.Items = append(out.Items, item)
 				continue
 			}
-			ls, err := pricePart(ctx, p.ID, region, display)
-			if err != nil {
-				return nil, shopOut{}, err
+			if priced[i].err != nil {
+				return nil, shopOut{}, priced[i].err
 			}
+			ls := priced[i].ls
 			if len(ls) > 0 && ls[0].usable() {
 				best := ls[0]
 				item.Best = &best
@@ -1051,11 +1171,21 @@ func registerTools(s *mcp.Server) {
 				if best.VATUnknown {
 					out.VATUnknownCount++
 				}
+				if best.LiveUnknown {
+					// The listing feeds the total, but its liveness (and thus its
+					// price/stock) couldn't be verified — say so rather than let it
+					// read as a confirmed live buy.
+					out.Notes = append(out.Notes, fmt.Sprintf("%s: best listing's liveness could not be verified (probe timed out) — price/stock unconfirmed, treat the total as provisional", id))
+				}
 				var contributed float64
 				if v, ok := bestContribution(best, display); ok {
 					contributed = v * float64(buyN)
 					out.TotalBest += contributed
 					out.TotalCovers += buyN
+				} else {
+					// A "covered" part silently missing from the total reads as a
+					// cheaper build — say WHY the units are excluded.
+					out.Notes = append(out.Notes, fmt.Sprintf("%s: best listing is in %s and could not be converted to %s (fx source unreachable?) — %d unit(s) excluded from totals; retry, or convert_currency to check the fx source", id, best.Currency, display, buyN))
 				}
 				if v, ok := exVATContribution(best, display); ok {
 					out.TotalExVAT += v * float64(buyN)
@@ -1077,9 +1207,8 @@ func registerTools(s *mcp.Server) {
 				c.Subtotal += contributed
 			} else {
 				item.Alternatives = ls // only flagged listings on record — show them all
-				if name := strings.TrimSpace(p.Vendor + " " + p.Model); !in.NoSearch && name != "" {
-					item.SearchHits, _ = searchRegion(ctx, name+" buy price "+region.Currency, 5, region) // best-effort
-				}
+				item.SearchHits = priced[i].hits
+				out.Notes = append(out.Notes, fmt.Sprintf("%s: no usable listing (%s) — %d unit(s) excluded from totals", id, unusableSummary(ls), buyN))
 			}
 			out.Items = append(out.Items, item)
 		}

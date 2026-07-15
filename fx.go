@@ -60,23 +60,34 @@ func ratesFor(ctx context.Context, base string) (rates map[string]float64, stale
 		}
 		return nil, 0, err
 	}
+	// One transient fetch failure here silently degrades every total in the
+	// calling tool (listings flip to Unconverted for the whole call) — worth
+	// one bounded retry before falling back to stale rates.
 	u := "https://api.frankfurter.app/latest?base=" + url.QueryEscape(base)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-	if err != nil {
-		return nil, 0, err
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return staleOr(err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return staleOr(fmt.Errorf("frankfurter returned %s", resp.Status))
-	}
 	var body struct {
 		Rates map[string]float64 `json:"rates"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	fetchOnce := func() error {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return fmt.Errorf("frankfurter returned %s", resp.Status)
+		}
+		return json.NewDecoder(resp.Body).Decode(&body)
+	}
+	err = fetchOnce()
+	if err != nil && ctx.Err() == nil {
+		time.Sleep(500 * time.Millisecond)
+		err = fetchOnce()
+	}
+	if err != nil {
 		return staleOr(err)
 	}
 	if body.Rates == nil { // 200 with no rates (unknown base) — nil-map write would panic

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 )
 
@@ -76,44 +78,113 @@ func latestLightpanda(ctx context.Context, platform string) (tag string, asset l
 	return "", lpAsset{}, fmt.Errorf("release %s has no asset %s", body.TagName, want)
 }
 
+// Renderer POOL: concurrent fetches (shop_spec fans out, searches escalate)
+// each get their own lightpanda process instead of interleaving CDP sessions
+// on one — lightpanda serves a single debugger session per instance, so a
+// shared process made concurrent renders corrupt each other. The pool grows
+// on demand up to maxRenderers; a process lives for the MCP's lifetime.
+const maxRenderers = 3
+
+type lpProc struct {
+	base string
+	cmd  *exec.Cmd // nil for an external LIGHTPANDA_URL endpoint
+}
+
 var (
-	lpMu   sync.Mutex
-	lpCmd  *exec.Cmd // spawned lightpanda, if any
-	lpBase string    // http CDP base of the endpoint we resolved
+	lpMu    sync.Mutex
+	lpProcs []*lpProc    // every process/token ever pooled
+	lpIdle  chan *lpProc // checked-in renderers, buffered maxRenderers
 )
 
-// ensureRenderer returns the CDP websocket URL, starting or downloading
-// lightpanda if needed.
-func ensureRenderer(ctx context.Context) (string, error) {
+// acquireRenderer checks a renderer out of the pool, growing it up to
+// maxRenderers on demand and blocking when all are busy. Unhealthy checkouts
+// are killed and respawned. Callers MUST releaseRenderer(p).
+func acquireRenderer(ctx context.Context) (*lpProc, error) {
 	lpMu.Lock()
-	defer lpMu.Unlock()
-	// 1. Explicit env always wins.
-	if raw := os.Getenv("LIGHTPANDA_URL"); raw != "" {
-		return wsFromBase(ctx, raw)
+	if lpIdle == nil {
+		lpIdle = make(chan *lpProc, maxRenderers)
+		if raw := os.Getenv("LIGHTPANDA_URL"); raw != "" {
+			// External endpoint: it multiplexes sessions itself; the tokens
+			// just cap our concurrency at the same limit as the local pool.
+			for range maxRenderers {
+				p := &lpProc{base: raw}
+				lpProcs = append(lpProcs, p)
+				lpIdle <- p
+			}
+		}
 	}
-	// Already spawned and still alive?
-	if lpBase != "" {
-		if ws, err := wsFromBase(ctx, lpBase); err == nil {
-			return ws, nil
+	select {
+	case p := <-lpIdle:
+		lpMu.Unlock()
+		return checkoutHealthy(ctx, p)
+	default:
+	}
+	if len(lpProcs) < maxRenderers {
+		bin, err := lightpandaBinary(ctx)
+		if err != nil {
+			lpMu.Unlock()
+			return nil, err
 		}
-		// Unresponsive: kill before respawning — it may be alive-but-stuck,
-		// and dropping the handle without killing would orphan it while a
-		// second instance spawns.
-		if lpCmd != nil && lpCmd.Process != nil {
-			lpCmd.Process.Kill()
+		base, cmd, err := spawnLightpanda(ctx, bin)
+		if err != nil {
+			lpMu.Unlock()
+			return nil, err
 		}
-		lpBase, lpCmd = "", nil
+		p := &lpProc{base: base, cmd: cmd}
+		lpProcs = append(lpProcs, p)
+		lpMu.Unlock()
+		return p, nil
+	}
+	lpMu.Unlock()
+	select {
+	case p := <-lpIdle:
+		return checkoutHealthy(ctx, p)
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// checkoutHealthy verifies a checked-out renderer answers CDP; a dead local
+// process is killed (alive-but-stuck must never be orphaned) and respawned in
+// place. On respawn failure the token goes BACK to the pool — a dead token
+// that vanished would shrink the pool forever.
+func checkoutHealthy(ctx context.Context, p *lpProc) (*lpProc, error) {
+	if _, err := wsFromBase(ctx, p.base); err == nil {
+		return p, nil
+	}
+	if p.cmd == nil {
+		releaseRenderer(p)
+		return nil, fmt.Errorf("external renderer at %s unresponsive", p.base)
+	}
+	if p.cmd.Process != nil {
+		p.cmd.Process.Kill()
 	}
 	bin, err := lightpandaBinary(ctx)
 	if err != nil {
-		return "", err
+		releaseRenderer(p)
+		return nil, err
 	}
 	base, cmd, err := spawnLightpanda(ctx, bin)
 	if err != nil {
-		return "", err
+		releaseRenderer(p)
+		return nil, err
 	}
-	lpBase, lpCmd = base, cmd
-	return wsFromBase(ctx, base)
+	p.base, p.cmd = base, cmd
+	return p, nil
+}
+
+// releaseRenderer checks a renderer back in. Non-blocking and nil-safe so a
+// release racing stopRenderer can never hang a fetch goroutine.
+func releaseRenderer(p *lpProc) {
+	lpMu.Lock()
+	ch := lpIdle
+	lpMu.Unlock()
+	if ch != nil {
+		select {
+		case ch <- p:
+		default:
+		}
+	}
 }
 
 // lightpandaBinary fetches and manages the lightpanda executable: the newest
@@ -276,14 +347,16 @@ func freePort() (int, error) {
 	return l.Addr().(*net.TCPAddr).Port, nil
 }
 
-// stopRenderer kills a spawned lightpanda. Called when the MCP exits.
+// stopRenderer kills every spawned lightpanda. Called when the MCP exits.
 func stopRenderer() {
 	lpMu.Lock()
 	defer lpMu.Unlock()
-	if lpCmd != nil && lpCmd.Process != nil {
-		lpCmd.Process.Kill()
+	for _, p := range lpProcs {
+		if p.cmd != nil && p.cmd.Process != nil {
+			p.cmd.Process.Kill()
+		}
 	}
-	lpCmd, lpBase = nil, ""
+	lpProcs, lpIdle = nil, nil
 }
 
 // wsFromBase resolves a CDP websocket URL from an http(s) base or passes
@@ -316,41 +389,143 @@ func wsFromBase(ctx context.Context, raw string) (string, error) {
 	return v.WebSocketDebuggerURL, nil
 }
 
-// fetchRendered drives lightpanda over CDP to load a page (spawning or even
-// downloading the browser on first use), then extracts readable text.
+// fetchRendered drives a pooled lightpanda over CDP to load a page (spawning
+// or even downloading the browser on first use), waits out delayed hydration,
+// gives challenge interstitials a human-like nudge, then extracts readable
+// text. Safe to call concurrently — each call checks out its own renderer.
 func fetchRendered(ctx context.Context, rawURL string) (title, text string, err error) {
-	ws, err := ensureRenderer(ctx)
+	p, err := acquireRenderer(ctx)
 	if err != nil {
 		return "", "", fmt.Errorf("renderer unavailable: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer releaseRenderer(p)
+	ws, err := wsFromBase(ctx, p.base)
+	if err != nil {
+		return "", "", fmt.Errorf("renderer unavailable: %w", err)
+	}
+	// Budget covers navigation + hydration polling + one challenge attempt.
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 	allocCtx, cancelAlloc := chromedp.NewRemoteAllocator(ctx, ws)
 	defer cancelAlloc()
 	tabCtx, cancelTab := chromedp.NewContext(allocCtx)
 	defer cancelTab()
 
-	var html string
-	if err := chromedp.Run(tabCtx,
-		chromedp.Navigate(rawURL),
-		chromedp.Sleep(2*time.Second), // let JS settle — eBay et al. hydrate after load
-		chromedp.OuterHTML("html", &html),
-	); err != nil {
+	// network.Enable lets us read the cookie store afterwards (below).
+	if err := chromedp.Run(tabCtx, network.Enable(), chromedp.Navigate(rawURL)); err != nil {
 		return "", "", fmt.Errorf("render %s: %w", rawURL, err)
 	}
-	// Slow hydrators: if the DOM is still growing, the 2s snapshot is a partial
-	// page that would read as ground truth. One bounded re-snapshot when the
-	// first looks unsettled — grew or thin — costs 2s only on those pages.
-	if len(html) < 4096 {
-		var html2 string
-		if err := chromedp.Run(tabCtx,
-			chromedp.Sleep(2*time.Second),
-			chromedp.OuterHTML("html", &html2),
-		); err == nil && len(html2) > len(html) {
-			html = html2
-		}
+	html, err := waitStableHTML(tabCtx, 10*time.Second)
+	if err != nil {
+		return "", "", fmt.Errorf("render %s: %w", rawURL, err)
 	}
 	// Same extraction as the plain fetcher (readability + table preservation):
 	// rendering is an implementation detail, never a downgrade.
-	return extractHTML([]byte(html), rawURL, "")
+	t, x, exErr := extractHTML([]byte(html), rawURL, "")
+	// Anti-bot challenge interstitial: do what a human does — click the
+	// checkbox if there is one, then wait for the challenge to clear. If the
+	// wall persists, return it anyway — fetchCached flags it as BotWall so
+	// the caller knows this is a wall, not the page.
+	if exErr == nil && isBotWall(t+"\n"+x) {
+		if cleared, ok := tryClearBotWall(tabCtx, rawURL); ok {
+			t, x, exErr = extractHTML([]byte(cleared), rawURL, "")
+		}
+	}
+	// Harvest the browser's cookies into the shared jar so the cheap HTTP path
+	// rides whatever the render earned — most importantly a WAF clearance
+	// cookie (cf_clearance et al.): once lightpanda passes the wall, plain
+	// fetches to this host stop hitting it, instead of re-rendering every time.
+	harvestRenderCookies(tabCtx, rawURL)
+	return t, x, exErr
+}
+
+// harvestRenderCookies copies the render session's cookies into httpClient's
+// jar, keyed by the fetched URL's host. Best-effort — a cookie read failure
+// just means the next plain fetch starts cold (today's behaviour). The jar's
+// public-suffix logic drops any cookie whose domain doesn't cover the host.
+func harvestRenderCookies(tabCtx context.Context, rawURL string) {
+	defer recoverLog("harvestRenderCookies")
+	u, err := url.Parse(rawURL)
+	if err != nil || httpClient.Jar == nil {
+		return
+	}
+	var cookies []*network.Cookie
+	cctx, cancel := context.WithTimeout(tabCtx, 3*time.Second)
+	defer cancel()
+	if err := chromedp.Run(cctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		var e error
+		cookies, e = network.GetCookies().Do(ctx)
+		return e
+	})); err != nil || len(cookies) == 0 {
+		return
+	}
+	var jarCookies []*http.Cookie
+	for _, c := range cookies {
+		jarCookies = append(jarCookies, &http.Cookie{
+			Name: c.Name, Value: c.Value, Path: c.Path, Domain: c.Domain,
+			Secure: c.Secure, HttpOnly: c.HTTPOnly,
+		})
+	}
+	httpClient.Jar.SetCookies(u, jarCookies)
+}
+
+// waitStableHTML polls the DOM until its size stops changing between
+// consecutive snapshots — the classic delayed-hydration fix: a fixed sleep is
+// always either too short (partial page read as ground truth) or too long
+// (every fast page pays the worst case). Returns the last snapshot when the
+// budget runs out mid-hydration; the thin-text flags catch a still-empty one.
+func waitStableHTML(tabCtx context.Context, budget time.Duration) (string, error) {
+	deadline := time.Now().Add(budget)
+	var html string
+	last := -1
+	for {
+		if err := chromedp.Run(tabCtx,
+			chromedp.Sleep(1200*time.Millisecond),
+			chromedp.OuterHTML("html", &html),
+		); err != nil {
+			return "", err
+		}
+		if len(html) == last { // two consecutive identical sizes = settled
+			return html, nil
+		}
+		last = len(html)
+		if time.Now().After(deadline) {
+			return html, nil
+		}
+	}
+}
+
+// tryClearBotWall attempts what a human does at a challenge interstitial:
+// click the verification checkbox, then wait for the page to swap in. Cheap
+// and legitimate — the checkbox IS the intended interaction. Best-effort by
+// design: Turnstile usually sits in a cross-origin iframe this CDP session
+// can't reach, and its background checks may fail a headless engine no matter
+// what; the caller keeps the honest BotWall flag when this returns !ok.
+func tryClearBotWall(tabCtx context.Context, rawURL string) (html string, ok bool) {
+	for _, sel := range []string{
+		`input[type="checkbox"]`,    // Turnstile / hCaptcha checkbox rendered in-DOM
+		`#challenge-stage input`,    // Cloudflare interstitial stage
+		`.ctp-checkbox-label input`, // Cloudflare turnstile label variant
+		`label.cb-lb input`,         // Turnstile widget markup
+	} {
+		cctx, cancel := context.WithTimeout(tabCtx, 2*time.Second)
+		_ = chromedp.Run(cctx, chromedp.Click(sel, chromedp.ByQuery, chromedp.NodeVisible))
+		cancel()
+	}
+	// Challenges also clear on their own once their JS finishes — poll either
+	// way, bounded.
+	deadline := time.Now().Add(12 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := chromedp.Run(tabCtx,
+			chromedp.Sleep(2*time.Second),
+			chromedp.OuterHTML("html", &html),
+		); err != nil {
+			return "", false
+		}
+		if t, x, err := extractHTML([]byte(html), rawURL, ""); err == nil &&
+			len(strings.TrimSpace(x)) > 0 && !isBotWall(t+"\n"+x) {
+			return html, true
+		}
+	}
+	return "", false
 }

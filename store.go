@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -20,7 +21,11 @@ func openStore(path string) (*Store, error) {
 	// Two MCP sessions share this DB; without a busy timeout the second writer
 	// gets an instant SQLITE_BUSY. WAL lets a reader coexist with the other
 	// session's writer, and one conn serializes this process's own writers.
-	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)")
+	// _txlock=immediate: read-modify-write saves (savePart merge) BEGIN with the
+	// write lock held, so a second MCP process can't commit between our read and
+	// our write and clobber it — the cross-process enrichment-loss race. Deferred
+	// (the default) would only fail the write with SQLITE_BUSY, not prevent it.
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(10000)&_pragma=journal_mode(WAL)&_txlock=immediate")
 	if err != nil {
 		return nil, err
 	}
@@ -191,17 +196,31 @@ func mergeCounts(old, in map[string]int) map[string]int {
 }
 
 func (s *Store) savePart(p Part) error {
-	// Merge over any existing row so a partial save can't erase enrichment.
-	if olds, err := s.getParts([]string{p.ID}); err == nil && len(olds) == 1 {
-		p = mergePart(olds[0], p)
+	ctx, cancel := writeCtx()
+	defer cancel()
+	// Read-merge-write in ONE immediate transaction: the merge protects stored
+	// enrichment from a thin re-save, but only if no other writer commits
+	// between the read and the write. A bare read-then-write (even with one
+	// conn) is not safe across two MCP processes; the tx + _txlock=immediate is.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+	row := tx.QueryRowContext(ctx, `SELECT `+partCols+` FROM parts WHERE id=?`, p.ID)
+	switch scanned, serr := scanPartRow(row); {
+	case serr == nil:
+		p = mergePart(scanned, p) // existing row: merge so we can't blank enrichment
+	case errors.Is(serr, sql.ErrNoRows):
+		// genuinely new part — nothing to merge
+	default:
+		return serr // a real read error must ABORT, not silently skip the merge
 	}
 	conns, _ := json.Marshal(p.PowerConnectors)
 	prov, _ := json.Marshal(p.Provides)
 	req, _ := json.Marshal(p.Requires)
 	attrs, _ := json.Marshal(p.Attrs)
-	ctx, cancel := writeCtx()
-	defer cancel()
-	_, err := s.db.ExecContext(ctx, `
+	if _, err := tx.ExecContext(ctx, `
 INSERT INTO parts (id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
   tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
   attrs,raw_specs,source_url,fetched_at)
@@ -217,18 +236,26 @@ ON CONFLICT(id) DO UPDATE SET category=excluded.category,vendor=excluded.vendor,
 		p.ID, p.Category, p.Vendor, p.Model, p.Socket, p.MemType, p.MemSpeed,
 		p.FormFactor, p.TDPW, p.PCIeGen, p.PCIeLanes, string(conns), p.LengthMM,
 		p.Watts, string(prov), string(req), string(attrs), p.RawSpecs, p.SourceURL,
-		utcRFC3339(p.FetchedAt))
-	return err
+		utcRFC3339(p.FetchedAt)); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 const partCols = `id,category,vendor,model,socket,mem_type,mem_speed,form_factor,
   tdp_w,pcie_gen,pcie_lanes,power_connectors,length_mm,watts,provides,requires,
   attrs,raw_specs,source_url,fetched_at`
 
-func scanPart(rows *sql.Rows) (Part, error) {
+// rowScanner is the Scan method shared by *sql.Row and *sql.Rows, so one
+// part-scan body serves both single-row and multi-row queries.
+type rowScanner interface{ Scan(dest ...any) error }
+
+func scanPart(rows *sql.Rows) (Part, error) { return scanPartRow(rows) }
+
+func scanPartRow(sc rowScanner) (Part, error) {
 	var p Part
 	var conns, prov, req, attrs, fetched sql.NullString
-	if err := rows.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
+	if err := sc.Scan(&p.ID, &p.Category, &p.Vendor, &p.Model, &p.Socket,
 		&p.MemType, &p.MemSpeed, &p.FormFactor, &p.TDPW, &p.PCIeGen, &p.PCIeLanes,
 		&conns, &p.LengthMM, &p.Watts, &prov, &req, &attrs, &p.RawSpecs,
 		&p.SourceURL, &fetched); err != nil {
@@ -392,11 +419,15 @@ func (s *Store) recordHistory(l Listing) error {
 	defer cancel()
 	var price float64
 	var shipping sql.NullFloat64
-	err := s.db.QueryRowContext(ctx, `SELECT price, shipping FROM listing_history
-  WHERE listing_id=? ORDER BY seen_at DESC, rowid DESC LIMIT 1`, l.ID).Scan(&price, &shipping)
+	var currency string
+	err := s.db.QueryRowContext(ctx, `SELECT price, shipping, currency FROM listing_history
+  WHERE listing_id=? ORDER BY seen_at DESC, rowid DESC LIMIT 1`, l.ID).Scan(&price, &shipping, &currency)
 	sameShipping := (l.Shipping == nil && !shipping.Valid) ||
 		(l.Shipping != nil && shipping.Valid && *l.Shipping == shipping.Float64)
-	if err == nil && price == l.Price && sameShipping {
+	// Currency MUST be part of the dedup: 100 EUR re-saved as 100 DKK is a real
+	// ~85% price move, not a no-op — comparing bare price would drop the row and
+	// silently lose the change the tool promises to keep.
+	if err == nil && price == l.Price && sameShipping && currency == l.Currency {
 		return nil
 	}
 	_, err = s.db.ExecContext(ctx, `INSERT INTO listing_history
@@ -419,12 +450,14 @@ func utcRFC3339(t time.Time) string {
 
 // PriceObs is one historical price observation for a listing.
 type PriceObs struct {
-	ListingID string    `json:"listing_id"`
-	Vendor    string    `json:"vendor,omitempty"`
-	Price     float64   `json:"price"`
-	Shipping  *float64  `json:"shipping,omitempty"` // nil = shipping wasn't recorded
-	Currency  string    `json:"currency,omitempty"`
-	SeenAt    time.Time `json:"seen_at"`
+	ListingID    string    `json:"listing_id"`
+	Vendor       string    `json:"vendor,omitempty"`
+	Price        float64   `json:"price"`
+	Shipping     *float64  `json:"shipping,omitempty"` // nil = shipping wasn't recorded
+	Currency     string    `json:"currency,omitempty"`
+	SeenAt       time.Time `json:"seen_at"`
+	DisplayTotal float64   `json:"display_total,omitempty"` // price+shipping converted to the requested display currency — the comparable number
+	Unconverted  bool      `json:"unconverted,omitempty"`   // couldn't convert to display currency; display_total is unset, don't trend against peers
 }
 
 func (s *Store) priceHistory(partID string) ([]PriceObs, error) {
@@ -678,6 +711,7 @@ func (s *Store) composeTree(ids []string, visiting map[string]bool) (Spec, error
 	var childViolations []Violation
 	var childGaps []string
 	anyChildPartial := false
+	allChildrenVerified := true
 	for _, sub := range refs {
 		n := counts[sub]
 		if visiting[sub] {
@@ -693,6 +727,9 @@ func (s *Store) composeTree(ids []string, visiting map[string]bool) (Spec, error
 			return Spec{}, err
 		}
 		delete(visiting, sub)
+		if !child.Verified {
+			allChildrenVerified = false // an unverified node makes the whole rack unverified
+		}
 		tag := "spec:" + sub
 		if n > 1 {
 			tag = fmt.Sprintf("spec:%s (x%d)", sub, n)
@@ -750,6 +787,9 @@ func (s *Store) composeTree(ids []string, visiting map[string]bool) (Spec, error
 	spec.Parts = allParts
 	spec.Violations = append(spec.Violations, childViolations...)
 	spec.Compatible = len(spec.Violations) == 0
+	// Verified is the node's own structural verification AND every child's — a
+	// rack is only trustworthy when each node was fully checked too.
+	spec.Verified = spec.Verified && spec.Compatible && allChildrenVerified
 	spec.Gaps = append(spec.Gaps, childGaps...)
 	if len(refs) > 0 {
 		// A parent of sub-builds isn't itself a bootable machine; each

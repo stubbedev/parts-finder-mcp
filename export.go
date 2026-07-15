@@ -118,7 +118,12 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 
 	st := newStyles(f, display)
 	var summaries []cmpRow
-	exportedAt := time.Now() // prices are live-probed below — this IS the fetch time
+	// exportedAt is when THIS workbook was generated — it is the staleness
+	// reference for per-row age flags. It is NOT when the prices were fetched:
+	// prices come from stored listings with their own SeenAt, and the live-check
+	// only verifies the URL still resolves, not that the price is current.
+	// Labeling it "prices fetched" would stamp two-month-old prices as fresh.
+	exportedAt := time.Now()
 	asOf := exportedAt.UTC().Format(time.RFC3339)
 
 	for _, sid := range specIDs {
@@ -343,13 +348,15 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 			put("PSU output", fmt.Sprintf("%dW vs %dW total TDP (%.0f%% headroom)",
 				psuW, spec.TotalTDPW, (float64(psuW)/float64(spec.TotalTDPW)-1)*100), false)
 		}
-		f.SetCellValue(sheet, cell(1, row), "TO BUY total ("+display+")")
+		f.SetCellValue(sheet, cell(1, row), "TO BUY total ("+display+", gross as listed)")
 		f.SetCellValue(sheet, cell(2, row), total)
 		f.SetCellStyle(sheet, cell(1, row), cell(1, row), st.sumStrong)
 		f.SetCellStyle(sheet, cell(2, row), cell(2, row), st.moneyBold)
 		row++
 		if exCovers > 0 {
-			f.SetCellValue(sheet, cell(1, row), fmt.Sprintf("TO BUY ex-VAT total (%s, covers %d of %d priced parts)", display, exCovers, buyCovers))
+			// Gross above mixes incl-VAT (consumer) and ex-VAT (B2B) listings; the
+			// ex-VAT line is the single-basis business figure. Units, not parts.
+			f.SetCellValue(sheet, cell(1, row), fmt.Sprintf("TO BUY ex-VAT total (%s, business basis; covers %d of %d priced units)", display, exCovers, buyCovers))
 			f.SetCellValue(sheet, cell(2, row), exTotal)
 			f.SetCellStyle(sheet, cell(1, row), cell(1, row), st.sumLabel)
 			f.SetCellStyle(sheet, cell(2, row), cell(2, row), st.moneyBold)
@@ -363,11 +370,11 @@ func exportSpecsXLSX(ctx context.Context, specIDs []string, path string, region 
 			sort.Strings(curs)
 			put("TO BUY total excludes", fmt.Sprintf("%d unconverted listings (%s)", unconv, strings.Join(curs, ", ")), true)
 		}
-		put("Parts to buy", fmt.Sprintf("%d priced of %d needed", buyCovers, buyUnits), false)
+		put("Units to buy", fmt.Sprintf("%d priced of %d needed", buyCovers, buyUnits), false)
 		if ownedUnits > 0 {
 			put("Already owned", fmt.Sprintf("%d", ownedUnits), false)
 		}
-		put("Prices fetched", asOf+" — re-export to refresh", false)
+		put("Workbook exported", asOf+" — prices are per-listing as last seen (see each row's age/stale flag); re-run save_listing to refresh a price, then re-export", false)
 		for _, g := range spec.Gaps {
 			put("Gap", g, false)
 		}
