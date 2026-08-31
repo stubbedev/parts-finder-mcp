@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -49,6 +50,11 @@ func main() {
 	// Learned draw categories (see drawCategories) come from the store.
 	drawCatsFn = store.tdpCategories
 
+	// Zero-touch renderer: fetch the managed browser now, in the background,
+	// so a user who installed only parts-finder still gets a working
+	// bot-wall escalation on their first search.
+	go prewarmRenderer()
+
 	s := mcp.NewServer(&mcp.Implementation{Name: "parts-finder", Version: version}, nil)
 	// A panic in any tool handler would otherwise crash the whole server — the
 	// SDK doesn't recover them. Turn a handler panic into a normal error so one
@@ -61,7 +67,7 @@ func main() {
 	registerTools(s)
 
 	// SIGINT/SIGTERM skip deferred calls — reap the spawned renderer
-	// explicitly so a killed MCP session never orphans a lightpanda.
+	// explicitly so a killed MCP session never orphans a renderer.
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -69,8 +75,41 @@ func main() {
 		stopRenderer()
 		os.Exit(1)
 	}()
-	defer stopRenderer() // kill any lightpanda we spawned
+	defer stopRenderer() // kill any renderer we spawned
+	if addr := os.Getenv("PARTS_HTTP"); addr != "" {
+		serveHTTP(s, addr)
+		return
+	}
 	if err := s.Run(context.Background(), &mcp.StdioTransport{}); err != nil {
+		stopRenderer()
+		log.Fatal(err)
+	}
+}
+
+// serveHTTP serves the MCP over Streamable HTTP instead of stdio, in
+// STATELESS mode: every POST carries its own initialize and gets its own
+// short-lived session, so there is nothing to pin a client to — a restarted
+// client, a second client, or N replicas behind a load balancer all just
+// work, and no SSE stream is held open between calls. That is free here
+// because no tool keeps in-memory session state: parts, specs, rules and
+// price history live in sqlite, caches are process-wide and content-keyed.
+//
+// stdio stays the default — Claude Code and Claude Desktop spawn us as a
+// child process and never speak HTTP.
+func serveHTTP(s *mcp.Server, addr string) {
+	if strings.HasPrefix(addr, ":") {
+		// Loopback unless the user names a host: the tools browse the web on
+		// this machine's IP and the store is this user's file. A bare ":8080"
+		// meaning 0.0.0.0 would hand both to anyone on the network.
+		addr = "127.0.0.1" + addr
+	}
+	h := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return s },
+		&mcp.StreamableHTTPOptions{Stateless: true},
+	)
+	srv := &http.Server{Addr: addr, Handler: h, ReadHeaderTimeout: 10 * time.Second}
+	fmt.Fprintf(os.Stderr, "parts-finder: streamable HTTP (stateless) on http://%s\n", addr)
+	if err := srv.ListenAndServe(); err != nil {
 		stopRenderer()
 		log.Fatal(err)
 	}
@@ -120,7 +159,7 @@ type searchOut struct {
 type fetchIn struct {
 	URL    string `json:"url" jsonschema:"page or spec-sheet URL to fetch"`
 	Kind   string `json:"kind,omitempty" jsonschema:"cache freshness bucket: spec (datasheets ~30d), listing (prices ~1h), page (default ~1d)"`
-	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed lightpanda). Bot-blocked sites (403/429) escalate to this automatically. Applies to the initial fetch only — offset pages read the cached text"`
+	Render bool   `json:"render,omitempty" jsonschema:"force headless-browser rendering (auto-managed obscura). Bot-blocked sites (403/429) escalate to this automatically. Applies to the initial fetch only — offset pages read the cached text"`
 	Offset int    `json:"offset,omitempty" jsonschema:"byte offset into the extracted text — big documents are paginated; pass the previous call's next_offset to continue (served from cache, no re-download)"`
 }
 type fetchOut struct {
