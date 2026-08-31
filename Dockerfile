@@ -14,8 +14,9 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
     go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /parts-finder .
 
 FROM debian:bookworm-slim
-# ca-certificates: https everywhere. The lightpanda renderer is auto-downloaded
-# to ~/.cache on first bot-walled fetch; mount /root/.cache to keep it.
+# ca-certificates: https everywhere. The obscura renderer is auto-downloaded
+# to ~/.cache on first bot-walled fetch (~220MB unpacked); mount /root/.cache
+# to keep it across container restarts.
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /parts-finder /usr/local/bin/parts-finder

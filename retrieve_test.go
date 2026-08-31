@@ -58,6 +58,58 @@ func TestSearchChain(t *testing.T) {
 	}
 }
 
+// A bot-walled engine gets ONE retry with its fetch routed through the
+// stealth renderer. Hits from that retry count normally; a rendered wall
+// (zero hits) must NOT read as "the query has no results" — the engine still
+// cools down and the chain still reports blindness.
+func TestSearchChainRenderRetry(t *testing.T) {
+	ctx := context.Background()
+	rendered := 0
+	walled := func(ctx context.Context, _ string, _ int, _ Region) ([]SearchHit, error) {
+		if ctx.Value(renderFetchKey{}) != nil {
+			rendered++
+			return []SearchHit{{Title: "x", URL: "https://example.com/rendered"}}, nil
+		}
+		return nil, fmt.Errorf("wall: %w", errRateLimited)
+	}
+	hits, err := searchChain(ctx, []searchEngine{{"walled", walled}}, "q", 5, Region{})
+	if err != nil || len(hits) != 1 || rendered != 1 {
+		t.Fatalf("render retry must serve the wall: hits=%v err=%v renders=%d", hits, err, rendered)
+	}
+	if coolingDown("walled") {
+		t.Errorf("an engine the renderer unblocked must not be cooled down")
+	}
+
+	// Wall survives the render: blind, not empty.
+	stillWalled := func(context.Context, string, int, Region) ([]SearchHit, error) {
+		return nil, fmt.Errorf("wall: %w", errRateLimited)
+	}
+	hits, err = searchChain(ctx, []searchEngine{{"hard", stillWalled}}, "q", 5, Region{})
+	if err == nil || hits != nil {
+		t.Fatalf("a wall that survives rendering must error, got hits=%v err=%v", hits, err)
+	}
+	if !coolingDown("hard") || !coolingDown("render:hard") {
+		t.Errorf("both the engine and its render path must cool down")
+	}
+	// The render path cools down separately, so the next query skips the
+	// ~30s render instead of paying for it again.
+	cooldowns["hard"] = time.Time{}
+	tried := 0
+	countingWall := func(ctx context.Context, _ string, _ int, _ Region) ([]SearchHit, error) {
+		if ctx.Value(renderFetchKey{}) != nil {
+			tried++
+		}
+		return nil, fmt.Errorf("wall: %w", errRateLimited)
+	}
+	if _, err := searchChain(ctx, []searchEngine{{"hard", countingWall}}, "q", 5, Region{}); err == nil {
+		t.Errorf("still blind")
+	}
+	if tried != 0 {
+		t.Errorf("render path is cooling down; it must not be retried (%d attempts)", tried)
+	}
+	cooldowns["hard"], cooldowns["render:hard"], cooldowns["walled"] = time.Time{}, time.Time{}, time.Time{}
+}
+
 func TestDecodeYahooLink(t *testing.T) {
 	cases := map[string]string{
 		"https://r.search.yahoo.com/_ylt=Aw/RV=2/RE=1/RO=10/RU=https%3a%2f%2fwww.pishop.us%2fproduct%2fpi-4%2f/RK=2/RS=x-": "https://www.pishop.us/product/pi-4/",

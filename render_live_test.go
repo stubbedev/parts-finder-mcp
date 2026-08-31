@@ -43,3 +43,37 @@ func TestLiveRenderFanout(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+// One-off live harness: does each engine's PARSER still work on the rendered
+// DOM? The render fallback is worthless if obscura clears the wall but the
+// markup it returns doesn't match the selectors written for the static page.
+// RENDER_LIVE=1 go test -run TestLiveSearchRender -v
+func TestLiveSearchRender(t *testing.T) {
+	if os.Getenv("RENDER_LIVE") == "" {
+		t.Skip("live render test — set RENDER_LIVE=1")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+	ctx = context.WithValue(ctx, renderFetchKey{}, true)
+	// Not every engine can be rendered: Ecosia challenges the renderer too,
+	// and Yahoo's rendered DOM is a consent interstitial. Those cool their
+	// render path down and the chain moves on, so the guarantee that matters
+	// is that SOME engine survives the render — that is what keeps a
+	// fully-throttled chain from going blind.
+	working := 0
+	for _, e := range searchEngines() {
+		hits, err := e.fn(ctx, "hpe proliant dl380 gen11 price", 10, Region{DDG: "dk-da", Country: "DK"})
+		switch {
+		case err != nil:
+			t.Logf("%s -> ERR: %v", e.name, err)
+		case len(hits) == 0:
+			t.Logf("%s -> 0 hits from the rendered page (parser vs rendered markup?)", e.name)
+		default:
+			working++
+			t.Logf("%s -> %d hits, first=%s", e.name, len(hits), hits[0].URL)
+		}
+	}
+	if working == 0 {
+		t.Error("no engine parses its rendered results page — the render fallback is dead weight")
+	}
+}

@@ -156,6 +156,10 @@ Once registered, just talk to Claude in plain language:
 - **Export** — get a polished `.xlsx` with a sheet per spec and a compare
   sheet.
 
+Nothing else to install: the headless browser parts-finder uses to get past
+bot walls (obscura's stealth build) is downloaded and managed for you on first
+start, into your OS cache dir.
+
 Region and currency are detected automatically from your IP and search is
 biased toward local and EU vendors. The live web is always the source of
 truth — Claude searches rather than guessing from training data.
@@ -163,6 +167,24 @@ truth — Claude searches rather than guessing from training data.
 Already own some parts? Tell Claude — owned units count toward compatibility
 and power but are excluded from the purchase total, so a piecemeal upgrade
 prices only what you're missing.
+
+## Optional: HTTP instead of stdio
+
+By default parts-finder speaks stdio — Claude Code and Claude Desktop spawn it
+as a child process. Set `PARTS_HTTP` to serve **stateless** Streamable HTTP
+instead:
+
+```sh
+PARTS_HTTP=127.0.0.1:8080 parts-finder
+claude mcp add --transport http parts-finder http://127.0.0.1:8080
+```
+
+Stateless means every request carries its own initialize and is answered on its
+own POST: no session to resume, no stream held open, so a client can reconnect
+or several clients can share one running server. A bare `:8080` binds loopback
+rather than every interface — the tools browse the web on this machine's IP and
+the parts database is your file, so don't expose the port without putting your
+own auth in front of it.
 
 ## Development
 

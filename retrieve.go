@@ -23,11 +23,11 @@ import (
 )
 
 // Plain HTTP + DDG HTML endpoint covers static vendor/reseller pages;
-// bot-blocked pages auto-escalate to the zero-config lightpanda renderer
+// bot-blocked pages auto-escalate to the zero-config obscura renderer
 // (render.go). Extraction quality is identical on both paths (extractHTML).
 
 // userAgent is the default fingerprint's UA — used where a single UA string is
-// needed (e.g. the lightpanda download).
+// needed (e.g. the obscura download).
 const userAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 // httpClient follows redirects (Go default, ≤10) and carries session cookies
@@ -220,11 +220,13 @@ func coolingDown(name string) bool {
 	return time.Now().Before(cooldowns[name])
 }
 
-func startCooldown(name string) {
+func startCooldown(name string) { startCooldownReason(name, "rate-limited") }
+
+func startCooldownReason(name, reason string) {
 	cooldownMu.Lock()
 	cooldowns[name] = time.Now().Add(engineCooldownFor)
 	cooldownMu.Unlock()
-	fmt.Fprintf(os.Stderr, "parts-finder: search engine %s rate-limited, cooling down %s\n", name, engineCooldownFor)
+	fmt.Fprintf(os.Stderr, "parts-finder: %s %s, cooling down %s\n", name, reason, engineCooldownFor)
 }
 
 // engineProvider buckets engines that share a backend/throttle regime — a
@@ -288,11 +290,24 @@ func searchChain(ctx context.Context, engines []searchEngine, query string, limi
 		wg.Wait()
 		var merged []SearchHit
 		seen := map[string]bool{}
-		for _, res := range results {
+		for i, res := range results {
 			switch {
 			case errors.Is(res.err, errRateLimited):
+				// The wall is exactly what the stealth renderer is for: retry
+				// this engine once with its fetch routed through obscura
+				// before writing the engine off for five minutes.
+				if hits := renderRetry(ctx, wave[i], query, limit, r); len(hits) > 0 {
+					answered = true
+					for _, h := range hits {
+						if !seen[h.URL] {
+							seen[h.URL] = true
+							merged = append(merged, h)
+						}
+					}
+					break
+				}
 				startCooldown(res.name)
-				errs = append(errs, res.name+": rate limited")
+				errs = append(errs, res.name+": rate limited (render retry did not clear it)")
 			case res.err != nil:
 				errs = append(errs, res.name+": "+res.err.Error())
 			default:
@@ -320,10 +335,42 @@ func searchChain(ctx context.Context, engines []searchEngine, query string, limi
 	// web_search tool (Claude Code and friends do), it runs on the provider's
 	// infra — a different IP and quota the user already pays for, zero setup
 	// here. The tool result IS the handoff channel; the model acts on this text.
-	return nil, fmt.Errorf("all keyless search engines are throttled/blocked for %q [%s].\n"+
+	return nil, fmt.Errorf("all keyless search engines are throttled/blocked for %q, rendering included [%s].\n"+
 		"FALLBACK: if you (the calling agent) have a web_search / WebSearch tool, run it now with this exact query, "+
 		"then pass the top result URLs to fetch_content or deep_specs — that reuses your own search (no setup, separate quota). "+
 		"For a permanent private backend, a self-hoster can set SEARXNG_URL.", query, strings.Join(errs, "; "))
+}
+
+// renderFetchKey marks a context whose search-page fetches must go through
+// the renderer instead of the plain HTTP client.
+type renderFetchKey struct{}
+
+// renderRetry re-runs ONE engine with its results page fetched by the stealth
+// renderer — obscura's consistent fingerprint and TLS impersonation clear
+// walls the plain client cannot, and the engine's own parser then reads the
+// rendered DOM exactly as it reads static markup.
+//
+// Zero hits counts as failure, never as "this query has no results": a
+// rendered wall must cool the engine down like any other block, or search
+// would report "no results" when it is actually blind. Renders cost ~30s, so
+// a failed retry cools the RENDER path down separately — the next query goes
+// straight to the remaining engines instead of paying that again.
+func renderRetry(ctx context.Context, e searchEngine, query string, limit int, r Region) []SearchHit {
+	label := "render:" + e.name
+	if coolingDown(label) {
+		return nil
+	}
+	hits, err := e.fn(context.WithValue(ctx, renderFetchKey{}, true), query, limit, r)
+	if err != nil || len(hits) == 0 {
+		reason := "rendered fetch did not clear the wall"
+		if err != nil {
+			reason += " (" + err.Error() + ")"
+		}
+		startCooldownReason(label, reason)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "parts-finder: %s was bot-walled; rendering it cleared the wall (%d hits)\n", e.name, len(hits))
+	return hits
 }
 
 // searchCache: repeat queries within a session (deep_specs angles, shop_spec
@@ -387,6 +434,19 @@ func fetchSearchPage(ctx context.Context, u, engineLabel string) ([]byte, error)
 // fetchSearchPageHdr is fetchSearchPage with extra request headers — for
 // engines whose only region signal is a header (Ecosia: Accept-Language).
 func fetchSearchPageHdr(ctx context.Context, u, engineLabel string, extra map[string]string) ([]byte, error) {
+	// Render retry (renderRetry): skip the HTTP client entirely — it already
+	// hit the wall on this URL. No 20s cap here; renderHTML budgets itself.
+	if ctx.Value(renderFetchKey{}) != nil {
+		// `extra` is dropped here: the renderer sends the browser's own
+		// headers. Only Ecosia signals region by header, and its wall does
+		// not yield to a render anyway — a rendered Ecosia returns 0 hits and
+		// cools down, rather than silently answering with the wrong region.
+		html, _, _, err := renderHTML(ctx, u)
+		if err != nil {
+			return nil, fmt.Errorf("%s render: %w", engineLabel, err)
+		}
+		return []byte(html), nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var resp *http.Response
@@ -844,7 +904,7 @@ func fetchContent(ctx context.Context, rawURL string) (Fetched, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests {
 		// Bot-blocked (eBay/Akamai and friends). Auto-escalate through the
-		// headless renderer — zero config, lightpanda is spawned (and even
+		// headless renderer — zero config, obscura is spawned (and even
 		// downloaded) on demand. PDFs can't be rendered by a browser DOM;
 		// instead retry the download with full browser headers + referer
 		// (most PDF 403s are referer/UA checks, not TLS fingerprinting).

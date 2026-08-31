@@ -29,12 +29,27 @@ All optional — the server runs zero-config.
   `deep_specs` pulls the brand-authorized structured datasheet (normalized
   spec table + vendor PDF links) before falling back to web search; save a
   part's `gtin`/`ean` or `mpn` attr for exact lookups.
-- `LIGHTPANDA_URL` — CDP endpoint of an externally managed
-  [lightpanda](https://github.com/lightpanda-io/browser)/Chrome. Without it,
-  parts-finder finds `lightpanda` on PATH, or downloads it to
-  `~/.cache/parts-finder/` and spawns it on demand. Bot-blocked sites (eBay
-  et al. return 403 to plain HTTP) automatically escalate through the
-  renderer.
+- `RENDERER_URL` (legacy alias: `LIGHTPANDA_URL`) — CDP endpoint of an
+  externally managed browser. Without it, parts-finder downloads the
+  [obscura](https://github.com/h4ckf0r0day/obscura) stealth build to
+  `~/.cache/parts-finder/` (86MB, sha256-verified against the release digest)
+  and spawns `obscura serve --stealth` on demand. Bot-blocked sites (eBay et
+  al. return 403 to plain HTTP) automatically escalate through the renderer,
+  and so does a bot-walled **search engine** page — obscura's fingerprint +
+  TLS impersonation clears walls the plain client can't, and a wall that
+  survives the render is still reported as blindness, never as "no results".
+- `PARTS_CACHE` — where the managed browser is installed (default: the OS
+  cache dir, `~/.cache/parts-finder` on Linux). Nothing to install by hand:
+  the renderer download starts in the background at startup, so the first
+  bot-walled page doesn't pay for it mid-request. With no `HOME` at all (a
+  bare container) it falls back to a temp dir — mount a cache volume to keep
+  the download across restarts.
+- `PARTS_HTTP` — serve MCP over **stateless** Streamable HTTP on this address
+  (e.g. `127.0.0.1:8080`) instead of stdio. Every POST carries its own
+  initialize, so clients need no session affinity and any number of them can
+  share one process. A bare `:8080` is bound to loopback, not `0.0.0.0`: the
+  tools browse the web on this machine's IP and the store is this user's
+  file.
 - `REGION_COUNTRY` / `REGION_CURRENCY` — override the IP-detected region
   (e.g. `DK` / `DKK`). By default the region is auto-detected from your IP
   (ifconfig.co over https) and cached for the process.
@@ -59,7 +74,7 @@ claude mcp add parts-finder -- docker run -i --rm \
 | Tool | Does |
 |------|------|
 | `search_parts(query, category?, limit?)` | LIVE keyless region-biased search → result links (web is truth, not training data) |
-| `fetch_content(url, kind?, render?)` | fetch → text (smart-cached by kind); PDF + HTML tables preserved; bot-blocked pages auto-render via lightpanda |
+| `fetch_content(url, kind?, render?)` | fetch → text (smart-cached by kind); PDF + HTML tables preserved; bot-blocked pages auto-render via obscura |
 | `fetch_image(url)` | download + downscale an image (jpeg/png/gif/webp/bmp/tiff) → vision block for reading specs/labels/diagrams off pictures |
 | `export_spec(spec_ids[], path?, append?)` | polished .xlsx: per-spec sheet (parts, live prices, buy links, owned-vs-buy totals) + Compare sheet; `append` edits an existing workbook in place; prompts for a save location when `path` is omitted |
 | `save_part(Part)` | persist a part: scalars + provides/requires + free-form `attrs` |
@@ -187,7 +202,9 @@ hardened path:
   bot tell). Cookie jar carries sessions across the set-cookie→redirect dance.
 - **https-first**, redirect-following, transparent gzip.
 - **Headless escalation** — TLS-fingerprint walls (eBay/Akamai) auto-escalate
-  to lightpanda; same extraction either way.
+  to obscura's stealth build (real V8, randomized fingerprint, TLS
+  impersonation); same extraction either way. A rate-limited/bot-walled search
+  engine gets one render retry before it is cooled down.
 - **Resilient** — every goroutine and tool handler recovers from panics, so one
   bad probe/scrape/request can never crash the server. Listing liveness is
   pre-warmed in one parallel sweep before pricing a build.
