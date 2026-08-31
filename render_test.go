@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -76,12 +77,16 @@ func TestRendererCacheDir(t *testing.T) {
 	if got := rendererCacheDir(); got != "/tmp/pf-cache-override" {
 		t.Errorf("PARTS_CACHE must win, got %q", got)
 	}
+	// Default: a subdir of whatever this OS calls the user cache dir
+	// (XDG_CACHE_HOME on Linux, ~/Library/Caches on macOS — os.UserCacheDir
+	// decides, this test does not).
 	t.Setenv("PARTS_CACHE", "")
-	t.Setenv("XDG_CACHE_HOME", "/tmp/pf-xdg")
-	if got := rendererCacheDir(); got != "/tmp/pf-xdg/parts-finder" {
-		t.Errorf("XDG cache dir: got %q", got)
+	if want, err := os.UserCacheDir(); err == nil {
+		if got := rendererCacheDir(); got != filepath.Join(want, "parts-finder") {
+			t.Errorf("default cache dir: got %q, want %q", got, filepath.Join(want, "parts-finder"))
+		}
 	}
-	// No home, no XDG: a temp dir, never an empty path.
+	// No home at all: a temp dir, never an empty path.
 	t.Setenv("XDG_CACHE_HOME", "")
 	t.Setenv("HOME", "")
 	got := rendererCacheDir()
