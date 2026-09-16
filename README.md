@@ -14,6 +14,7 @@ keys, no ports.
 Homebrew (macOS + Linux):
 
 ```sh
+brew tap stubbedev/tap
 brew install stubbedev/tap/parts-finder
 ```
 
