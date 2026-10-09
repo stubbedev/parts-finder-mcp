@@ -316,8 +316,9 @@ func downloadObscura(ctx context.Context, asset ghAsset, destDir string) error {
 }
 
 // extractTarGz unpacks a flat release tarball into dir. Flat is enforced, not
-// assumed: an entry with a path separator or ".." is rejected rather than
-// written (a tarball is remote input, and zip-slip writes anywhere).
+// assumed: an entry that is not a plain file name resolving inside dir is
+// rejected rather than written (a tarball is remote input, and zip-slip
+// writes anywhere).
 func extractTarGz(src, dir string) error {
 	f, err := os.Open(src)
 	if err != nil {
@@ -347,8 +348,10 @@ func extractTarGz(src, dir string) error {
 		if h.Typeflag != tar.TypeReg {
 			continue // symlinks/devices: obscura ships none, and we won't follow one
 		}
-		name := filepath.Base(h.Name)
-		if name != h.Name || name == "." || name == ".." {
+		name := h.Name
+		// filepath.IsLocal rejects absolute paths and any ".." escape;
+		// the Base comparison additionally keeps the layout flat.
+		if !filepath.IsLocal(name) || name != filepath.Base(name) || name == "." {
 			return fmt.Errorf("unexpected path %q in archive", h.Name)
 		}
 		out, err := os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)

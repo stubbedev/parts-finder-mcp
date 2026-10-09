@@ -1,6 +1,9 @@
 package main
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"net/http"
 	"net/http/httptest"
@@ -92,5 +95,64 @@ func TestRendererCacheDir(t *testing.T) {
 	got := rendererCacheDir()
 	if got == "" || got == "parts-finder" || !filepath.IsAbs(got) {
 		t.Errorf("homeless environment must still resolve an absolute dir, got %q", got)
+	}
+}
+
+// tarGz builds an in-memory tar.gz with the given flat member names.
+func tarGz(t *testing.T, names ...string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	for _, n := range names {
+		if err := tw.WriteHeader(&tar.Header{Name: n, Mode: 0o755, Size: int64(len(n))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte(n)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// Extraction must never follow an entry name out of the staging dir
+// (zip-slip), and a well-formed flat tarball must still unpack.
+func TestExtractTarGzRejectsEscapes(t *testing.T) {
+	for _, name := range []string{
+		"../obscura",
+		"../../bin/sh",
+		"sub/obscura",
+		"/etc/passwd",
+		".",
+	} {
+		t.Run(name, func(t *testing.T) {
+			src := filepath.Join(t.TempDir(), "evil.tar.gz")
+			if err := os.WriteFile(src, tarGz(t, name), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			stage := filepath.Join(t.TempDir(), "stage")
+			if err := extractTarGz(src, stage); err == nil {
+				t.Errorf("entry %q must be rejected", name)
+			}
+		})
+	}
+
+	// The happy path: a flat tarball unpacks under the staging dir.
+	src := filepath.Join(t.TempDir(), "ok.tar.gz")
+	if err := os.WriteFile(src, tarGz(t, "obscura", "README.md"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stage := filepath.Join(t.TempDir(), "stage")
+	if err := extractTarGz(src, stage); err != nil {
+		t.Fatalf("flat tarball must unpack: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stage, "obscura")); err != nil {
+		t.Errorf("obscura not unpacked: %v", err)
 	}
 }
