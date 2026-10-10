@@ -3,7 +3,7 @@
 # mount a volume to keep parts/specs/listings across sessions.
 # --platform=$BUILDPLATFORM + GOOS/GOARCH cross-compile: the Go build always
 # runs natively (fast) even when producing the arm64 image on an amd64 runner.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27 AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download

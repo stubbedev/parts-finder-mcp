@@ -11,7 +11,7 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
-        parts-finder = pkgs.buildGoModule {
+        parts-finder = pkgs.buildGo127Module {
           pname = "parts-finder";
           version = "0.1.19";
           src = ./.;
@@ -46,7 +46,7 @@
 
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
-            go
+            go_1_27
             gopls
             just
             git
