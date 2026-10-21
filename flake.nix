@@ -3,59 +3,23 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    flake-utils.url = "github:numtide/flake-utils";
+    flake-parts = {
+      url = "github:hercules-ci/flake-parts";
+      inputs.nixpkgs-lib.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = import nixpkgs { inherit system; };
-
-        parts-finder = pkgs.buildGo127Module {
-          pname = "parts-finder";
-          version = "0.1.19";
-          src = ./.;
-          # buildGoModule fetches Go deps through the module proxy and
-          # hashes the resulting vendor tree; `vendorHash` pins that
-          # hash so the sandboxed build is reproducible. Kept in sync
-          # with go.sum by `just sync-flake` (and CI auto-bump).
-          # go-sum: 5c26afcd5421790c7a6421553da559e6400b43e8c55febe6eba3db9ed1ba2378
-          vendorHash = "sha256-aMUvzSLCobhahKzzsr+/rKfHxZ4jtg5Tjdztsx3jaPk=";
-          # Unit tests hit the network-free paths only, but keep the
-          # sandbox check fast and deterministic: vet+tests run in CI.
-          doCheck = false;
-          ldflags = [
-            "-s"
-            "-w"
-            "-X main.version=0.1.19"
-          ];
-        };
-      in
-      {
-        packages = {
-          default = parts-finder;
-          parts-finder = parts-finder;
-        };
-
-        apps.default = flake-utils.lib.mkApp {
-          drv = parts-finder;
-          name = "parts-finder";
-        };
-
-        checks.build = parts-finder;
-
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
-            go_1_27
-            gopls
-            just
-            git
-          ];
-          shellHook = ''
-            echo "parts-finder-mcp dev shell — \`just build\` to compile, \`just test\` to test"
-          '';
-        };
-
-        formatter = pkgs.nixpkgs-fmt;
-      });
+  outputs = inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [
+        "x86_64-linux"
+        "aarch64-linux"
+        "x86_64-darwin"
+        "aarch64-darwin"
+      ];
+      imports = [
+        ./nix/package.nix
+        ./nix/shell.nix
+      ];
+    };
 }

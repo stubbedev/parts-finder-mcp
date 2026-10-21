@@ -1,7 +1,7 @@
 name: flake-lock-update
 
 # Keeps flake.lock current with the configured inputs (nixpkgs,
-# flake-utils). Runs weekly and on demand. Commits the updated
+# flake-parts). Runs weekly and on demand. Commits the updated
 # lock straight to master with `[skip ci]` so it doesn't trigger
 # another ci run; the next push picks up the new revision and the
 # nix flake-check job re-validates against it.
