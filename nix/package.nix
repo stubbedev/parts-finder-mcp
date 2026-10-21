@@ -29,12 +29,8 @@
           "-w"
           "-X main.version=${version}"
         ];
+        meta.mainProgram = "parts-finder-mcp";
       };
-    };
-
-    apps.default = {
-      type = "app";
-      program = "${self'.packages.parts-finder}/bin/parts-finder";
     };
 
     checks.build = self'.packages.parts-finder;
