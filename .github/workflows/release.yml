@@ -23,9 +23,6 @@ jobs:
             goarch: arm64
             os: ubuntu-latest
           - goos: darwin
-            goarch: amd64
-            os: macos-latest
-          - goos: darwin
             goarch: arm64
             os: macos-latest
     steps:
@@ -130,7 +127,6 @@ jobs:
           {
             echo "VERSION=${VERSION}"
             echo "SHA_DARWIN_ARM64=$(extract darwin-arm64)"
-            echo "SHA_DARWIN_AMD64=$(extract darwin-amd64)"
             echo "SHA_LINUX_ARM64=$(extract linux-arm64)"
             echo "SHA_LINUX_AMD64=$(extract linux-amd64)"
           } >> "$GITHUB_ENV"
@@ -157,10 +153,6 @@ jobs:
               on_arm do
                 url "https://github.com/stubbedev/parts-finder-mcp/releases/download/v#{version}/parts-finder-#{version}-darwin-arm64.tar.gz"
                 sha256 "${SHA_DARWIN_ARM64}"
-              end
-              on_intel do
-                url "https://github.com/stubbedev/parts-finder-mcp/releases/download/v#{version}/parts-finder-#{version}-darwin-amd64.tar.gz"
-                sha256 "${SHA_DARWIN_AMD64}"
               end
             end
 
