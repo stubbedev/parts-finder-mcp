@@ -1,8 +1,8 @@
 {
-  perSystem = { lib, pkgs, self', ... }: {
+  perSystem = { inputs', lib, pkgs, self', ... }: {
     packages = {
       default = self'.packages.parts-finder;
-      parts-finder = pkgs.buildGo127Module rec {
+      parts-finder = (pkgs.buildGoModule.override { go = inputs'.devtools.packages.go; }) rec {
         pname = "parts-finder";
         version = "0.1.19";
         src = lib.fileset.toSource {
