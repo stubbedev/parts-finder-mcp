@@ -19,8 +19,8 @@
         # hashes the resulting vendor tree; `vendorHash` pins that
         # hash so the sandboxed build is reproducible. Kept in sync
         # with go.sum by `just sync-flake` (and CI auto-bump).
-        # go-sum: 0c0b5bdcee4486b0b00a3042b4fcbcdbe75fa855141c52a1192e0099f6a512cb
-        vendorHash = "sha256-rbuAHQ9q9A3taapBvrdqS765AN1brojF5hMt2sSJR/I=";
+        # go-sum: f51c0905734b73fd0a120194158050f106b46da40a4c8ba155ed7bc5a3a54a01
+        vendorHash = "sha256-WL3oi8tPW35eNVoDAVOFpgHsH9Sb/byekr5c/vhnCRk=";
         # Unit tests hit the network-free paths only, but keep the
         # sandbox check fast and deterministic: vet+tests run in CI.
         doCheck = false;
