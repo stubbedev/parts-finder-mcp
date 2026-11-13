@@ -4,7 +4,7 @@
       default = self'.packages.parts-finder;
       parts-finder = (pkgs.buildGoModule.override { go = inputs'.devtools.packages.go; }) rec {
         pname = "parts-finder";
-        version = "0.1.20";
+        version = "0.1.21";
         src = lib.fileset.toSource {
           root = ../.;
           fileset = lib.fileset.difference (lib.fileset.gitTracked ../.) (
